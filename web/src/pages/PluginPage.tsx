@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { api, useApi, type PluginMeta } from '../api'
+import { api, useApi, type PluginMeta, type Server } from '../api'
 import { Alert, Badge, Json, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
@@ -16,7 +16,9 @@ const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host']
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
   const { id } = useParams()
-  const [plugins, reload] = useApi<PluginMeta[]>('/plugins')
+  const [plugins, reloadPlugins] = useApi<PluginMeta[]>('/plugins')
+  const [servers, reloadServers] = useApi<Server[]>('/servers')
+  const reload = async () => { await Promise.all([reloadPlugins(), reloadServers()]) }
   const p = plugins?.find((x) => x.id === id)
   if (!plugins) return null
   if (!p) return <Alert kind="err">Plugin "{id}" is not loaded.</Alert>
@@ -24,14 +26,39 @@ export default function PluginPage() {
     <>
       <div className="row" style={{ marginBottom: 4 }}><h1 style={{ margin: 0 }}>{p.name}</h1><Badge kind="info">{p.id}@{p.version}</Badge></div>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
-      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} reload={reload} />)}
+      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} />)}
     </>
   )
 }
 
-function Inventory({ p, k, reload }: { p: PluginMeta; k: string; reload: () => Promise<void> }) {
+/** Instances of plugin `p` whose config selects from inventory `k`, with the field + disabled-list key. */
+function usersOf(p: PluginMeta, k: string, servers: Server[]) {
+  const [field, fs] = Object.entries<any>(p.configSchema?.properties ?? {}).find(([, s]) => s.items?.['x-options-from'] === k) ?? []
+  const dk: string | undefined = fs?.['x-disabled-key']
+  if (!field) return []
+  return servers.flatMap((s) => s.instances.filter((i) => i.plugin_id === p.id).map((inst) => ({ server: s, inst, field, dk })))
+}
+
+function ServerToggles({ item, users, reload }: { item: string; users: ReturnType<typeof usersOf>; reload: () => Promise<void> }) {
+  const { run, busy } = useAction()
+  const mine = users.filter((u) => ((u.inst.config[u.field] as string[]) ?? []).includes(item))
+  if (mine.length === 0) return <span className="muted small">—</span>
+  return <div className="chips">{mine.map(({ server, inst, dk }) => {
+    const off = dk ? ((inst.config[dk] as string[]) ?? []) : []
+    const on = !off.includes(item)
+    return <label key={inst.id} className="chip small toggle" title={dk ? `${on ? 'Disable' : 'Enable'} ${item} for ${inst.name} on ${server.name}` : 'Edit the instance to change'}>
+      <input type="checkbox" checked={on} disabled={busy || !dk} onChange={(e) => run(async () => {
+        await api(`/instances/${inst.id}`, { method: 'PUT', body: { config: { ...inst.config, [dk!]: e.target.checked ? off.filter((x) => x !== item) : [...off, item] } } })
+        await reload()
+      })} /> {server.name}{inst.name !== inst.plugin_id ? `/${inst.name}` : ''}
+    </label>
+  })}</div>
+}
+
+function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; servers: Server[]; reload: () => Promise<void> }) {
   const schema = p.globalConfigSchema.properties[k]
   const items: any[] = p.globalConfig?.[k] ?? []
+  const users = usersOf(p, k, servers)
   const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
   const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
@@ -51,12 +78,13 @@ function Inventory({ p, k, reload }: { p: PluginMeta; k: string; reload: () => P
       {schema.description && <p className="muted small">{schema.description}</p>}
       {error && <Alert kind="err">{error}</Alert>}
       <table>
-        <thead><tr><th>Name</th>{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}<th></th></tr></thead>
+        <thead><tr><th>Name</th>{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}<th>Used by</th><th></th></tr></thead>
         <tbody>
           {items.map((it, i) => (
             <tr key={it.name ?? i}>
               <td className="mono"><strong>{it.name}</strong></td>
               {cols.map(([c]) => <td key={c}>{String(it[c] ?? '')}</td>)}
+              <td><ServerToggles item={it.name} users={users} reload={reload} /></td>
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
                   onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
