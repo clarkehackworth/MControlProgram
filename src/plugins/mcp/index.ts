@@ -1,0 +1,239 @@
+/**
+ * MCP pass-through plugin: MControlProgram connects to external MCP servers (Streamable HTTP or stdio),
+ * holds their credentials, and re-exposes their tools so every call goes through MControlProgram's
+ * auth, logging and approval gate. Upstream tool schemas and annotations are forwarded unchanged.
+ */
+import { z } from 'zod';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
+import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
+import type { MControlProgramPlugin, PluginContext, PluginInstance, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
+import { effective } from '../../core/global-config.js';
+import { setting } from '../../core/db.js';
+import { encrypt, decrypt } from '../../core/crypto.js';
+import { config as mcontrolprogramConfig } from '../../core/config.js';
+
+interface ServerCfg {
+  name: string; description?: string; transport: 'http' | 'stdio';
+  url?: string; auth: 'none' | 'bearer' | 'header' | 'oauth'; token?: string; headerName?: string;
+  command?: string; args?: string; env?: string; cwd?: string;
+}
+interface GlobalCfg { servers: ServerCfg[]; callTimeoutMs: number }
+interface Cfg { servers: string[]; serversDisabled?: string[]; flat: boolean; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
+
+const serverSchema = {
+  type: 'object',
+  required: ['name', 'transport'],
+  properties: {
+    name: { type: 'string', title: 'Name', description: 'Prefix for its tools (e.g. github → github_create_issue)', pattern: '^[a-zA-Z0-9_-]+$' },
+    description: { type: 'string', title: 'Description' },
+    transport: { type: 'string', title: 'Transport', enum: ['http', 'stdio'], default: 'http' },
+    url: { type: 'string', title: 'URL', description: 'Streamable HTTP endpoint, e.g. https://mcp.example.com/mcp', 'x-show-if': { transport: 'http' } },
+    auth: { type: 'string', title: 'Authentication', enum: ['none', 'bearer', 'header', 'oauth'], default: 'none', 'x-show-if': { transport: 'http' } },
+    token: { type: 'string', title: 'Token / header value', 'x-secret': true, 'x-show-if': { auth: ['bearer', 'header'] } },
+    headerName: { type: 'string', title: 'Header name', default: 'X-API-Key', 'x-show-if': { auth: 'header' } },
+    command: { type: 'string', title: 'Command', description: 'Executable to spawn, e.g. npx', 'x-show-if': { transport: 'stdio' } },
+    args: { type: 'string', title: 'Arguments', description: 'One per line', format: 'multiline', 'x-show-if': { transport: 'stdio' } },
+    env: { type: 'string', title: 'Environment', description: 'KEY=VALUE per line; secrets go here, the agent never sees them', format: 'multiline', 'x-secret': true, 'x-show-if': { transport: 'stdio' } },
+    cwd: { type: 'string', title: 'Working directory', 'x-show-if': { transport: 'stdio' } },
+  },
+};
+
+// ---- OAuth client state, encrypted in settings (kept out of the config form) ----
+const oauthKey = (name: string) => `mcp.oauth.${name}`;
+const loadOauth = (name: string): { client?: OAuthClientInformationMixed; tokens?: OAuthTokens; verifier?: string } => {
+  const raw = setting.get(oauthKey(name)); return raw ? JSON.parse(decrypt(raw)) : {};
+};
+const saveOauth = (name: string, patch: Record<string, unknown>) => setting.set(oauthKey(name), encrypt(JSON.stringify({ ...loadOauth(name), ...patch })));
+const pendingAuth = new Map<string, URL>(); // server name → authorization URL captured during connect
+const redirectUrl = () => `${mcontrolprogramConfig.publicUrl ?? `http://${mcontrolprogramConfig.adminHost}:${mcontrolprogramConfig.adminPort}`}/api/plugins/mcp/callback`;
+
+function oauthProvider(name: string): OAuthClientProvider {
+  return {
+    get redirectUrl() { return redirectUrl(); },
+    get clientMetadata() { return { client_name: 'MControlProgram', redirect_uris: [redirectUrl()], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' }; },
+    state: () => name, // ponytail: state carries the server name back to the callback; CSRF covered by the admin session cookie
+    clientInformation: () => loadOauth(name).client,
+    saveClientInformation: (client) => saveOauth(name, { client }),
+    tokens: () => loadOauth(name).tokens,
+    saveTokens: (tokens) => saveOauth(name, { tokens }),
+    redirectToAuthorization: (url) => { pendingAuth.set(name, url); },
+    saveCodeVerifier: (verifier) => saveOauth(name, { verifier }),
+    codeVerifier: () => loadOauth(name).verifier ?? '',
+  };
+}
+
+const lines = (s?: string) => (s ?? '').split('\n').map((l) => l.trim()).filter(Boolean);
+
+function makeTransport(s: ServerCfg) {
+  if (s.transport === 'stdio') {
+    if (!s.command) throw new Error(`server ${s.name}: command required`);
+    const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+    for (const l of lines(s.env)) { const i = l.indexOf('='); if (i > 0) env[l.slice(0, i)] = l.slice(i + 1); }
+    return new StdioClientTransport({ command: s.command, args: lines(s.args), env, cwd: s.cwd || undefined, stderr: 'ignore' });
+  }
+  if (!s.url) throw new Error(`server ${s.name}: url required`);
+  const headers: Record<string, string> = {};
+  if (s.auth === 'bearer' && s.token) headers.authorization = `Bearer ${s.token}`;
+  if (s.auth === 'header' && s.token) headers[s.headerName || 'X-API-Key'] = s.token;
+  return new StreamableHTTPClientTransport(new URL(s.url), { requestInit: { headers }, authProvider: s.auth === 'oauth' ? oauthProvider(s.name) : undefined });
+}
+
+/** Connect and return the client; for OAuth servers that need authorization, throws UnauthorizedError after capturing the URL. */
+async function connect(s: ServerCfg): Promise<{ client: Client; transport: ReturnType<typeof makeTransport> }> {
+  const transport = makeTransport(s);
+  const client = new Client({ name: 'mcontrolprogram', version: '0.1.0' });
+  await client.connect(transport);
+  return { client, transport };
+}
+
+const plugin: MControlProgramPlugin = {
+  id: 'mcp',
+  name: 'MCP pass-through',
+  version: '0.1.0',
+  description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with logging, per-tool allow/deny and approval gating.',
+  globalConfigSchema: {
+    type: 'object',
+    properties: {
+      servers: { type: 'array', title: 'Upstream MCP servers', items: serverSchema, default: [] },
+      callTimeoutMs: { type: 'integer', title: 'Tool call timeout (ms)', default: 60000 },
+    },
+  },
+  defaultGlobalConfig: { servers: [], callTimeoutMs: 60000 },
+  globalActions: {
+    test_server: {
+      title: 'Test server',
+      async run({ name }, { config }) {
+        const s = (config.servers as ServerCfg[]).find((x) => x.name === name);
+        if (!s) throw new Error('unknown server');
+        try {
+          const { client } = await connect(s);
+          const tools = (await client.listTools()).tools.map((t) => t.name);
+          await client.close();
+          return { ok: true, serverInfo: client.getServerVersion?.(), tools };
+        } catch (e) {
+          if (e instanceof UnauthorizedError) return { ok: false, needsAuthorization: true, authorizeUrl: pendingAuth.get(s.name)?.toString(), error: 'not authorized: run "Authorize (OAuth)"' };
+          throw e;
+        }
+      },
+    },
+    oauth_start: {
+      title: 'Authorize (OAuth)',
+      async run({ name }, { config }) {
+        const s = (config.servers as ServerCfg[]).find((x) => x.name === name);
+        if (!s) throw new Error('unknown server');
+        if (s.auth !== 'oauth') throw new Error('server is not configured for OAuth');
+        pendingAuth.delete(name);
+        try { const { client } = await connect(s); await client.close(); return { ok: true, alreadyAuthorized: true }; }
+        catch (e) {
+          if (!(e instanceof UnauthorizedError)) throw e;
+          const url = pendingAuth.get(name)?.toString();
+          if (!url) throw new Error('authorization server did not provide an authorization URL');
+          return { ok: true, authorizeUrl: url, note: 'Open the URL, sign in and approve; the server redirects back to MControlProgram.' };
+        }
+      },
+    },
+    callback: {
+      title: 'OAuth callback (internal)',
+      async run({ code, state, error, error_description }, { config }) {
+        if (error) throw new Error(`${error}: ${error_description ?? ''}`);
+        const s = (config.servers as ServerCfg[]).find((x) => x.name === state);
+        if (!s || !code) throw new Error('unknown server or missing code');
+        const transport = makeTransport(s) as StreamableHTTPClientTransport;
+        await transport.finishAuth(String(code));
+        saveOauth(s.name, { verifier: undefined });
+        return { ok: true, name: s.name };
+      },
+    },
+    oauth_reset: {
+      title: 'Forget OAuth tokens',
+      async run({ name }) { setting.set(oauthKey(String(name)), encrypt('{}')); return { ok: true }; },
+    },
+  },
+  configSchema: {
+    type: 'object',
+    properties: {
+      servers: { type: 'array', title: 'Servers to expose', description: 'Empty = no servers.', items: { type: 'string', 'x-options-from': 'servers' }, 'x-disabled-key': 'serversDisabled', default: [] },
+      serversDisabled: { type: 'array', items: { type: 'string' }, 'x-hidden': true, default: [] },
+      flat: { type: 'boolean', title: 'Flat tool names', description: 'Do not prefix tool names with the server name (use when exposing a single server)', default: false },
+      allowTools: { type: 'array', title: 'Allow only these tools', description: 'Upstream tool names (or server/tool); empty = all', items: { type: 'string' }, default: [] },
+      denyTools: { type: 'array', title: 'Deny these tools', items: { type: 'string' }, default: [] },
+      idleDisconnectSec: { type: 'integer', title: 'Idle disconnect (seconds)', description: '0 = MControlProgram default', default: 0 },
+    },
+  },
+  defaultConfig: { servers: [], flat: false, allowTools: [], denyTools: [], idleDisconnectSec: 0 },
+
+  create(ctx: PluginContext): PluginInstance {
+    const cfg = ctx.config as Cfg;
+    const g = ctx.pluginConfig as GlobalCfg;
+    const active = cfg.servers.filter((n) => !(cfg.serversDisabled ?? []).includes(n));
+    const selected = g.servers.filter((s) => active.includes(s.name));
+    for (const n of cfg.servers) if (!g.servers.some((s) => s.name === n)) ctx.log.warn(`server "${n}" is not configured on the mcp plugin`);
+
+    const conns = new Map<string, { client: Client; lastUsed: number }>();
+    const tools: ToolDefinition[] = [];
+    let reaper: NodeJS.Timeout | undefined;
+
+    const allowed = (server: string, tool: string) => {
+      const ids = [tool, `${server}/${tool}`];
+      if (cfg.denyTools.some((d) => ids.includes(d))) return false;
+      return cfg.allowTools.length === 0 || cfg.allowTools.some((a) => ids.includes(a));
+    };
+
+    const client = async (s: ServerCfg): Promise<Client> => {
+      const c = conns.get(s.name);
+      if (c) { c.lastUsed = Date.now(); return c.client; }
+      const { client } = await connect(s);
+      client.onclose = () => { if (conns.get(s.name)?.client === client) conns.delete(s.name); };
+      conns.set(s.name, { client, lastUsed: Date.now() });
+      ctx.log.debug(`connected to ${s.name}`);
+      return client;
+    };
+
+    return {
+      tools,
+      async start() {
+        for (const s of selected) {
+          try {
+            const c = await client(s);
+            const list = (await c.listTools()).tools;
+            let n = 0;
+            for (const t of list) {
+              if (!allowed(s.name, t.name)) continue;
+              n++;
+              tools.push({
+                name: cfg.flat ? t.name : `${s.name}_${t.name}`,
+                title: t.title,
+                description: t.description ?? '',
+                jsonSchema: t.inputSchema as Record<string, any>,
+                annotations: t.annotations as ToolDefinition['annotations'],
+                async handler(args, call) {
+                  const c = await client(s);
+                  const r = await c.callTool({ name: t.name, arguments: args }, undefined, { signal: call.signal, timeout: g.callTimeoutMs });
+                  return r as unknown as ToolResult;
+                },
+              });
+            }
+            ctx.log.info(`${s.name}: exposing ${n}/${list.length} tools`);
+          } catch (e) {
+            ctx.log.error(`${s.name}: ${e instanceof UnauthorizedError ? 'not authorized (run Authorize in plugin config)' : String((e as Error).message ?? e)}; no tools exposed`);
+          }
+        }
+        // ponytail: idle sockets closed by the reaper reconnect transparently on the next call
+        reaper = setInterval(() => {
+          const idle = effective(cfg.idleDisconnectSec, ctx.global().connectionIdleSec) * 1000;
+          for (const [name, c] of conns) if (Date.now() - c.lastUsed > idle) { conns.delete(name); void c.client.close(); ctx.log.debug(`idle disconnect ${name}`); }
+        }, 30_000).unref();
+      },
+      async stop() {
+        clearInterval(reaper);
+        for (const [, c] of conns) await c.client.close().catch(() => {});
+        conns.clear();
+      },
+      status: () => ({ servers: selected.map((s) => ({ name: s.name, transport: s.transport, connected: conns.has(s.name), tools: tools.filter((t) => cfg.flat || t.name.startsWith(`${s.name}_`)).length })) }),
+    };
+  },
+};
+export default plugin;

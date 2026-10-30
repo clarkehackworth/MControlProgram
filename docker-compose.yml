@@ -1,0 +1,16 @@
+services:
+  mcontrolprogram:
+    build: .
+    restart: unless-stopped
+    user: "1000:1000" # match the owner of ./data
+    ports:
+      - "7700:7700"      # admin UI
+      - "7801:7801"      # MCP servers: add one line per server port you create
+    volumes:
+      - ./data:/data:z
+    environment:
+      # Optional. If unset, /data/master.key is generated on first run; keep it with the DB.
+      # MCONTROLPROGRAM_MASTER_KEY:
+      # MCONTROLPROGRAM_PUBLIC_URL: https://mcontrolprogram.example.com
+      MCONTROLPROGRAM_ADMIN_HOST: 0.0.0.0
+

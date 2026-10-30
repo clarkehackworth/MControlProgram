@@ -1,0 +1,87 @@
+import { useState } from 'react'
+import { useParams } from 'react-router-dom'
+import { api, useApi, type PluginMeta } from '../api'
+import { Alert, Badge, Json, Modal, useAction } from '../components/ui'
+import SchemaForm, { defaultsFor } from '../components/SchemaForm'
+import SshAddHost from '../plugins/SshAddHost'
+
+/** Array-of-object properties of a plugin's global config (SSH hosts, upstream servers, credentials…). */
+export function inventoryKeys(p: PluginMeta): string[] {
+  return Object.entries<any>(p.globalConfigSchema?.properties ?? {}).filter(([, s]) => s.type === 'array' && s.items?.type === 'object').map(([k]) => k)
+}
+
+// ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host']
+
+/** Full-width management page for one plugin's inventories. */
+export default function PluginPage() {
+  const { id } = useParams()
+  const [plugins, reload] = useApi<PluginMeta[]>('/plugins')
+  const p = plugins?.find((x) => x.id === id)
+  if (!plugins) return null
+  if (!p) return <Alert kind="err">Plugin "{id}" is not loaded.</Alert>
+  return (
+    <>
+      <div className="row" style={{ marginBottom: 4 }}><h1 style={{ margin: 0 }}>{p.name}</h1><Badge kind="info">{p.id}@{p.version}</Badge></div>
+      <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
+      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} reload={reload} />)}
+    </>
+  )
+}
+
+function Inventory({ p, k, reload }: { p: PluginMeta; k: string; reload: () => Promise<void> }) {
+  const schema = p.globalConfigSchema.properties[k]
+  const items: any[] = p.globalConfig?.[k] ?? []
+  const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
+  const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key))
+  const [editing, setEditing] = useState<{ index: number; value: any }>()
+  const [wizard, setWizard] = useState(false)
+  const [out, setOut] = useState<any>()
+  const { run, error, busy } = useAction()
+  const save = (next: any[]) => api(`/plugins/${p.id}/config`, { method: 'PUT', body: { ...p.globalConfig, [k]: next } })
+  return (
+    <div className="card">
+      <div className="row between">
+        <h2 style={{ margin: 0 }}>{schema.title ?? k} <span className="muted small">({items.length})</span></h2>
+        <div className="row">
+          {p.id === 'ssh' && k === 'hosts' && <button className="primary" onClick={() => setWizard(true)}>+ Add host (guided)</button>}
+          <button className={p.id === 'ssh' ? '' : 'primary'} onClick={() => setEditing({ index: -1, value: defaultsFor(schema.items) })}>+ Add</button>
+        </div>
+      </div>
+      {schema.description && <p className="muted small">{schema.description}</p>}
+      {error && <Alert kind="err">{error}</Alert>}
+      <table>
+        <thead><tr><th>Name</th>{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}<th></th></tr></thead>
+        <tbody>
+          {items.map((it, i) => (
+            <tr key={it.name ?? i}>
+              <td className="mono"><strong>{it.name}</strong></td>
+              {cols.map(([c]) => <td key={c}>{String(it[c] ?? '')}</td>)}
+              <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
+                {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
+                  onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
+                <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>
+                <button className="sm danger" disabled={busy} onClick={() => { if (window.confirm(`Delete "${it.name}"?`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
+              </div></td>
+            </tr>
+          ))}
+          {items.length === 0 && <tr><td colSpan={cols.length + 2} className="muted">None configured.</td></tr>}
+        </tbody>
+      </table>
+      {out?.authorizeUrl && <Alert kind="ok">Open <a href={out.authorizeUrl} target="_blank" rel="noreferrer">the authorization page</a>, approve, then run "Test server".</Alert>}
+      {out && <div style={{ marginTop: 12 }}><div className="row between"><strong className="small">{out.action}</strong><button className="sm" onClick={() => setOut(undefined)}>Clear</button></div><Json value={out} /></div>}
+      {editing && <Modal title={editing.index < 0 ? `Add to ${schema.title ?? k}` : `Edit ${editing.value.name}`} onClose={() => setEditing(undefined)}>
+        <p className="muted small">Shared by every <code>{p.id}</code> instance on every server. Saving restarts those instances. Secrets show as •••••••• — leave them to keep the stored value.</p>
+        <SchemaForm schema={schema.items} value={editing.value} onChange={(v) => setEditing({ ...editing, value: v })} />
+        <div className="row between" style={{ marginTop: 12 }}>
+          <button onClick={() => setEditing(undefined)}>Cancel</button>
+          <button className="primary" disabled={busy || !editing.value.name} onClick={() => run(async () => {
+            await save(editing.index < 0 ? [...items, editing.value] : items.map((x, j) => (j === editing.index ? editing.value : x)))
+            setEditing(undefined); await reload()
+          })}>Save</button>
+        </div>
+      </Modal>}
+      {wizard && <SshAddHost onClose={() => setWizard(false)} onDone={async () => { setWizard(false); await reload() }} />}
+    </div>
+  )
+}
