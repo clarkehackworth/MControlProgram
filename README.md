@@ -5,6 +5,8 @@ API tokens, internal networks. Agents connect to MControlProgram over the standa
 [Model Context Protocol](https://modelcontextprotocol.io) (Streamable HTTP) and get **tools**;
 MControlProgram's plugins own the credentials, make the real connections, and enforce policy.
 
+![MControlProgram admin UI: SSH plugin with per-server toggles](docs/images/ssh-plugin.png)
+
 ```
  agent (Claude Code, Cursor, …)  ──MCP/HTTP + auth──▶  MControlProgram MCP server :7801  ──▶  ssh plugin ──▶ hosts
  agent                            ──MCP/HTTP + auth──▶  MControlProgram MCP server :7802  ──▶  web plugin ──▶ APIs
