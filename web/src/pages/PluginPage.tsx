@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api, useApi, type PluginMeta, type Server } from '../api'
-import { Alert, Badge, Json, Modal, useAction } from '../components/ui'
+import { Alert, Json, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
 import SshDeleteHost from '../plugins/SshDeleteHost'
@@ -25,7 +25,7 @@ export default function PluginPage() {
   if (!p) return <Alert kind="err">Plugin "{id}" is not loaded.</Alert>
   return (
     <>
-      <div className="row" style={{ marginBottom: 4 }}><h1 style={{ margin: 0 }}>{p.name}</h1><Badge kind="info">{p.id}</Badge></div>
+      <h1 style={{ marginBottom: 4 }}>{p.name}</h1>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
       {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} />)}
     </>
