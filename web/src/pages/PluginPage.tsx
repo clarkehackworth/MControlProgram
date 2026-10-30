@@ -4,6 +4,7 @@ import { api, useApi, type PluginMeta, type Server } from '../api'
 import { Alert, Badge, Json, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
+import SshDeleteHost from '../plugins/SshDeleteHost'
 
 /** Array-of-object properties of a plugin's global config (SSH hosts, upstream servers, credentials…). */
 export function inventoryKeys(p: PluginMeta): string[] {
@@ -11,7 +12,7 @@ export function inventoryKeys(p: PluginMeta): string[] {
 }
 
 // ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
-const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host']
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key']
 
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
@@ -24,7 +25,7 @@ export default function PluginPage() {
   if (!p) return <Alert kind="err">Plugin "{id}" is not loaded.</Alert>
   return (
     <>
-      <div className="row" style={{ marginBottom: 4 }}><h1 style={{ margin: 0 }}>{p.name}</h1><Badge kind="info">{p.id}@{p.version}</Badge></div>
+      <div className="row" style={{ marginBottom: 4 }}><h1 style={{ margin: 0 }}>{p.name}</h1><Badge kind="info">{p.id}</Badge></div>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
       {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} />)}
     </>
@@ -63,6 +64,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
   const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
   const [wizard, setWizard] = useState(false)
+  const [deleting, setDeleting] = useState<any>()
   const [out, setOut] = useState<any>()
   const { run, error, busy } = useAction()
   const save = (next: any[]) => api(`/plugins/${p.id}/config`, { method: 'PUT', body: { ...p.globalConfig, [k]: next } })
@@ -89,7 +91,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
                 {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
                   onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
                 <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>
-                <button className="sm danger" disabled={busy} onClick={() => { if (window.confirm(`Delete "${it.name}"?`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
+                <button className="sm danger" disabled={busy} onClick={() => { if (p.id === 'ssh' && k === 'hosts' && it.auth === 'key') setDeleting(it); else if (window.confirm(`Delete "${it.name}"?`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
               </div></td>
             </tr>
           ))}
@@ -109,6 +111,10 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
           })}>Save</button>
         </div>
       </Modal>}
+      {deleting && <SshDeleteHost name={deleting.name} onClose={() => setDeleting(undefined)} onDone={async (removeKey, password) => {
+        if (removeKey) await api(`/plugins/ssh/actions/remove_key`, { method: 'POST', body: { name: deleting.name, password: password || undefined } })
+        await save(items.filter((x) => x.name !== deleting.name)); setDeleting(undefined); await reload()
+      }} />}
       {wizard && <SshAddHost onClose={() => setWizard(false)} onDone={async () => { setWizard(false); await reload() }} />}
     </div>
   )

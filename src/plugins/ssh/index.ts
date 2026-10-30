@@ -236,6 +236,23 @@ const plugin: MControlProgramPlugin = {
         return { installed: true, keyLogin: t.stdout.trim() === 'ok' };
       },
     },
+    remove_key: {
+      title: 'Remove key from host',
+      /** params: { name, password? }. Deletes this host's public key from the remote ~/.ssh/authorized_keys, logging in with the key (or the password if given). */
+      async run(p, a: PluginActionContext) {
+        const g = a.config as GlobalCfg;
+        const h = g.hosts.find((x) => x.name === p.name);
+        if (!h) throw new Error('unknown host');
+        if (!h.privateKey) throw new Error('host has no private key configured');
+        const blob = publicKeyOf(h.privateKey, h.passphrase, `mcontrolprogram-${h.name}`).split(' ')[1];
+        const login = p.password ? { ...h, auth: 'password' as const, password: String(p.password) } : h;
+        const f = '~/.ssh/authorized_keys';
+        const r = await execOnce(login, g, `grep -vF '${blob}' ${f} > ${f}.mcp; cat ${f}.mcp > ${f}; rm -f ${f}.mcp; echo removed`, a.log);
+        if (!/removed/.test(r.stdout)) throw new Error(`could not remove key: ${r.stderr || r.stdout || 'exit ' + r.code}`);
+        a.log.info(`ssh public key removed from ${h.name}`);
+        return { removed: true };
+      },
+    },
     test_host: {
       title: 'Test connection',
       async run(p, a: PluginActionContext) {

@@ -22,7 +22,7 @@ function Shell({ user, onLogout, children }: { user: string; onLogout: () => voi
       <nav className="sidebar">
         <div className="brand">MControlProgram<div className="muted small mono"><img src="/favicon.svg" alt="" width={14} height={14} />{sys && <> v{sys.version}</>}</div></div>
         {plugins?.filter((p) => inventoryKeys(p).length > 0).map((p) => <NavLink key={p.id} to={`/p/${p.id}`}>{p.name}</NavLink>)}
-        <NavLink to="/servers">Servers</NavLink>
+        <NavLink to="/servers">MCP Servers</NavLink>
         <NavLink to="/plugins">Plugins</NavLink>
         <NavLink to="/approvals">Approvals{n > 0 && <span className="badge warn" style={{ marginLeft: 8 }}>{n}</span>}</NavLink>
         <NavLink to="/logs">Logs</NavLink>

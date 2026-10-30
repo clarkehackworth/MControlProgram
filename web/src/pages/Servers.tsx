@@ -50,7 +50,7 @@ function CreateServer({ onClose, onCreated }: { onClose: () => void; onCreated: 
       <div className="grid2">
         <Field label="Name"><input type="text" value={f.name} onChange={(e) => set('name', e.target.value)} autoFocus /></Field>
         <Field label="Description"><input type="text" value={f.description} onChange={(e) => set('description', e.target.value)} /></Field>
-        <Field label="Bind host" desc="127.0.0.1 = local only; 0.0.0.0 = all interfaces"><input type="text" value={f.host} onChange={(e) => set('host', e.target.value)} /></Field>
+        <Field label="Bind host" desc="127.0.0.1 = local only; 0.0.0.0 = all interfaces / for docker"><input type="text" value={f.host} onChange={(e) => set('host', e.target.value)} /></Field>
         <Field label="Port"><input type="number" value={f.port} onChange={(e) => set('port', Number(e.target.value))} /></Field>
         <Field label="Authentication"><AuthSelect value={f.auth_mode} onChange={(v) => set('auth_mode', v)} /></Field>
         <Field label="Logging"><LogSelect value={f.log_level} onChange={(v) => set('log_level', v)} /></Field>

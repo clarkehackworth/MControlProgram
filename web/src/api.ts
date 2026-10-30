@@ -32,7 +32,18 @@ export function useApi<T = any>(path: string | null, pollMs = 0): [T | undefined
 }
 
 export const fmtTime = (v?: string | number | null) => (v ? new Date(v).toLocaleString() : '—')
-export const copy = (s: string) => navigator.clipboard.writeText(s)
+export const copy = async (s: string) => {
+  // navigator.clipboard is undefined on insecure (plain http, non-localhost) origins
+  if (navigator.clipboard) return navigator.clipboard.writeText(s)
+  const t = document.createElement('textarea')
+  t.value = s
+  t.style.position = 'fixed'
+  t.style.opacity = '0'
+  document.body.appendChild(t)
+  t.select()
+  document.execCommand('copy')
+  t.remove()
+}
 
 // ---- shared types (mirror backend) ----
 export interface PluginMeta { id: string; name: string; version: string; description: string; configSchema: any; defaultConfig: Record<string, any>; source: string; globalConfigSchema?: any; globalConfig?: Record<string, any>; globalActions: { key: string; title: string }[] }
