@@ -156,6 +156,7 @@ export default {
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
 - Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
+- The "Used by" column (server toggles + Pair server) appears only on inventories that an instance config selects from (`x-options-from`). An inventory that other inventory items point at by name can say so with `'x-referenced-by': { inventory, field, title }`; its table then lists those items instead (and the delete confirmation warns about them).
 - `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
 - A global action with `inventory: '<key>'` only shows as a row button on that inventory table.
 
@@ -169,6 +170,18 @@ Runs isolated Chromium profiles with the [BrowserPaw](https://github.com/GoldenL
 When an agent calls a tool, the plugin finds the profile's bridge: it is the listening process whose ancestor is that profile's Chromium, found with `ps` and `ss`. The plugin tunnels to the bridge with ssh `forwardOut` and forwards the call with the bridge's bearer token. If the profile isn't running, it starts it first (when "Start on demand" is on). Agents get the BrowserPaw tools plus `profiles`. When more than one profile is exposed, every tool requires a `profile` argument. Agents never see SSH, ports or the token. Use the instance's allow/deny lists and approval policy for risky tools (`chrome_javascript`, cookies, network capture).
 
 The SSH user needs a normal shell, because the plugin runs setup commands as that user. Don't reuse a `command="true"` tunnel-only key for this host.
+
+**Operating systems.** Each browser host has an **Operating system** setting (`auto`, `linux`, `macos`, `windows`) and a **Browser** setting (`chromium`, `chrome`, `edge`). With `auto`, the plugin runs `uname -s` and falls back to a PowerShell probe; **Check host** shows the result and re-detects. Empty binary, profiles-directory and environment fields use per-OS defaults. The per-OS command sets live in `src/plugins/browserpaw/platform.ts`:
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Remote shell | `sh -c` | `sh -c` | PowerShell (`-EncodedCommand`) |
+| Native messaging | `<profile>/NativeMessagingHosts/` manifest + wrapper | same as Linux | `HKCU\Software\<browser>\NativeMessagingHosts`, one per user, origins merged |
+| Tool profile | set in the wrapper | set in the wrapper | set in the browser's environment |
+| Launch | `setsid -f` (else `nohup`), `DISPLAY` from env | `open -n -a <App>.app` | scheduled task on the logged-in desktop |
+| Bridge port | `ss` | `lsof` | `Get-NetTCPConnection` |
+
+Windows requirements: OpenSSH Server, the SSH user logged in to a desktop session, and BrowserPaw's `run_host.bat`. Because the HKCU registration is shared, setting up a profile replaces any registration BrowserPaw's own installer made, keeping its allowed origins. Branded Chrome and Edge 137+ ignore `--load-extension` by default, so the plugin adds `--disable-features=DisableLoadExtensionCommandLineSwitch` for them. Linux is tested against a real host. The macOS and Windows commands are covered by unit tests only (macOS shares the POSIX scripts, which the tests run under `sh`).
 
 ## Raw JSON Schema tools
 

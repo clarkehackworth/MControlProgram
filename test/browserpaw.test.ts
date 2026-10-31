@@ -20,7 +20,8 @@ mk('dep-chain', '1.0.0', { 'dep-bad': '*' });
 
 const { satisfies } = await import('../src/core/semver.js');
 const { loadPlugins, plugins, depResolver } = await import('../src/core/plugin-loader.js');
-const { extensionId, parseStatus, sp } = await import('../src/plugins/browserpaw/index.js');
+const { parseStatus, sp, pp, platforms, osFromUname } = await import('../src/plugins/browserpaw/platform.js');
+const extensionId = platforms.linux.extensionId;
 
 test('semver ranges', () => {
   assert.ok(satisfies('0.2.0', '^0.2.0'));
@@ -87,4 +88,78 @@ test('plugin config schema patterns reject bad profile names (same rule the UI e
   const pattern = (bp.globalConfigSchema as any).properties.profiles.items.properties.name.pattern;
   assert.ok(new RegExp(pattern).test('Kali_profile-1'));
   assert.ok(!new RegExp(pattern).test('Kali profile 1'));
+});
+
+test('parseStatus: macOS lsof and Windows (quoted command line, synthesized socket lines)', () => {
+  const tok = 'cd'.repeat(32);
+  const mac = '/Users/u/Library/Application Support/mcp-bp/work';
+  const macOut = [
+    `dir=${mac}`,
+    `  500     1 /Applications/Chromium.app/Contents/MacOS/Chromium --user-data-dir=${mac} --load-extension=/e about:blank`,
+    `  510   500 /bin/sh ${mac}/browserpaw-host.sh chrome-extension://abc/`,
+    `  511   510 node /bp/index.js chrome-extension://abc/`,
+    '@@SS@@',
+    'COMMAND   PID USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME',
+    'node      999 u     21u  IPv4 0x1234      0t0  TCP 127.0.0.1:12306 (LISTEN)',
+    'node      511 u     21u  IPv4 0x5678      0t0  TCP 127.0.0.1:12309 (LISTEN)',
+    '@@TOKEN@@', tok,
+  ].join('\n');
+  assert.deepEqual(parseStatus(macOut), { dir: mac, chromiumPid: 500, bridge: { pid: 511, port: 12309, token: tok } });
+  const win = 'C:\\Users\\Jo Smith\\AppData\\Local\\mcontrolprogram-browserpaw\\work';
+  const winOut = [
+    `dir=${win}`,
+    `4000 3000 "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" "--user-data-dir=${win}" --load-extension=C:\\bp\\ext about:blank`,
+    `4001 4000 "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" --type=renderer "--user-data-dir=${win}"`,
+    `4100 4000 C:\\Windows\\system32\\cmd.exe /d /s /c "C:\\bp\\run_host.bat chrome-extension://abc/"`,
+    `4101 4100 "C:\\node\\node.exe" C:\\bp\\index.js chrome-extension://abc/`,
+    '@@SS@@',
+    'LISTEN 127.0.0.1:12306 pid=77',
+    'LISTEN 127.0.0.1:12311 pid=4101',
+    '@@TOKEN@@', tok,
+  ].join('\n');
+  assert.deepEqual(parseStatus(winOut), { dir: win, chromiumPid: 4000, bridge: { pid: 4101, port: 12311, token: tok } });
+});
+
+test('OS detection and Windows quoting helpers', () => {
+  assert.equal(osFromUname('Linux\n'), 'linux');
+  assert.equal(osFromUname('Darwin\n'), 'macos');
+  assert.equal(osFromUname("'uname' is not recognized as an internal or external command"), undefined);
+  assert.equal(pp('~/AppData/Local/x y'), "(Join-Path $HOME 'AppData\\Local\\x y')");
+  assert.equal(pp("C:/it's"), "'C:\\it''s'");
+  // the Windows id hashes UTF-16LE with an upper-case drive letter, so drive case must not matter
+  assert.equal(platforms.windows.extensionId('c:\\bp\\ext'), platforms.windows.extensionId('C:\\bp\\ext'));
+  assert.notEqual(platforms.windows.extensionId('C:\\bp\\ext'), platforms.linux.extensionId('C:\\bp\\ext'));
+  const w = platforms.windows.launch({ dir: 'C:\\p\\a b', ext: 'C:\\e', extensionId: 'x', nativeHost: 'C:\\n.bat', chromium: 'C:\\Program Files\\c.exe' }, { browser: 'chrome', toolProfile: 'core', headless: false, extraArgs: '', env: [], task: 'T' });
+  assert.match(w, /set "CHROME_MCP_TOOL_PROFILE=core"&& start "" "C:\\Program Files\\c\.exe" --user-data-dir="C:\\p\\a b" --load-extension=C:\\e/);
+  assert.match(w, /--disable-features=DisableLoadExtensionCommandLineSwitch/);
+  assert.match(platforms.windows.wrap('x'), /^powershell -NoProfile .* -EncodedCommand [A-Za-z0-9+/=]+$/);
+});
+
+test('POSIX scripts run under sh: inspect, setup, status (linux and macos variants)', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "bp sh it's-"));
+  fs.mkdirSync(path.join(root, 'bp/app/chrome-extension/.output/chrome-mv3'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'bp/app/chrome-extension/.output/chrome-mv3/manifest.json'), '{"name":"x"}');
+  fs.mkdirSync(path.join(root, 'bp/app/native-server/dist'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'bp/app/native-server/dist/run_host.sh'), '#!/bin/sh\n');
+  for (const name of ['linux', 'macos'] as const) {
+    const pf = platforms[name];
+    const sh = (script: string) => execFileSync('/bin/sh', ['-c', script], { env: { ...process.env, HOME: root } }).toString();
+    const o = Object.fromEntries(sh(pf.inspect({ ext: '~/bp/app/chrome-extension/.output/chrome-mv3', nativeHost: `~/bp/${pf.nativeHostRel}`, chromium: '/bin/sh', profile: `~/profiles/${name}` })).trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+    assert.equal(o.ext, fs.realpathSync(path.join(root, 'bp/app/chrome-extension/.output/chrome-mv3')));
+    assert.equal(JSON.parse(Buffer.from(o.manifest!, 'base64').toString()).name, 'x');
+    assert.equal(o.nativehost, fs.realpathSync(path.join(root, 'bp/app/native-server/dist/run_host.sh')));
+    assert.equal(o.chromium, '/bin/sh');
+    assert.equal(o.dir, fs.realpathSync(path.join(root, 'profiles', name)));
+    const r = { dir: o.dir!, ext: o.ext!, extensionId: pf.extensionId(o.ext!), nativeHost: o.nativehost!, chromium: o.chromium! };
+    assert.match(sh(pf.setup(r, name, 'chromium', 'crawl')), /done=1/);
+    const m = JSON.parse(fs.readFileSync(path.join(r.dir, 'NativeMessagingHosts/com.chromemcp.nativehost.json'), 'utf8'));
+    assert.deepEqual(m.allowed_origins, [`chrome-extension://${r.extensionId}/`]);
+    assert.equal(m.path, `${r.dir}/browserpaw-host.sh`);
+    assert.match(fs.readFileSync(m.path, 'utf8'), /CHROME_MCP_TOOL_PROFILE='crawl'\nexec '.*run_host\.sh' "\$@"/);
+    assert.equal(fs.statSync(m.path).mode & 0o777, 0o700);
+    const st = parseStatus(sh(pf.status(`~/profiles/${name}`)));
+    assert.equal(st.dir, r.dir); assert.equal(st.chromiumPid, undefined); // nothing running
+  }
+  fs.rmSync(root, { recursive: true, force: true });
 });

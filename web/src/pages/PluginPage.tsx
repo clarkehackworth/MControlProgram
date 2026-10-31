@@ -72,6 +72,9 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
   const items: any[] = p.globalConfig?.[k] ?? []
   const users = usersOf(p, k, servers)
   const fk = fieldOf(p, k)
+  // `x-referenced-by: { inventory, field }` on the inventory: items of another inventory that point at these by name
+  const ref = schema['x-referenced-by'] as { inventory: string; field: string; title?: string } | undefined
+  const refs = (name: string): string[] => ref ? ((p.globalConfig?.[ref.inventory] ?? []) as any[]).filter((x) => x[ref.field] === name).map((x) => x.name) : []
   const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && !s['x-no-column'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
   const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key) && (!a.inventory || a.inventory === k))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
@@ -93,23 +96,23 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
       {schema.description && <p className="muted small">{schema.description}</p>}
       {error && <Alert kind="err">{error}</Alert>}
       <table>
-        <thead><tr><th>Name</th>{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}<th>Used by</th><th></th></tr></thead>
+        <thead><tr><th>Name</th>{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}{fk.field ? <th>Used by</th> : ref ? <th>{ref.title ?? ref.inventory}</th> : null}<th></th></tr></thead>
         <tbody>
           {items.map((it, i) => (
             <tr key={it.name ?? i}>
               <td className="mono"><strong>{it.name}</strong></td>
               {cols.map(([c]) => <td key={c}>{String(it[c] ?? '')}</td>)}
-              <td><ServerToggles item={it.name} users={users} reload={reload} /></td>
+              {fk.field ? <td><ServerToggles item={it.name} users={users} reload={reload} /></td> : ref ? <td>{refs(it.name).length ? <div className="chips">{refs(it.name).map((n) => <span key={n} className="chip small">{n}</span>)}</div> : <span className="muted small">—</span>}</td> : null}
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
                   onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
                 {fk.field && <button className="sm" onClick={() => setPairing(it.name)}>Pair server</button>}
                 <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>
-                <button className="sm danger" disabled={busy} onClick={() => { if (p.id === 'ssh' && k === 'hosts' && it.auth === 'key') setDeleting(it); else if (window.confirm(`Delete "${it.name}"?`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
+                <button className="sm danger" disabled={busy} onClick={() => { if (p.id === 'ssh' && k === 'hosts' && it.auth === 'key') setDeleting(it); else if (window.confirm(`Delete "${it.name}"?${refs(it.name).length ? ` It is used by ${ref!.inventory}: ${refs(it.name).join(', ')}, which will stop working.` : ''}`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
               </div></td>
             </tr>
           ))}
-          {items.length === 0 && <tr><td colSpan={cols.length + 2} className="muted">None configured.</td></tr>}
+          {items.length === 0 && <tr><td colSpan={cols.length + 2 + (fk.field || ref ? 1 : 0)} className="muted">None configured.</td></tr>}
         </tbody>
       </table>
       {out?.authorizeUrl && <Alert kind="ok">Open <a href={out.authorizeUrl} target="_blank" rel="noreferrer">the authorization page</a>, approve, then run "Test server".</Alert>}

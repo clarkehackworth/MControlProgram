@@ -1,17 +1,16 @@
 /**
- * BrowserPaw plugin: runs isolated Chromium profiles with the BrowserPaw extension on SSH hosts and
- * re-exposes their browser tools to agents.
+ * BrowserPaw plugin: runs isolated Chromium/Chrome/Edge profiles with the BrowserPaw extension on SSH
+ * hosts (Linux, macOS or Windows) and re-exposes their browser tools to agents.
  *
  * Per profile, on the remote host (all over the ssh plugin, which must have the host pinned):
- *   <profilesDir>/<profile>/                      Chromium --user-data-dir
- *     NativeMessagingHosts/com.chromemcp.nativehost.json   admits only the BrowserPaw extension id
- *     browserpaw-host.sh                          wrapper: sets the tool profile, execs BrowserPaw's run_host.sh
- * Chromium is launched with --load-extension=<extensionDir>. The extension starts BrowserPaw's bridge, which
- * binds a free port in 127.0.0.1:12306-12316, authenticated by the user's ~/.chrome-mcp/bridge-token.
- * MControlProgram finds the listening bridge whose process descends from the profile's Chromium (via ps + ss), tunnels to it with
- * ssh `forwardOut`, and talks MCP over the tunnel. Agents never see SSH, ports or the bridge token.
+ *   - a --user-data-dir of its own (cookies, logins);
+ *   - a native messaging registration admitting only the BrowserPaw extension id (per profile on
+ *     Linux/macOS, per user in HKCU on Windows; see platform.ts);
+ *   - the browser launched with --load-extension. The extension starts BrowserPaw's bridge, which binds a
+ *     free port in 127.0.0.1:12306-12316, authenticated by the user's ~/.chrome-mcp/bridge-token.
+ * MControlProgram finds the listening bridge whose process descends from the profile's browser, tunnels to
+ * it with ssh `forwardOut`, and talks MCP over the tunnel. Agents never see SSH, ports or the bridge token.
  */
-import { createHash } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
@@ -19,8 +18,10 @@ import { text, errorResult } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
 import { setting } from '../../core/db.js';
 import type { SshApi } from '../ssh/index.js';
+import { platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, type Os, type Browser, type Platform, type Resolved, type Status } from './platform.js';
+export { parseStatus, sp } from './platform.js';
 
-interface HostCfg { name: string; sshHost: string; description?: string; browserpawDir?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
+interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
 interface ProfileCfg { name: string; host: string; description?: string; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; extraArgs?: string }
 interface GlobalCfg { hosts: HostCfg[]; profiles: ProfileCfg[]; startTimeoutSec: number; callTimeoutMs: number }
 interface Cfg { profiles: string[]; profilesDisabled?: string[]; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
@@ -28,120 +29,95 @@ type Log = PluginContext['log'];
 interface CachedTool { name: string; title?: string; description?: string; inputSchema?: Record<string, any>; annotations?: ToolDefinition['annotations'] }
 
 const NAME = /^[a-zA-Z0-9_-]+$/;
-const DEFAULT_PROFILES_DIR = '~/.local/share/mcontrolprogram-browserpaw';
 
-// ---------- remote shell helpers ----------
+// ---------- host OS ----------
 
-const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-/** Shell word for a path; a leading `~/` becomes "$HOME"/… so it expands remotely. */
-export const sp = (p: string) => (p === '~' ? '"$HOME"' : p.startsWith('~/') ? `"$HOME"/${sq(p.slice(2))}` : sq(p));
-/** Run under POSIX sh whatever the user's login shell is (zsh would abort on an unmatched glob, fish on everything). */
-const run = (ssh: SshApi, host: string, script: string, log: Log) => ssh.exec(host, `sh -c ${sq(script)}`, log);
-const kv = (out: string) => Object.fromEntries(out.split('\n').map((l) => /^([a-z]+)=(.*)$/.exec(l)).filter((m): m is RegExpExecArray => !!m).map((m) => [m[1]!, m[2]!]));
-
-/** Chrome's id for an unpacked extension: from the manifest `key` if present, else from its absolute path. */
-export function extensionId(absPath: string, manifestKey?: string) {
-  const hex = createHash('sha256').update(manifestKey ? Buffer.from(manifestKey, 'base64') : Buffer.from(absPath)).digest('hex').slice(0, 32);
-  return [...hex].map((c) => String.fromCharCode(97 + parseInt(c, 16))).join('');
+/** Detected OS per ssh host, for hosts configured as `auto`. Cleared by "Check host". */
+const detected = new Map<string, Os>();
+async function platformOf(ssh: SshApi, h: HostCfg, log: Log): Promise<Platform> {
+  if (h.os && h.os !== 'auto') return platforms[h.os];
+  let os = detected.get(h.sshHost);
+  if (!os) {
+    os = osFromUname((await ssh.exec(h.sshHost, PROBE_UNIX, log).catch(() => ({ stdout: '' }))).stdout);
+    if (!os && (await ssh.exec(h.sshHost, PROBE_WINDOWS, log).catch(() => ({ stdout: '' }))).stdout.includes('windows')) os = 'windows';
+    if (!os) throw new Error(`host ${h.name}: could not detect the OS over ssh (uname and PowerShell both failed); set it on the host`);
+    detected.set(h.sshHost, os);
+    log.info(`browserpaw: host ${h.name} detected as ${os}`);
+  }
+  return platforms[os];
 }
 
-const paths = (h: HostCfg, p?: ProfileCfg) => {
-  const bp = h.browserpawDir || '~/dev/browserpaw';
+/** Run a platform script; output normalized to \n line endings. */
+async function run(ssh: SshApi, h: HostCfg, pf: Platform, script: string, log: Log) {
+  const r = await ssh.exec(h.sshHost, pf.wrap(script), log);
+  return { ...r, stdout: r.stdout.replace(/\r/g, '') };
+}
+
+const paths = (h: HostCfg, pf: Platform, p?: ProfileCfg) => {
+  const d = pf.defaults(h.browser ?? 'chromium');
+  const bp = (h.browserpawDir || '~/dev/browserpaw').replace(/[\\/]+$/, '');
   return {
     ext: h.extensionDir || `${bp}/app/chrome-extension/.output/chrome-mv3`,
-    nativeHost: `${bp}/app/native-server/dist/run_host.sh`,
-    profile: p ? `${h.profilesDir || DEFAULT_PROFILES_DIR}/${p.name}` : undefined,
+    nativeHost: `${bp}/${pf.nativeHostRel}`,
+    chromium: h.chromium || d.chromium,
+    profile: p ? `${(h.profilesDir || d.profilesDir).replace(/[\\/]+$/, '')}/${p.name}` : undefined,
   };
 };
 
-function launchEnv(h: HostCfg) {
-  const lines = (h.env ?? 'DISPLAY=:0').split('\n').map((l) => l.trim()).filter(Boolean);
+function launchEnv(h: HostCfg, pf: Platform): [string, string][] {
+  const lines = (h.env ?? pf.defaults(h.browser ?? 'chromium').env).split('\n').map((l) => l.trim()).filter(Boolean);
   return lines.map((l) => {
     const i = l.indexOf('='); const k = l.slice(0, i);
     if (i < 1 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`host ${h.name}: bad env line "${l}"`);
-    return `export ${k}=${sq(l.slice(i + 1))};`;
-  }).join(' ');
+    return [k, l.slice(i + 1)];
+  });
 }
 
 /** Resolve paths on the host (creating the profile dir if given) and report what is installed. */
 async function inspect(ssh: SshApi, h: HostCfg, log: Log, p?: ProfileCfg) {
-  const x = paths(h, p);
-  const r = await run(ssh, h.sshHost, [
-    `ext=$(realpath -e ${sp(x.ext)} 2>/dev/null) && echo "ext=$ext" && echo "manifest=$(base64 -w0 "$ext/manifest.json" 2>/dev/null)"`,
-    `echo "nativehost=$(realpath -e ${sp(x.nativeHost)} 2>/dev/null)"`,
-    `echo "chromium=$(command -v ${sq(h.chromium || 'chromium')} 2>/dev/null)"`,
-    x.profile ? `mkdir -p ${sp(x.profile)} && echo "dir=$(cd ${sp(x.profile)} && pwd -P)"` : 'true',
-  ].join('; '), log);
-  const o = kv(r.stdout);
+  const pf = await platformOf(ssh, h, log);
+  const x = paths(h, pf, p);
+  const o = kv((await run(ssh, h, pf, pf.inspect(x), log)).stdout);
   let key: string | undefined;
-  try { key = o.manifest ? JSON.parse(Buffer.from(o.manifest, 'base64').toString()).key : undefined; } catch { /* id from path */ }
-  return { ext: o.ext || undefined, extensionId: o.ext ? extensionId(o.ext, key) : undefined, nativeHost: o.nativehost || undefined, chromium: o.chromium || undefined, dir: o.dir || undefined, paths: x };
+  try { key = o.manifest ? JSON.parse(Buffer.from(o.manifest, 'base64').toString().replace(/^\uFEFF/, '')).key : undefined; } catch { /* id from path */ }
+  return { pf, ext: o.ext || undefined, extensionId: o.ext ? pf.extensionId(o.ext, key) : undefined, nativeHost: o.nativehost || undefined, chromium: o.chromium || undefined, dir: o.dir || undefined, paths: x };
 }
 
-/** Create the profile dir, its native messaging manifest and host wrapper. Idempotent. */
+/** Create the profile dir and its native messaging registration. Idempotent. */
 async function setupProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log) {
   const i = await inspect(ssh, h, log, p);
-  const missing = [!i.ext && `extension dir ${i.paths.ext}`, !i.nativeHost && `native host ${i.paths.nativeHost}`, !i.chromium && `chromium binary "${h.chromium || 'chromium'}"`].filter(Boolean);
-  if (missing.length) throw new Error(`host ${h.name} is missing: ${missing.join(', ')}. Build/install BrowserPaw there (see its INSTALL.md) or fix the host paths.`);
+  const missing = [!i.ext && `extension dir ${i.paths.ext}`, !i.nativeHost && `native host ${i.paths.nativeHost}`, !i.chromium && `browser binary "${i.paths.chromium}"`].filter(Boolean);
+  if (missing.length) throw new Error(`host ${h.name} (${i.pf.os}) is missing: ${missing.join(', ')}. Build/install BrowserPaw there (see its INSTALL.md) or fix the host paths.`);
   if (!i.dir) throw new Error(`could not create profile dir ${i.paths.profile}`);
-  const wrapper = `#!/bin/sh\n# Generated by MControlProgram (browserpaw plugin) for profile ${p.name}; overwritten on setup.\nexport CHROME_MCP_TOOL_PROFILE=${sq(p.toolProfile || 'full')}\nexec ${sq(i.nativeHost!)} "$@"\n`;
-  const manifest = JSON.stringify({ name: 'com.chromemcp.nativehost', description: `BrowserPaw (MControlProgram profile ${p.name})`, path: `${i.dir}/browserpaw-host.sh`, type: 'stdio', allowed_origins: [`chrome-extension://${i.extensionId}/`] }, null, 2);
-  const put = (content: string, file: string, mode: string) => `printf %s ${sq(Buffer.from(content).toString('base64'))} | base64 -d > ${sq(file)} && chmod ${mode} ${sq(file)}`;
-  const r = await run(ssh, h.sshHost, [`mkdir -p ${sq(i.dir + '/NativeMessagingHosts')}`, put(wrapper, `${i.dir}/browserpaw-host.sh`, '700'), put(manifest, `${i.dir}/NativeMessagingHosts/com.chromemcp.nativehost.json`, '600'), 'echo done'].join(' && '), log);
-  if (!r.stdout.includes('done')) throw new Error(`profile setup failed: ${r.stderr || r.stdout}`);
-  return i as typeof i & { dir: string; ext: string; extensionId: string; chromium: string };
-}
-
-interface Status { dir?: string; chromiumPid?: number; bridge?: { pid: number; port: number; token: string } }
-
-/**
- * Find the profile's Chromium and the BrowserPaw bridge it started. The bridge's port comes from `ss`
- * (the process tree ties it to this profile); BrowserPaw's registry is keyed by extension id, which every
- * profile shares, so it cannot tell profiles apart. The bearer token is per user, shared by all bridges.
- */
-export function parseStatus(out: string): Status {
-  // markers are written as @@S''S@@ etc. in the command, so `ps` listing our own shell cannot fake them
-  const [psOut = '', rest = ''] = out.split('\n@@SS@@\n');
-  const [ssOut = '', token = ''] = rest.split('\n@@TOKEN@@\n').map((x) => x.trim());
-  const dir = kv(psOut).dir || undefined;
-  const procs = new Map<number, { ppid: number; args: string }>();
-  for (const l of psOut.split('\n')) { const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(l); if (m) procs.set(Number(m[1]), { ppid: Number(m[2]), args: m[3]! }); }
-  if (!dir) return {};
-  const flag = `--user-data-dir=${dir}`;
-  const chromiumPid = [...procs].find(([, x]) => !x.args.includes(' --type=') && (x.args.includes(`${flag} `) || x.args.endsWith(flag)))?.[0];
-  if (!chromiumPid) return { dir };
-  const descends = (pid: number) => { for (let i = 0; i < 20 && pid > 1; i++) { if (pid === chromiumPid) return true; pid = procs.get(pid)?.ppid ?? 0; } return false; };
-  if (!/^[0-9a-fA-F]{48,64}$/.test(token)) return { dir, chromiumPid };
-  for (const l of ssOut.split('\n')) {
-    const m = /\s127\.0\.0\.1:(\d+)\s.*\bpid=(\d+)/.exec(l);
-    if (m && descends(Number(m[2]))) return { dir, chromiumPid, bridge: { pid: Number(m[2]), port: Number(m[1]), token } };
-  }
-  return { dir, chromiumPid };
+  const r = i as typeof i & Resolved;
+  const out = kv((await run(ssh, h, i.pf, i.pf.setup(r, p.name, h.browser ?? 'chromium', p.toolProfile || 'full'), log)).stdout);
+  if (out.done !== '1') throw new Error(`profile setup failed on ${h.name} (${i.pf.os})`);
+  if (out.previous && !out.previous.startsWith(r.dir.replace(/[\\/][^\\/]+$/, ''))) log.warn(`browserpaw: replaced native messaging registration ${out.previous} on ${h.name} (its allowed origins were kept)`);
+  return r;
 }
 
 async function status(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log): Promise<Status> {
-  const d = sp(paths(h, p).profile!);
-  const r = await run(ssh, h.sshHost, `[ -d ${d} ] && echo "dir=$(cd ${d} && pwd -P)"; ps -eo pid=,ppid=,args=; echo @@S''S@@; ss -ltnpH 2>/dev/null; echo @@TOK''EN@@; cat "$HOME"/.chrome-mcp/bridge-token 2>/dev/null; true`, log);
-  return parseStatus(r.stdout);
+  const pf = await platformOf(ssh, h, log);
+  return parseStatus((await run(ssh, h, pf, pf.status(paths(h, pf, p).profile!), log)).stdout);
 }
 
 /** Set up the profile and launch Chromium if it is not running; wait for its bridge. */
 async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: number, log: Log) {
   let st = await status(ssh, h, p, log);
   if (st.bridge) return st;
+  const pf = await platformOf(ssh, h, log);
   if (!st.chromiumPid) {
-    const i = await setupProfile(ssh, h, p, log);
-    const args = [`--user-data-dir=${sq(i.dir)}`, `--load-extension=${sq(i.ext)}`, '--no-first-run', '--no-default-browser-check', ...(p.headless ? ['--headless=new'] : []), p.extraArgs ?? ''].join(' ');
-    // ponytail: extraArgs is appended verbatim (shell syntax); it is admin-only config like the ssh host itself
-    await run(ssh, h.sshHost, `${launchEnv(h)} cd ${sq(i.dir)} && setsid -f ${sq(i.chromium)} ${args} about:blank >> ${sq(i.dir + '/chromium.log')} 2>&1 < /dev/null; echo launched`, log);
-    log.info(`browserpaw: launched chromium for profile ${p.name} on ${h.name}`);
+    const r = await setupProfile(ssh, h, p, log);
+    await run(ssh, h, pf, pf.launch(r, { browser: h.browser ?? 'chromium', toolProfile: p.toolProfile || 'full', headless: !!p.headless, extraArgs: p.extraArgs ?? '', env: launchEnv(h, pf), task: `MControlProgram-BrowserPaw-${p.name}` }), log);
+    log.info(`browserpaw: launched ${h.browser ?? 'chromium'} for profile ${p.name} on ${h.name} (${pf.os})`);
   }
   for (const until = Date.now() + timeoutSec * 1000; Date.now() < until;) {
     await new Promise((r) => setTimeout(r, 1000));
     st = await status(ssh, h, p, log);
     if (st.bridge) return st;
   }
-  throw new Error(`profile ${p.name}: ${st.chromiumPid ? 'chromium is running but the BrowserPaw bridge did not come up' : 'chromium did not start'} within ${timeoutSec}s (see ${paths(h, p).profile}/chromium.log on ${h.name})`);
+  const hint = pf.os === 'windows' ? 'Windows needs the user logged in to a desktop session (the browser starts there via a scheduled task)' : `see ${paths(h, pf, p).profile}/chromium.log on ${h.name}`;
+  throw new Error(`profile ${p.name}: ${st.chromiumPid ? 'the browser is running but the BrowserPaw bridge did not come up' : 'the browser did not start'} within ${timeoutSec}s (${hint})`);
 }
 
 // ---------- MCP over the tunnel ----------
@@ -177,12 +153,14 @@ const hostSchema = {
   properties: {
     name: { type: 'string', title: 'Name', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (must have a pinned host key). MControlProgram runs setup commands as that user.', 'x-options-from': 'ssh:hosts' },
+    os: { type: 'string', title: 'Operating system', enum: ['auto', 'linux', 'macos', 'windows'], default: 'auto', description: 'auto: detected over ssh (uname, else PowerShell). Windows needs OpenSSH Server and PowerShell; macOS and Linux need sh.' },
+    browser: { type: 'string', title: 'Browser', enum: ['chromium', 'chrome', 'edge'], default: 'chromium', description: 'Picks the default binary path and, on Windows, the registry key for native messaging. Branded Chrome/Edge get --disable-features=DisableLoadExtensionCommandLineSwitch so --load-extension still works.' },
     description: { type: 'string', title: 'Description' },
-    browserpawDir: { type: 'string', title: 'BrowserPaw checkout', description: 'Built BrowserPaw repo on the host (pnpm build). Native host: <dir>/app/native-server/dist/run_host.sh', default: '~/dev/browserpaw' },
+    browserpawDir: { type: 'string', title: 'BrowserPaw checkout', description: 'Built BrowserPaw repo on the host (pnpm build). Native host: <dir>/app/native-server/dist/run_host.sh (run_host.bat on Windows). ~/ means the ssh user\'s home on every OS.', default: '~/dev/browserpaw' },
     extensionDir: { type: 'string', title: 'Extension dir', description: 'Unpacked extension (chrome-mv3). Default: <checkout>/app/chrome-extension/.output/chrome-mv3' },
-    chromium: { type: 'string', title: 'Chromium binary', default: 'chromium' },
-    profilesDir: { type: 'string', title: 'Profiles directory', default: DEFAULT_PROFILES_DIR },
-    env: { type: 'string', title: 'Launch environment', description: 'KEY=VALUE per line for Chromium, e.g. DISPLAY=:0 and XAUTHORITY=…', format: 'multiline', default: 'DISPLAY=:0' },
+    chromium: { type: 'string', title: 'Browser binary', description: 'Empty = per OS/browser default. Linux: chromium, google-chrome, microsoft-edge (on PATH). macOS: /Applications/<App>.app/Contents/MacOS/<App>. Windows: ~/AppData/Local/Chromium/Application/chrome.exe, C:/Program Files/Google/Chrome/Application/chrome.exe, C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' },
+    profilesDir: { type: 'string', title: 'Profiles directory', description: 'Empty = ~/.local/share/mcontrolprogram-browserpaw (Linux), ~/Library/Application Support/mcontrolprogram-browserpaw (macOS), ~/AppData/Local/mcontrolprogram-browserpaw (Windows)' },
+    env: { type: 'string', title: 'Launch environment', description: 'KEY=VALUE per line for the browser. Empty = DISPLAY=:0 on Linux, nothing on macOS/Windows. Add XAUTHORITY=… or WAYLAND_DISPLAY=… as needed on Linux.', format: 'multiline' },
   },
 };
 const profileSchema = {
@@ -211,13 +189,13 @@ function lookup(g: GlobalCfg, profile: string) {
 const plugin: MControlProgramPlugin = {
   id: 'browserpaw',
   name: 'BrowserPaw',
-  version: '0.1.0',
+  version: '0.2.0',
   description: 'Run isolated Chromium profiles with the BrowserPaw extension on SSH hosts and give agents their browser tools. MControlProgram sets up the profiles, launches Chromium and tunnels to the bridge; agents never get SSH access or the bridge token.',
   dependencies: { ssh: '^0.2.0' },
   globalConfigSchema: {
     type: 'object',
     properties: {
-      hosts: { type: 'array', title: 'Browser hosts', items: hostSchema, default: [] },
+      hosts: { type: 'array', title: 'Browser hosts', items: hostSchema, default: [], 'x-referenced-by': { inventory: 'profiles', field: 'host', title: 'Profiles' } },
       profiles: { type: 'array', title: 'Profiles', description: 'Each profile is its own Chromium user-data-dir (cookies, logins) with its own BrowserPaw bridge.', items: profileSchema, default: [] },
       startTimeoutSec: { type: 'integer', title: 'Start timeout (seconds)', default: 45 },
       callTimeoutMs: { type: 'integer', title: 'Tool call timeout (ms)', default: 120000 },
@@ -230,8 +208,9 @@ const plugin: MControlProgramPlugin = {
       async run({ name }, a: PluginActionContext) {
         const g = a.config as GlobalCfg;
         const h = g.hosts.find((x) => x.name === name); if (!h) throw new Error('unknown host');
+        detected.delete(h.sshHost); // re-detect
         const i = await inspect(a.dep<SshApi>('ssh'), h, a.log);
-        return { ok: !!(i.ext && i.nativeHost && i.chromium), extension: i.ext ?? `MISSING: ${i.paths.ext}`, extensionId: i.extensionId, nativeHost: i.nativeHost ?? `MISSING: ${i.paths.nativeHost}`, chromium: i.chromium ?? `MISSING: ${h.chromium || 'chromium'}` };
+        return { ok: !!(i.ext && i.nativeHost && i.chromium), os: i.pf.os + (h.os && h.os !== 'auto' ? ' (configured)' : ' (detected)'), extension: i.ext ?? `MISSING: ${i.paths.ext}`, extensionId: i.extensionId, nativeHost: i.nativeHost ?? `MISSING: ${i.paths.nativeHost}`, browser: i.chromium ?? `MISSING: ${i.paths.chromium}` };
       },
     },
     start_profile: {
@@ -256,7 +235,8 @@ const plugin: MControlProgramPlugin = {
         const ssh = a.dep<SshApi>('ssh');
         const st = await status(ssh, h, p, a.log);
         if (!st.chromiumPid) return { ok: true, running: false };
-        await ssh.exec(h.sshHost, `kill ${st.chromiumPid}`, a.log);
+        const pf = await platformOf(ssh, h, a.log);
+        await run(ssh, h, pf, pf.stop(st.chromiumPid), a.log);
         return { ok: true, stopped: st.chromiumPid };
       },
     },
