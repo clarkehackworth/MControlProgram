@@ -109,7 +109,7 @@ export default function SshAddHost({ onClose, onDone }: { onClose: () => void; o
       {step === 'done' && (
         <>
           <Alert kind="ok">Host <b>{result?.name ?? f.name}</b> is in the inventory. Expose it on an MCP server by selecting it in that server's ssh plugin instance.</Alert>
-          {result?.publicKey && <p className="muted small">You can retrieve the public key and install instructions later with "Show public key" on the Plugins page.</p>}
+          {result?.publicKey && <p className="muted small">Use "Pair server" on the host row to make it available to an MCP server.</p>}
           <div className="row" style={{ justifyContent: 'flex-end' }}><button className="primary" onClick={onDone}>Close</button></div>
         </>
       )}

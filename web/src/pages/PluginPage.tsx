@@ -4,6 +4,7 @@ import { api, useApi, type PluginMeta, type Server } from '../api'
 import { Alert, Json, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
+import PairServer from '../plugins/PairServer'
 import SshDeleteHost from '../plugins/SshDeleteHost'
 
 /** Array-of-object properties of a plugin's global config (SSH hosts, upstream servers, credentials…). */
@@ -12,7 +13,7 @@ export function inventoryKeys(p: PluginMeta): string[] {
 }
 
 // ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
-const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key']
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key']
 
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
@@ -33,9 +34,13 @@ export default function PluginPage() {
 }
 
 /** Instances of plugin `p` whose config selects from inventory `k`, with the field + disabled-list key. */
-function usersOf(p: PluginMeta, k: string, servers: Server[]) {
+function fieldOf(p: PluginMeta, k: string) {
   const [field, fs] = Object.entries<any>(p.configSchema?.properties ?? {}).find(([, s]) => s.items?.['x-options-from'] === k) ?? []
-  const dk: string | undefined = fs?.['x-disabled-key']
+  return { field: field as string | undefined, dk: fs?.['x-disabled-key'] as string | undefined }
+}
+
+function usersOf(p: PluginMeta, k: string, servers: Server[]) {
+  const { field, dk } = fieldOf(p, k)
   if (!field) return []
   return servers.flatMap((s) => s.instances.filter((i) => i.plugin_id === p.id).map((inst) => ({ server: s, inst, field, dk })))
 }
@@ -60,11 +65,13 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
   const schema = p.globalConfigSchema.properties[k]
   const items: any[] = p.globalConfig?.[k] ?? []
   const users = usersOf(p, k, servers)
+  const fk = fieldOf(p, k)
   const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
   const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
   const [wizard, setWizard] = useState(false)
   const [deleting, setDeleting] = useState<any>()
+  const [pairing, setPairing] = useState<string>()
   const [out, setOut] = useState<any>()
   const { run, error, busy } = useAction()
   const save = (next: any[]) => api(`/plugins/${p.id}/config`, { method: 'PUT', body: { ...p.globalConfig, [k]: next } })
@@ -90,6 +97,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
                   onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
+                {fk.field && <button className="sm" onClick={() => setPairing(it.name)}>Pair server</button>}
                 <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>
                 <button className="sm danger" disabled={busy} onClick={() => { if (p.id === 'ssh' && k === 'hosts' && it.auth === 'key') setDeleting(it); else if (window.confirm(`Delete "${it.name}"?`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
               </div></td>
@@ -115,6 +123,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
         if (removeKey) await api(`/plugins/ssh/actions/remove_key`, { method: 'POST', body: { name: deleting.name, password: password || undefined } })
         await save(items.filter((x) => x.name !== deleting.name)); setDeleting(undefined); await reload()
       }} />}
+      {pairing && fk.field && <PairServer p={p} item={pairing} servers={servers} field={fk.field} dk={fk.dk} onClose={() => setPairing(undefined)} reload={reload} />}
       {wizard && <SshAddHost onClose={() => setWizard(false)} onDone={async () => { setWizard(false); await reload() }} />}
     </div>
   )
