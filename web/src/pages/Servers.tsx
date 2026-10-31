@@ -28,6 +28,7 @@ export default function Servers() {
                 <td className="small">{s.instances.map((i) => i.name).join(', ') || <span className="muted">none</span>}</td>
                 <td className="row">
                   {s.status.running ? <button className="sm" onClick={() => act(s.id, 'stop')}>Stop</button> : <button className="sm" onClick={() => act(s.id, 'start')}>Start</button>}
+                  <button className="sm danger" onClick={() => { if (window.confirm(`Delete server "${s.name}" and all its plugin instances, tokens and clients?`)) void run(async () => { await api(`/servers/${s.id}`, { method: 'DELETE' }); await reload() }) }}>Delete</button>
                 </td>
               </tr>
             ))}
