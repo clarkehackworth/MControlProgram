@@ -7,3 +7,4 @@ web/dist/
 .env
 .serena/
 .claude/
+*.tsbuildinfo
