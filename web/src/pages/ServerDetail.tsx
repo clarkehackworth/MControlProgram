@@ -160,6 +160,7 @@ function Access({ server }: { server: Server }) {
   const [clients, reloadClients] = useApi<any[]>(`/servers/${server.id}/oauth/clients`, 10000)
   const [issued] = useApi<any[]>(`/servers/${server.id}/oauth/tokens`, 10000)
   const [newName, setNewName] = useState('')
+  const [newExpiry, setNewExpiry] = useState('')
   const [created, setCreated] = useState<{ name: string; token: string }>()
   const { run, error, busy } = useAction()
   const oauth = server.auth_mode === 'oauth' || server.auth_mode === 'both'
@@ -173,7 +174,8 @@ function Access({ server }: { server: Server }) {
         {created && <Alert kind="ok"><div>Token <strong>{created.name}</strong> created. Copy it now; it will not be shown again.</div><div className="row" style={{ marginTop: 6 }}><code>{created.token}</code><CopyButton text={created.token} /></div></Alert>}
         <div className="row" style={{ marginBottom: 12 }}>
           <input type="text" placeholder="Token name, e.g. claude-code-laptop" value={newName} onChange={(e) => setNewName(e.target.value)} style={{ maxWidth: 320 }} />
-          <button className="primary" disabled={busy || !newName} onClick={() => run(async () => { const r = await api(`/servers/${server.id}/tokens`, { method: 'POST', body: { name: newName } }); setCreated({ name: newName, token: r.token }); setNewName(''); await reloadTokens() })}>Create token</button>
+          <input type="date" title="Expires (end of day; blank = never)" value={newExpiry} min={new Date().toISOString().slice(0, 10)} onChange={(e) => setNewExpiry(e.target.value)} style={{ maxWidth: 160 }} />
+          <button className="primary" disabled={busy || !newName} onClick={() => run(async () => { const r = await api(`/servers/${server.id}/tokens`, { method: 'POST', body: { name: newName, expires_at: newExpiry ? new Date(`${newExpiry}T23:59:59`).toISOString() : undefined } }); setCreated({ name: newName, token: r.token }); setNewName(''); setNewExpiry(''); await reloadTokens() })}>Create token</button>
         </div>
         <table><thead><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>
           {tokens?.map((t) => <tr key={t.id}><td>{t.name}</td><td className="mono">{t.prefix}…</td><td>{fmtTime(t.created_at)}</td><td>{fmtTime(t.last_used_at)}</td><td>{t.expires_at ? fmtTime(t.expires_at) : 'never'}</td>
