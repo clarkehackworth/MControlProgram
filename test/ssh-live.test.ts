@@ -17,7 +17,7 @@ const mk = async (over: Record<string, unknown>) => {
   const ssh = (await import('../src/plugins/ssh/index.js')).default;
   const { ScopedLogger } = await import('../src/core/logger.js');
   const inst = (await ssh.create({ instanceId: 'i', instanceName: 'ssh', serverId: 's', global: () => ({ stateIdleSec: 172800, connectionIdleSec: 3600, logRetentionDays: 30 }), log: new ScopedLogger({}, () => 'off'),
-    config: { ...ssh.defaultConfig, ...over },
+    config: { ...ssh.defaultConfig, hosts: ['box'], ...over },
     pluginConfig: { ...ssh.defaultGlobalConfig, hosts: [{ name: 'box', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key', privateKey: fs.readFileSync(keyFile!, 'utf8') }] } })) as any;
   await inst.start?.();
   const tool = (n: string) => inst.tools.find((t: any) => t.name === n);
@@ -108,4 +108,58 @@ test('reaper closes idle shells and connections, but output keeps a shell alive'
   await new Promise((r) => setTimeout(r, 16_500));
   assert.equal(Object.keys((await inst.status()).connections).length, 0, 'connection dropped once everything is idle');
   await inst.stop();
+});
+
+test('host key: test_host pins on first use, mismatch is refused, tunnel forwards and requires a pin', { skip }, async () => {
+  const ssh = await import('../src/plugins/ssh/index.js');
+  const { ScopedLogger } = await import('../src/core/logger.js');
+  const net = await import('node:net');
+  const log = new ScopedLogger({}, () => 'off');
+  const box = { name: 'box', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key' as const, privateKey: fs.readFileSync(keyFile!, 'utf8') };
+  let stored: any = { ...ssh.default.defaultGlobalConfig, hosts: [box] };
+  const actx = { get config() { return stored; }, async setConfig(n: any) { stored = n; }, log };
+  const r: any = await ssh.default.globalActions!.test_host!.run({ name: 'box' }, actx);
+  assert.match(r.hostKey, /^SHA256:/); assert.ok(r.pinned);
+  assert.equal(stored.hosts[0].hostKey, r.hostKey);
+  await assert.rejects(ssh.default.globalActions!.test_host!.run({ name: 'box' }, { ...actx, config: { ...stored, hosts: [{ ...box, hostKey: 'SHA256:wrong' }] } }), /host key mismatch/);
+  const g = { connectTimeoutMs: 5000, keepaliveSec: 30 };
+  await assert.rejects(ssh.openTunnel(box, g, '127.0.0.1', 1, log), /no pinned host key/);
+  const echo = net.createServer((s) => s.pipe(s)); await new Promise<void>((res) => echo.listen(0, '127.0.0.1', res));
+  const t = await ssh.openTunnel(stored.hosts[0], g, '127.0.0.1', (echo.address() as any).port, log);
+  for (let i = 0; i < 2; i++) { // two connections share one ssh session
+    const got = await new Promise<string>((res, rej) => { const c = net.connect(t.port, '127.0.0.1', () => c.end('ping' + i)); let b = ''; c.on('data', (d) => (b += d)).on('end', () => res(b)).on('error', rej); });
+    assert.equal(got, 'ping' + i);
+  }
+  t.close(); echo.close();
+});
+
+test('mcp plugin: http upstream reached through an ssh host (sshHost) with a pinned key', { skip }, async () => {
+  const { spawn } = await import('node:child_process');
+  const { fileURLToPath } = await import('node:url');
+  const { createHash } = await import('node:crypto');
+  const ssh2 = (await import('ssh2')).default;
+  const { pluginConfig } = await import('../src/core/store.js');
+  const { ScopedLogger } = await import('../src/core/logger.js');
+  const { GLOBAL_DEFAULTS } = await import('../src/core/global-config.js');
+  const mcp = (await import('../src/plugins/mcp/index.js')).default;
+  // learn the test sshd's host key the way an admin would (first-use), then pin it
+  const hostKey = await new Promise<string>((res, rej) => { const c = new ssh2.Client(); let fp = ''; c.on('ready', () => { c.end(); res(fp); }).on('error', rej)
+    .connect({ host: '127.0.0.1', port, username: os.userInfo().username, privateKey: fs.readFileSync(keyFile!, 'utf8'), hostVerifier: (k: Buffer) => { fp = 'SHA256:' + createHash('sha256').update(k).digest('base64').replace(/=+$/, ''); return true; } }); });
+  pluginConfig.savePlain('ssh', { connectTimeoutMs: 5000, keepaliveSec: 30, hosts: [{ name: 'box', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key', privateKey: fs.readFileSync(keyFile!, 'utf8'), hostKey }] });
+  const UP = 7898;
+  const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/echo-mcp.mjs');
+  const up = spawn(process.execPath, [fixture, 'http', String(UP), 'tok'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  try {
+    await new Promise<void>((r) => up.stdout.on('data', (d) => d.toString().includes('ready') && r()));
+    const servers = [{ name: 'remote', transport: 'http', url: `http://127.0.0.1:${UP}/mcp`, auth: 'bearer', token: 'tok', sshHost: 'box' }];
+    const inst = await mcp.create({ instanceId: 'i', instanceName: 'mcp', serverId: 's', config: { ...mcp.defaultConfig, servers: ['remote'] }, pluginConfig: { servers, callTimeoutMs: 5000 }, global: () => GLOBAL_DEFAULTS, log: new ScopedLogger({}, () => 'off') });
+    await inst.start?.();
+    const echo = inst.tools.find((t) => t.name === 'remote_echo')!;
+    const r = await echo.handler({ text: 'via-ssh' }, { signal: new AbortController().signal, log: new ScopedLogger({}, () => 'off') } as any);
+    assert.equal(r.content[0].type === 'text' && r.content[0].text, 'echo:via-ssh');
+    await inst.stop?.();
+    // wrong pin → refused
+    pluginConfig.savePlain('ssh', { connectTimeoutMs: 5000, keepaliveSec: 30, hosts: [{ name: 'box', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key', privateKey: fs.readFileSync(keyFile!, 'utf8'), hostKey: 'SHA256:wrong' }] });
+    await assert.rejects(mcp.globalActions!.test_server!.run({ name: 'remote' }, { config: { servers }, setConfig: async () => {}, log: new ScopedLogger({}, () => 'off') }), /host key mismatch/);
+  } finally { up.kill(); }
 });

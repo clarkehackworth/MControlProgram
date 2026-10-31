@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { z } from 'zod';
 import { servers, instances, bearerTokens, admins, logs, pluginConfig } from '../core/store.js';
 import { approvals } from '../core/approvals.js';
-import { plugins, loadPlugins } from '../core/plugin-loader.js';
+import { plugins, loadPlugins, depResolver } from '../core/plugin-loader.js';
 import { manager } from '../mcp/manager.js';
 import { oauthClients } from '../mcp/oauth.js';
 import { verifyPassword } from '../core/crypto.js';
@@ -72,7 +72,8 @@ export function adminApi() {
     id: p.id, name: p.name, version: p.version, description: p.description, source: p.source,
     configSchema: p.configSchema, defaultConfig: p.defaultConfig ?? {},
     globalConfigSchema: p.globalConfigSchema, globalConfig: p.globalConfigSchema ? pluginConfig.redacted(p.id) : undefined,
-    globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title })),
+    globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory })),
+    dependencies: p.dependencies ?? {},
   });
   r.get('/plugins', wrap(() => plugins.list().map(pluginView)));
   r.put('/plugins/:pid/config', wrap(async (req) => {
@@ -90,6 +91,7 @@ export function adminApi() {
       config: pluginConfig.decrypted(pid),
       async setConfig(next) { pluginConfig.savePlain(pid, next); await manager.applyPlugin(pid); },
       log: new ScopedLogger({ category: `plugin:${pid}` }),
+      dep: depResolver(p!),
     });
     return { result };
   }));
@@ -99,7 +101,7 @@ export function adminApi() {
     const action = p?.globalActions?.callback;
     if (!action) return res.status(404).send('no callback');
     try {
-      await action.run(req.query as Record<string, any>, { config: pluginConfig.decrypted(pid), async setConfig(next) { pluginConfig.savePlain(pid, next); await manager.applyPlugin(pid); }, log: new ScopedLogger({ category: `plugin:${pid}` }) });
+      await action.run(req.query as Record<string, any>, { config: pluginConfig.decrypted(pid), async setConfig(next) { pluginConfig.savePlain(pid, next); await manager.applyPlugin(pid); }, log: new ScopedLogger({ category: `plugin:${pid}` }), dep: depResolver(p!) });
       res.send('<p>Authorized. You can close this tab and return to MControlProgram.</p>');
     } catch (e) { res.status(400).send(`<p>Authorization failed: ${String((e as Error).message ?? e)}</p>`); }
   });

@@ -14,10 +14,12 @@ import { effective } from '../../core/global-config.js';
 import { setting } from '../../core/db.js';
 import { encrypt, decrypt } from '../../core/crypto.js';
 import { config as mcontrolprogramConfig } from '../../core/config.js';
+import { pluginConfig } from '../../core/store.js';
+import { openTunnel, type HostCfg } from '../ssh/index.js';
 
 interface ServerCfg {
   name: string; description?: string; transport: 'http' | 'stdio';
-  url?: string; auth: 'none' | 'bearer' | 'header' | 'oauth'; token?: string; headerName?: string;
+  url?: string; auth: 'none' | 'bearer' | 'header' | 'oauth'; token?: string; headerName?: string; sshHost?: string;
   command?: string; args?: string; env?: string; cwd?: string;
 }
 interface GlobalCfg { servers: ServerCfg[]; callTimeoutMs: number }
@@ -31,6 +33,7 @@ const serverSchema = {
     description: { type: 'string', title: 'Description' },
     transport: { type: 'string', title: 'Transport', enum: ['http', 'stdio'], default: 'http' },
     url: { type: 'string', title: 'URL', description: 'Streamable HTTP endpoint, e.g. https://mcp.example.com/mcp', 'x-show-if': { transport: 'http' } },
+    sshHost: { type: 'string', title: 'Reach via SSH host (optional)', description: 'Name of a host in the SSH plugin (must have a pinned host key). The URL is then resolved on that host, like ssh -L: e.g. http://127.0.0.1:12306/mcp is the remote machine\'s localhost. http only; not with OAuth.', 'x-show-if': { transport: 'http' } },
     auth: { type: 'string', title: 'Authentication', enum: ['none', 'bearer', 'header', 'oauth'], default: 'none', 'x-show-if': { transport: 'http' } },
     token: { type: 'string', title: 'Token / header value', 'x-secret': true, 'x-show-if': { auth: ['bearer', 'header'] } },
     headerName: { type: 'string', title: 'Header name', default: 'X-API-Key', 'x-show-if': { auth: 'header' } },
@@ -81,12 +84,31 @@ function makeTransport(s: ServerCfg) {
   return new StreamableHTTPClientTransport(new URL(s.url), { requestInit: { headers }, authProvider: s.auth === 'oauth' ? oauthProvider(s.name) : undefined });
 }
 
+/** If the server is reached through an SSH host, open the tunnel and return the server with its URL pointed at the local end. */
+async function viaTunnel(s: ServerCfg, log: PluginContext['log']) {
+  if (s.transport !== 'http' || !s.sshHost) return { s, close: () => {} };
+  if (s.auth === 'oauth') throw new Error(`server ${s.name}: OAuth is not supported through an SSH host`);
+  const u = new URL(s.url ?? '');
+  if (u.protocol !== 'http:') throw new Error(`server ${s.name}: only http:// URLs can go through an SSH host`);
+  const g = pluginConfig.decrypted('ssh') as { hosts?: HostCfg[]; connectTimeoutMs: number; keepaliveSec: number };
+  const h = g.hosts?.find((x) => x.name === s.sshHost);
+  if (!h) throw new Error(`server ${s.name}: ssh host "${s.sshHost}" is not in the SSH plugin inventory`);
+  const t = await openTunnel(h, g, u.hostname, Number(u.port) || 80, log);
+  u.host = `127.0.0.1:${t.port}`;
+  return { s: { ...s, url: u.toString() }, close: t.close };
+}
+
 /** Connect and return the client; for OAuth servers that need authorization, throws UnauthorizedError after capturing the URL. */
-async function connect(s: ServerCfg): Promise<{ client: Client; transport: ReturnType<typeof makeTransport> }> {
-  const transport = makeTransport(s);
-  const client = new Client({ name: 'mcontrolprogram', version: '0.1.0' });
-  await client.connect(transport);
-  return { client, transport };
+async function connect(s0: ServerCfg, log: PluginContext['log']): Promise<{ client: Client; transport: ReturnType<typeof makeTransport> }> {
+  const { s, close } = await viaTunnel(s0, log);
+  try {
+    const transport = makeTransport(s);
+    const client = new Client({ name: 'mcontrolprogram', version: '0.1.0' });
+    await client.connect(transport);
+    const onclose = transport.onclose; // set by client.connect; the tunnel lives exactly as long as the transport
+    transport.onclose = () => { close(); onclose?.(); };
+    return { client, transport };
+  } catch (e) { close(); throw e; }
 }
 
 const plugin: MControlProgramPlugin = {
@@ -105,11 +127,11 @@ const plugin: MControlProgramPlugin = {
   globalActions: {
     test_server: {
       title: 'Test server',
-      async run({ name }, { config }) {
+      async run({ name }, { config, log }) {
         const s = (config.servers as ServerCfg[]).find((x) => x.name === name);
         if (!s) throw new Error('unknown server');
         try {
-          const { client } = await connect(s);
+          const { client } = await connect(s, log);
           const tools = (await client.listTools()).tools.map((t) => t.name);
           await client.close();
           return { ok: true, serverInfo: client.getServerVersion?.(), tools };
@@ -121,12 +143,12 @@ const plugin: MControlProgramPlugin = {
     },
     oauth_start: {
       title: 'Authorize (OAuth)',
-      async run({ name }, { config }) {
+      async run({ name }, { config, log }) {
         const s = (config.servers as ServerCfg[]).find((x) => x.name === name);
         if (!s) throw new Error('unknown server');
         if (s.auth !== 'oauth') throw new Error('server is not configured for OAuth');
         pendingAuth.delete(name);
-        try { const { client } = await connect(s); await client.close(); return { ok: true, alreadyAuthorized: true }; }
+        try { const { client } = await connect(s, log); await client.close(); return { ok: true, alreadyAuthorized: true }; }
         catch (e) {
           if (!(e instanceof UnauthorizedError)) throw e;
           const url = pendingAuth.get(name)?.toString();
@@ -185,7 +207,7 @@ const plugin: MControlProgramPlugin = {
     const client = async (s: ServerCfg): Promise<Client> => {
       const c = conns.get(s.name);
       if (c) { c.lastUsed = Date.now(); return c.client; }
-      const { client } = await connect(s);
+      const { client } = await connect(s, ctx.log);
       client.onclose = () => { if (conns.get(s.name)?.client === client) conns.delete(s.name); };
       conns.set(s.name, { client, lastUsed: Date.now() });
       ctx.log.debug(`connected to ${s.name}`);

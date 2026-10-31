@@ -22,7 +22,7 @@ export default function Plugins() {
       {plugins?.map((p) => (
         <div className="card" key={p.id}>
           <div className="row between">
-            <div className="row"><strong>{p.name}</strong><Badge kind="info">{p.id}@{p.version}</Badge><span className="muted small">{p.source}</span></div>
+            <div className="row"><strong>{p.name}</strong><Badge kind="info">{p.id}@{p.version}</Badge>{Object.entries(p.dependencies ?? {}).map(([d, r]) => <span key={d} className="muted small">needs {d} {r}</span>)}<span className="muted small">{p.source}</span></div>
             <div className="row">
               {inventoryKeys(p).length > 0 && <Link to={`/p/${p.id}`}><button>Manage {inventoryKeys(p).map((k) => (p.globalConfigSchema.properties[k].title ?? k).toLowerCase()).join(', ')} →</button></Link>}
               {settingsSchema(p) && <button className="primary" onClick={() => setConfiguring(p)}>Configure</button>}

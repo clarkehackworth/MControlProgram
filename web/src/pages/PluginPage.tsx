@@ -29,9 +29,14 @@ export default function PluginPage() {
     <>
       <h1 style={{ marginBottom: 4 }}>{p.name}</h1>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
-      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} />)}
+      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} options={optionSources(p, plugins)} />)}
     </>
   )
+}
+
+/** Values for `x-options-from`: this plugin's global config, plus `<pluginId>:<key>` for every other plugin's. */
+function optionSources(p: PluginMeta, all: PluginMeta[]) {
+  return { ...p.globalConfig, ...Object.fromEntries(all.flatMap((x) => Object.entries(x.globalConfig ?? {}).map(([k, v]) => [`${x.id}:${k}`, v]))) }
 }
 
 /** Instances of plugin `p` whose config selects from inventory `k`, with the field + disabled-list key. */
@@ -62,13 +67,13 @@ function ServerToggles({ item, users, reload }: { item: string; users: ReturnTyp
   })}</div>
 }
 
-function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; servers: Server[]; reload: () => Promise<void> }) {
+function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: string; servers: Server[]; reload: () => Promise<void>; options: Record<string, any> }) {
   const schema = p.globalConfigSchema.properties[k]
   const items: any[] = p.globalConfig?.[k] ?? []
   const users = usersOf(p, k, servers)
   const fk = fieldOf(p, k)
   const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
-  const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key))
+  const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key) && (!a.inventory || a.inventory === k))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
   const [wizard, setWizard] = useState(false)
   const [deleting, setDeleting] = useState<any>()
@@ -111,7 +116,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
       {out && <div style={{ marginTop: 12 }}><div className="row between"><strong className="small">{out.action}</strong><button className="sm" onClick={() => setOut(undefined)}>Clear</button></div><Json value={out} /></div>}
       {editing && <Modal title={editing.index < 0 ? `Add to ${schema.title ?? k}` : `Edit ${editing.value.name}`} onClose={() => setEditing(undefined)}>
         <p className="muted small">Shared by every <code>{p.id}</code> instance on every server. Saving restarts those instances. Secrets show as •••••••• — leave them to keep the stored value.</p>
-        <SchemaForm schema={schema.items} value={editing.value} onChange={(v) => setEditing({ ...editing, value: v })} />
+        <SchemaForm schema={schema.items} value={editing.value} onChange={(v) => setEditing({ ...editing, value: v })} options={options} />
         {p.id === 'ssh' && k === 'hosts' && editing.index >= 0 && editing.value.auth === 'key' && <SshPublicKey name={editing.value.name} />}
         <div className="row between" style={{ marginTop: 12 }}>
           <button onClick={() => setEditing(undefined)}>Cancel</button>

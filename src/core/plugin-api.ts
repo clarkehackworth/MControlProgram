@@ -56,6 +56,8 @@ export interface PluginActionContext {
   /** Persist new plugin-wide config (secrets are encrypted; all instances of the plugin reload). */
   setConfig(next: Record<string, any>): Promise<void>;
   log: ScopedLogger;
+  /** The `api` of a plugin listed in this plugin's `dependencies`. Throws for undeclared or missing ones. */
+  dep<T = any>(id: string): T;
 }
 
 export interface PluginContext {
@@ -69,6 +71,8 @@ export interface PluginContext {
   /** Live view of MControlProgram-wide defaults (idle timeouts, …). Read it at use time, not once at create. */
   global: () => GlobalConfig;
   log: ScopedLogger;
+  /** The `api` of a plugin listed in this plugin's `dependencies`. Throws for undeclared or missing ones. */
+  dep<T = any>(id: string): T;
 }
 
 export interface PluginInstance {
@@ -101,8 +105,19 @@ export interface MControlProgramPlugin {
    */
   globalConfigSchema?: ConfigSchema;
   defaultGlobalConfig?: Record<string, any>;
-  /** Plugin-level admin actions (run from the Plugins page), e.g. "add host", "generate key". */
-  globalActions?: Record<string, { title: string; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
+  /**
+   * Plugin-level admin actions (run from the Plugins page), e.g. "add host", "generate key".
+   * `inventory` limits the row button to one inventory table (a key of the global config); default all.
+   */
+  globalActions?: Record<string, { title: string; inventory?: string; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
+  /**
+   * Other plugins this one needs: plugin id → semver range (`^1.2.0`, `>=0.2.0`, `*`).
+   * A plugin whose dependencies are missing or the wrong version is not loaded. Reach a dependency's
+   * `api` through `ctx.dep(id)`.
+   */
+  dependencies?: Record<string, string>;
+  /** What this plugin offers to plugins that depend on it (see `dependencies`). */
+  api?: unknown;
   /** Default tool prefix (defaults to id). */
   toolPrefix?: string;
   create(ctx: PluginContext): PluginInstance | Promise<PluginInstance>;

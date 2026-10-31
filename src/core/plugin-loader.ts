@@ -5,6 +5,7 @@ import { config } from './config.js';
 import { log } from './logger.js';
 import type { MControlProgramPlugin } from './plugin-api.js';
 import { setting } from './db.js';
+import { satisfies } from './semver.js';
 
 const registry = new Map<string, MControlProgramPlugin & { source: string }>();
 
@@ -25,7 +26,7 @@ async function loadFrom(specifier: string, source: string) {
 export async function loadPlugins() {
   registry.clear();
   const errors: string[] = [];
-  const builtins = ['ssh', 'web', 'mcp'];
+  const builtins = ['ssh', 'web', 'mcp', 'browserpaw'];
   for (const id of builtins) {
     try { await loadFrom(`../plugins/${id}/index.js`, `builtin:${id}`); }
     catch (e) { errors.push(`builtin ${id}: ${(e as Error).message}`); }
@@ -53,9 +54,36 @@ export async function loadPlugins() {
     try { await loadFrom(name, `npm:${name}`); }
     catch (e) { errors.push(`npm ${name}: ${(e as Error).message}`); }
   }
+  errors.push(...checkDependencies());
   for (const e of errors) log({ level: 'error', category: 'plugin', message: e });
   return { loaded: [...registry.keys()], errors };
 }
+
+/** Unload plugins whose dependencies are missing or out of range, repeating until stable (dependents of dropped plugins drop too). */
+function checkDependencies() {
+  const errors: string[] = [];
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const p of registry.values()) {
+      const bad = Object.entries(p.dependencies ?? {}).flatMap(([id, range]) => {
+        const d = registry.get(id);
+        if (!d) return [`${id} ${range} (not loaded)`];
+        try { return satisfies(d.version, range) ? [] : [`${id} ${range} (found ${d.version})`]; }
+        catch (e) { return [`${id} ${range} (${(e as Error).message})`]; }
+      });
+      if (bad.length) { registry.delete(p.id); errors.push(`${p.id}: unmet dependencies: ${bad.join(', ')}`); changed = true; }
+    }
+  }
+  return errors;
+}
+
+/** `ctx.dep` for plugin `p`: the api of a declared, loaded dependency. */
+export const depResolver = (p: MControlProgramPlugin) => <T = any>(id: string): T => {
+  if (!p.dependencies?.[id]) throw new Error(`plugin ${p.id} did not declare a dependency on ${id}`);
+  const d = registry.get(id);
+  if (!d) throw new Error(`plugin ${p.id} needs ${id}, which is not loaded`);
+  return d.api as T;
+};
 
 export const plugins = {
   get: (id: string) => registry.get(id),

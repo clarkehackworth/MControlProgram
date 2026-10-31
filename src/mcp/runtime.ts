@@ -15,7 +15,7 @@ import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { MControlProgramOAuthProvider } from './oauth.js';
 import { servers as serverStore, instances as instanceStore, bearerTokens, pluginConfig, type ServerRecord, type PluginInstanceRecord } from '../core/store.js';
 import { approvals } from '../core/approvals.js';
-import { plugins } from '../core/plugin-loader.js';
+import { plugins, depResolver } from '../core/plugin-loader.js';
 import { ScopedLogger, log } from '../core/logger.js';
 import { getGlobalConfig } from '../core/global-config.js';
 import type { MControlProgramPlugin, PluginInstance, ToolDefinition } from '../core/plugin-api.js';
@@ -99,7 +99,7 @@ export class RunningServer {
       return;
     }
     try {
-      const instance = await plugin.create({ instanceId: rec.id, instanceName: rec.name, serverId: this.record.id, config: instanceStore.decrypted(rec), pluginConfig: pluginConfig.decrypted(rec.plugin_id), global: getGlobalConfig, log: ilog });
+      const instance = await plugin.create({ instanceId: rec.id, instanceName: rec.name, serverId: this.record.id, config: instanceStore.decrypted(rec), pluginConfig: pluginConfig.decrypted(rec.plugin_id), global: getGlobalConfig, log: ilog, dep: depResolver(plugin) });
       await instance.start?.();
       this.live.set(rec.id, { record: rec, plugin, instance, log: ilog });
       ilog.info(`plugin instance "${rec.name}" started (${instance.tools.length} tools)`);

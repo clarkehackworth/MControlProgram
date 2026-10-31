@@ -137,6 +137,38 @@ MControlProgram's (`import { z } from 'zod'`).
 See `examples/echo-plugin` for a complete minimal plugin and `src/plugins/ssh` for a full one
 (connection pooling, idle disconnect, per-session cleanup, actions).
 
+## Dependencies and versions
+
+A plugin can build on another one. Declare it with a semver range and reach its `api` through `ctx.dep()`:
+
+```ts
+import type { SshApi } from '../ssh/index.js';
+export default {
+  id: 'browserpaw', version: '0.1.0',
+  dependencies: { ssh: '^0.2.0' },          // id → range: ^ ~ >= > <= < exact *, space = AND, || = OR
+  create(ctx) { const ssh = ctx.dep<SshApi>('ssh'); /* ... */ },
+  globalActions: { check: { title: 'Check', async run(p, a) { await a.dep<SshApi>('ssh').exec('box', 'true', a.log); } } },
+};
+```
+
+- A plugin whose dependencies are missing or out of range is **not loaded**, and neither is anything that depends on it. The reason shows on the Plugins page after a reload.
+- `ctx.dep(id)` throws for a plugin you did not declare, so dependencies stay explicit.
+- The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
+- Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key.
+- An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
+- A global action with `inventory: '<key>'` only shows as a row button on that inventory table.
+
+## Built-in: browserpaw
+
+Runs isolated Chromium profiles with the [BrowserPaw](https://github.com/GoldenLoaf24h/browserpaw) extension on SSH hosts. Admins configure:
+
+- **Browser hosts**: an SSH host from the ssh plugin (with a pinned key), the BrowserPaw checkout and extension dir there, the Chromium binary, the profiles directory and the launch environment (`DISPLAY=:0`). Use **Check host** to verify.
+- **Profiles**: each one is its own `--user-data-dir` with its own logins and its own BrowserPaw bridge. **Set up & start** creates the directory, a per-profile `NativeMessagingHosts/` manifest (allowing only the extension's id), and a host wrapper that sets the tool profile. It then launches Chromium with `--load-extension` and caches the tool list.
+
+When an agent calls a tool, the plugin finds the profile's bridge: it is the listening process whose ancestor is that profile's Chromium, found with `ps` and `ss`. The plugin tunnels to the bridge with ssh `forwardOut` and forwards the call with the bridge's bearer token. If the profile isn't running, it starts it first (when "Start on demand" is on). Agents get the BrowserPaw tools plus `profiles`. When more than one profile is exposed, every tool requires a `profile` argument. Agents never see SSH, ports or the token. Use the instance's allow/deny lists and approval policy for risky tools (`chrome_javascript`, cookies, network capture).
+
+The SSH user needs a normal shell, because the plugin runs setup commands as that user. Don't reuse a `command="true"` tunnel-only key for this host.
+
 ## Raw JSON Schema tools
 
 A tool may give `jsonSchema` (a JSON Schema object) instead of a zod `inputSchema`. MControlProgram
