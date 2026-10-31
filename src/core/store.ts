@@ -55,6 +55,11 @@ export const servers = {
 };
 
 export const instances = {
+  /** Every loaded plugin is attached to every server (enabled); admins can disable per server. Returns the newly created ids. */
+  ensureAll(serverId: string): string[] {
+    const have = new Set(this.listForServer(serverId).map((i) => i.plugin_id));
+    return plugins.list().filter((p) => !have.has(p.id)).map((p) => this.create(serverId, p.id, p.id, {}).id);
+  },
   listForServer: (serverId: string): PluginInstanceRecord[] =>
     (getDb().prepare('SELECT * FROM plugin_instances WHERE server_id=? ORDER BY position, created_at').all(serverId) as Row[]).map(rowToInstance),
   get: (id: string): PluginInstanceRecord | undefined => {

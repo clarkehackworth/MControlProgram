@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, fmtTime, useApi, type ApprovalPolicy, type Instance, type InstanceStatus, type PluginMeta, type Server } from '../api'
-import { Alert, Badge, CopyButton, Field, Json, Modal, useAction } from '../components/ui'
-import SchemaForm, { defaultsFor } from '../components/SchemaForm'
+import { Alert, Badge, CopyButton, Field, Modal, useAction } from '../components/ui'
+import SchemaForm from '../components/SchemaForm'
 import { AuthSelect, LogSelect } from './Servers'
 import { LogTable } from './Logs'
 
@@ -85,47 +85,40 @@ function General({ server, reload }: { server: Server; reload: () => Promise<voi
 
 function PluginsTab({ server, reload }: { server: Server; reload: () => Promise<void> }) {
   const [plugins] = useApi<PluginMeta[]>('/plugins')
-  const [adding, setAdding] = useState(false)
-  const [editing, setEditing] = useState<Instance>()
   const { run, error } = useAction()
-  const [actionOut, setActionOut] = useState<Record<string, unknown>>({})
+  const [gating, setGating] = useState<Instance>()
   const statusOf = (i: Instance): InstanceStatus | undefined => server.status.instances.find((s) => s.id === i.id)
   return (
-    <>
+    <div className="card">
+      <h2 style={{ marginTop: 0 }}>Plugins</h2>
+      <p className="muted small">All plugins are available on every server. Disable the ones this server should not offer. Choose which hosts / servers / credentials a plugin exposes from the plugin's own page ("Pair server").</p>
       {error && <Alert kind="err">{error}</Alert>}
-      <div className="row between" style={{ marginBottom: 12 }}><h2 style={{ margin: 0 }}>Plugin instances</h2><button className="primary" onClick={() => setAdding(true)}>+ Add plugin</button></div>
-      {server.instances.length === 0 && <div className="card muted">No plugins on this server. Agents connecting will see no tools.</div>}
-      {server.instances.map((inst) => {
-        const st = statusOf(inst); const meta = plugins?.find((p) => p.id === inst.plugin_id)
-        return (
-          <div className="card" key={inst.id}>
-            <div className="row between">
-              <div className="row">
-                <strong>{inst.name}</strong><Badge kind="info">{meta?.name ?? inst.plugin_id} {meta?.version}</Badge>
-                {!inst.enabled ? <Badge>disabled</Badge> : st?.error ? <Badge kind="err">error</Badge> : st ? <Badge kind="ok">active</Badge> : <Badge kind="warn">not running</Badge>}
-              </div>
-              <div className="row">
-                <label className="toggle"><input type="checkbox" checked={inst.enabled} onChange={(e) => run(async () => { await api(`/instances/${inst.id}`, { method: 'PUT', body: { enabled: e.target.checked } }); await reload() })} /> Enabled</label>
-                <button className="sm" onClick={() => setEditing(inst)}>Configure</button>
-                {st && <ToolsButton inst={st} />}
-                <button className="sm danger" onClick={() => { if (window.confirm(`Remove plugin instance "${inst.name}"?`)) void run(async () => { await api(`/instances/${inst.id}`, { method: 'DELETE' }); await reload() }) }}>Remove</button>
-              </div>
-            </div>
-            {st?.error && <div className="err small" style={{ marginTop: 8 }}>{st.error}</div>}
-            {st && <InstanceItems inst={st} />}
-            {st?.status && <details style={{ marginTop: 10 }}><summary className="muted small">Status</summary><Json value={st.status} /></details>}
-            {st?.actions && st.actions.length > 0 && (
-              <div className="row" style={{ marginTop: 10 }}>
-                {st.actions.map((a) => <button className="sm" key={a.key} onClick={() => run(async () => { const r = await api(`/instances/${inst.id}/actions/${a.key}`, { method: 'POST', body: {} }); setActionOut({ ...actionOut, [inst.id]: r.result }) })}>{a.title}</button>)}
-              </div>
-            )}
-            {actionOut[inst.id] !== undefined && <Json value={actionOut[inst.id]} />}
-          </div>
-        )
-      })}
-      {adding && plugins && <AddInstance server={server} plugins={plugins} onClose={() => setAdding(false)} onDone={() => { setAdding(false); void reload() }} />}
-      {editing && plugins && <EditInstance inst={editing} meta={plugins.find((p) => p.id === editing.plugin_id)} tools={server.status.instances.find((i) => i.id === editing.id)?.tools} onClose={() => setEditing(undefined)} onDone={() => { setEditing(undefined); void reload() }} />}
-    </>
+      <table>
+        <thead><tr><th>Plugin</th><th>Status</th><th>Items</th><th>Enabled</th><th></th></tr></thead>
+        <tbody>
+          {server.instances.map((inst) => {
+            const st = statusOf(inst); const meta = plugins?.find((p) => p.id === inst.plugin_id)
+            return (
+              <tr key={inst.id}>
+                <td><strong>{meta?.name ?? inst.plugin_id}</strong>{st?.error && <div className="err small">{st.error}</div>}</td>
+                <td>{!inst.enabled ? <Badge>disabled</Badge> : st?.error ? <Badge kind="err">error</Badge> : st ? <Badge kind="ok">active</Badge> : <Badge kind="warn">not running</Badge>}</td>
+                <td>{st && <InstanceItems inst={st} />}</td>
+                <td><input type="checkbox" checked={inst.enabled} onChange={(e) => run(async () => { await api(`/instances/${inst.id}`, { method: 'PUT', body: { enabled: e.target.checked } }); await reload() })} /></td>
+                <td><div className="row">{st && <ToolsButton inst={st} />}<button className="sm" onClick={() => setGating(inst)}>Approval</button></div></td>
+              </tr>
+            )
+          })}
+          {server.instances.length === 0 && <tr><td colSpan={5} className="muted">No plugins are loaded.</td></tr>}
+        </tbody>
+      </table>
+      {gating && <Modal title={`Approval — ${gating.name}`} onClose={() => setGating(undefined)}>
+        <ApprovalEditor value={gating.approval} onChange={(a) => setGating({ ...gating, approval: a })} tools={statusOf(gating)?.tools} />
+        <div className="row between" style={{ marginTop: 12 }}>
+          <button onClick={() => setGating(undefined)}>Cancel</button>
+          <button className="primary" onClick={() => run(async () => { await api(`/instances/${gating.id}`, { method: 'PUT', body: { approval: gating.approval } }); setGating(undefined); await reload() })}>Save</button>
+        </div>
+      </Modal>}
+    </div>
   )
 }
 
@@ -160,52 +153,6 @@ function ApprovalEditor({ value, onChange, tools }: { value: ApprovalPolicy; onC
     </div>
   )
 }
-function AddInstance({ server, plugins, onClose, onDone }: { server: Server; plugins: PluginMeta[]; onClose: () => void; onDone: () => void }) {
-  const [approval, setApproval] = useState<ApprovalPolicy>({ mode: 'none' })
-  const [pid, setPid] = useState(plugins[0]?.id ?? '')
-  const meta = plugins.find((p) => p.id === pid)
-  const [name, setName] = useState(pid)
-  const [cfg, setCfg] = useState<any>(() => ({ ...defaultsFor(meta?.configSchema), ...(meta?.defaultConfig ?? {}) }))
-  const { run, error, busy } = useAction()
-  const choose = (id: string) => { const m = plugins.find((p) => p.id === id); setPid(id); setName(id); setCfg({ ...defaultsFor(m?.configSchema), ...(m?.defaultConfig ?? {}) }) }
-  return (
-    <Modal title="Add plugin" onClose={onClose}>
-      {error && <Alert kind="err">{error}</Alert>}
-      <div className="grid2">
-        <Field label="Plugin"><select value={pid} onChange={(e) => choose(e.target.value)}>{plugins.map((p) => <option key={p.id} value={p.id}>{p.name} ({p.id}@{p.version})</option>)}</select></Field>
-        <Field label="Instance name" desc="Tool prefix seen by agents, e.g. ssh → ssh_exec"><input type="text" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-      </div>
-      {meta && <p className="muted small">{meta.description}</p>}
-      {meta && <ConfigEditor schema={meta.configSchema} value={cfg} onChange={setCfg} options={meta.globalConfig} />}
-      <ApprovalEditor value={approval} onChange={setApproval} />
-      <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
-        <button onClick={onClose}>Cancel</button>
-        <button className="primary" disabled={busy || !/^[a-zA-Z0-9_-]+$/.test(name)} onClick={() => run(async () => { await api(`/servers/${server.id}/instances`, { method: 'POST', body: { plugin_id: pid, name, config: cfg, approval } }); onDone() })}>Add</button>
-      </div>
-    </Modal>
-  )
-}
-
-function EditInstance({ inst, meta, tools, onClose, onDone }: { inst: Instance; meta?: PluginMeta; tools?: string[]; onClose: () => void; onDone: () => void }) {
-  const [name, setName] = useState(inst.name)
-  const [approval, setApproval] = useState<ApprovalPolicy>(inst.approval ?? { mode: 'none' })
-  const [cfg, setCfg] = useState<any>(inst.config)
-  const { run, error, busy } = useAction()
-  return (
-    <Modal title={`Configure ${inst.name}`} onClose={onClose}>
-      {error && <Alert kind="err">{error}</Alert>}
-      <Field label="Instance name"><input type="text" value={name} onChange={(e) => setName(e.target.value)} /></Field>
-      <p className="muted small">Secrets show as •••••••• — leave them untouched to keep the stored value, or type a new one.</p>
-      {meta ? <ConfigEditor schema={meta.configSchema} value={cfg} onChange={setCfg} options={meta.globalConfig} /> : <Alert kind="err">Plugin "{inst.plugin_id}" is not loaded; config cannot be edited as a form.</Alert>}
-      <ApprovalEditor value={approval} onChange={setApproval} tools={tools} />
-      <div className="row" style={{ justifyContent: 'flex-end', marginTop: 12 }}>
-        <button onClick={onClose}>Cancel</button>
-        <button className="primary" disabled={busy || !/^[a-zA-Z0-9_-]+$/.test(name)} onClick={() => run(async () => { await api(`/instances/${inst.id}`, { method: 'PUT', body: { name, config: cfg, approval } }); onDone() })}>Save & restart instance</button>
-      </div>
-    </Modal>
-  )
-}
-
 // ---------------- Access tab ----------------
 
 function Access({ server }: { server: Server }) {
@@ -273,7 +220,7 @@ function Sessions({ server, reload }: { server: Server; reload: () => Promise<vo
 // Configured hosts (ssh) / upstream servers (mcp) from the instance status.
 function InstanceItems({ inst }: { inst: InstanceStatus }) {
   const items: string[] = (inst.status?.hosts ?? inst.status?.servers ?? []).map((x: any) => (typeof x === 'string' ? x : x.name + (x.transport ? ` (${x.transport})` : '')))
-  return items.length > 0 ? <div className="chips" style={{ marginTop: 10 }}>{items.map((n) => <span className="chip mono" key={n}>{n}</span>)}</div> : null
+  return items.length > 0 ? <div className="chips">{items.map((n) => <span className="chip mono" key={n}>{n}</span>)}</div> : null
 }
 
 // Button + popup describing each tool.

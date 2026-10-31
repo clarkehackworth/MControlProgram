@@ -120,6 +120,7 @@ export function adminApi() {
   const serverView = async (id: string) => {
     const rec = servers.get(id); if (!rec) throw new Error('server not found');
     const rs = manager.get(id);
+    for (const iid of instances.ensureAll(id)) await manager.applyInstance(iid, id);
     return { ...rec, status: rs ? await rs.status() : { running: false, error: manager.lastError(id), sessions: [], instances: [] },
       instances: instances.listForServer(id).map((i) => ({ ...i, config: instances.redacted(i) })) };
   };

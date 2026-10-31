@@ -21,6 +21,7 @@ export const manager = {
     if (running.has(id)) return running.get(id)!;
     const rec = serverStore.get(id);
     if (!rec) throw new Error('server not found');
+    instanceStore.ensureAll(id);
     const rs = new RunningServer(rec);
     try {
       await rs.start();
