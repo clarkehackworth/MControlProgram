@@ -18,7 +18,7 @@ export default function Servers() {
           <tbody>
             {servers?.map((s) => (
               <tr key={s.id}>
-                <td><Link to={`/servers/${s.id}`}><strong>{s.name}</strong></Link><div className="muted small">{s.description}</div></td>
+                <td><strong>{s.name}</strong><div className="muted small">{s.description}</div></td>
                 <td className="mono small">{s.host}:{s.port}</td>
                 <td><Badge kind="info">{s.auth_mode}</Badge></td>
                 <td><Badge>{s.log_level}</Badge></td>
@@ -28,6 +28,7 @@ export default function Servers() {
                 <td className="small">{s.instances.map((i) => i.name).join(', ') || <span className="muted">none</span>}</td>
                 <td className="row">
                   {s.status.running ? <button className="sm" onClick={() => act(s.id, 'stop')}>Stop</button> : <button className="sm" onClick={() => act(s.id, 'start')}>Start</button>}
+                  <Link to={`/servers/${s.id}`}><button className="sm">Edit</button></Link>
                   <button className="sm danger" onClick={() => { if (window.confirm(`Delete server "${s.name}" and all its plugin instances, tokens and clients?`)) void run(async () => { await api(`/servers/${s.id}`, { method: 'DELETE' }); await reload() }) }}>Delete</button>
                 </td>
               </tr>
