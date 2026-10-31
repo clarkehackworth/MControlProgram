@@ -81,3 +81,10 @@ test('parseStatus finds the bridge port from ss, tied to the profile chromium by
   assert.deepEqual(parseStatus(`dir=${dir}\n  300 1 chromium --user-data-dir=${dir}-other\n@@SS@@\n\n@@TOKEN@@\n`), { dir });
   assert.deepEqual(parseStatus(''), {});
 });
+
+test('plugin config schema patterns reject bad profile names (same rule the UI enforces)', async () => {
+  const { default: bp } = await import('../src/plugins/browserpaw/index.js');
+  const pattern = (bp.globalConfigSchema as any).properties.profiles.items.properties.name.pattern;
+  assert.ok(new RegExp(pattern).test('Kali_profile-1'));
+  assert.ok(!new RegExp(pattern).test('Kali profile 1'));
+});

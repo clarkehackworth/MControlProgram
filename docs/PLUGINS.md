@@ -156,6 +156,7 @@ export default {
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
 - Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
+- `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
 - A global action with `inventory: '<key>'` only shows as a row button on that inventory table.
 
 ## Built-in: browserpaw

@@ -33,7 +33,7 @@ const hostSchema = {
     description: { type: 'string', title: 'Description', description: 'Shown to agents in list_hosts' },
     host: { type: 'string', title: 'Hostname / IP' },
     port: { type: 'integer', title: 'Port', default: 22 },
-    hostKey: { type: 'string', title: 'Pinned host key (SHA256 fingerprint)', description: 'Set on the first "Test connection" (compare with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host) or paste it. Connections presenting a different key are refused. Clear to re-pin.' },
+    hostKey: { type: 'string', title: 'Pinned host key (SHA256 fingerprint)', 'x-no-column': true, description: 'Set on the first "Test connection" (compare with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host) or paste it. Connections presenting a different key are refused. Clear to re-pin.' },
     username: { type: 'string', title: 'Username' },
     auth: { type: 'string', title: 'Auth method', enum: ['key', 'password', 'agent'], default: 'key' },
     privateKey: { type: 'string', title: 'Private key (PEM)', format: 'multiline', 'x-secret': true, 'x-show-if': { auth: 'key' } },

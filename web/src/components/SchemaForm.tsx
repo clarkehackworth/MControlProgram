@@ -38,7 +38,7 @@ export default function SchemaForm({ schema, value, onChange, path = '', options
     const opts = schema.enum ?? optionsFrom(schema)
     if (opts) return <Field title={title} desc={desc}><select value={value ?? ''} onChange={(e) => onChange(e.target.value)}>{!schema.enum && <option value="">—</option>}{opts.map((o: string) => <option key={o} value={o}>{o}</option>)}</select></Field>
     if (schema.format === 'multiline') return <Field title={title} desc={desc}><textarea value={value ?? ''} onChange={(e) => onChange(e.target.value)} /></Field>
-    return <Field title={title} desc={desc}><input type="text" value={value ?? ''} onChange={(e) => onChange(e.target.value)} /></Field>
+    return <Field title={title} desc={desc}><input type="text" value={value ?? ''} aria-invalid={!!patternError(schema, value)} style={patternError(schema, value) ? { borderColor: 'var(--err, #c33)' } : undefined} onChange={(e) => onChange(e.target.value)} />{patternError(schema, value) && <div className="desc" style={{ color: 'var(--err, #c33)' }}>{patternError(schema, value)}</div>}</Field>
   }
 
   if (t === 'integer' || t === 'number') return (
@@ -167,6 +167,20 @@ function SecretInput({ value, onChange }: { value: string; onChange: (v: string)
       {value && <button className="sm" type="button" onClick={() => onChange('')}>Clear</button>}
     </div>
   )
+}
+
+/** Message if a string value violates its schema `pattern` (empty values are left to `required`). */
+export function patternError(schema: any, value: unknown): string | undefined {
+  if (!schema?.pattern || typeof value !== 'string' || value === '') return undefined
+  return new RegExp(schema.pattern).test(value) ? undefined : `${schema.title ?? 'Value'} must match ${schema.pattern}${schema['x-pattern-hint'] ? ` (${schema['x-pattern-hint']})` : ''}`
+}
+
+/** First pattern violation anywhere in `value` under `schema` (objects, arrays), or undefined. */
+export function schemaError(schema: any, value: any): string | undefined {
+  if (!schema) return undefined
+  if (schema.type === 'object') for (const [k, s] of Object.entries<any>(schema.properties ?? {})) { const e = schemaError(s, value?.[k]); if (e) return e }
+  if (schema.type === 'array' && Array.isArray(value)) for (const v of value) { const e = schemaError(schema.items, v); if (e) return e }
+  return patternError(schema, value)
 }
 
 function Field({ title, desc, children }: { title: string; desc?: string; children: React.ReactNode }) {

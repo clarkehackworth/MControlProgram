@@ -75,11 +75,21 @@ export function adminApi() {
     globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory })),
     dependencies: p.dependencies ?? {},
   });
+  /** First string that violates its schema `pattern` (walks objects and arrays); the UI checks the same thing live. */
+  const patternViolation = (schema: any, value: any, where = ''): string | undefined => {
+    if (!schema) return undefined;
+    if (schema.type === 'object' && value && typeof value === 'object') for (const [k, s] of Object.entries<any>(schema.properties ?? {})) { const e = patternViolation(s, value[k], where ? `${where}.${k}` : k); if (e) return e; }
+    if (schema.type === 'array' && Array.isArray(value)) for (const [i, v] of value.entries()) { const e = patternViolation(schema.items, v, `${where}[${i}]`); if (e) return e; }
+    if (schema.pattern && typeof value === 'string' && value !== '' && !new RegExp(schema.pattern).test(value)) return `${schema.title ?? where}: "${value}" must match ${schema.pattern}${schema['x-pattern-hint'] ? ` (${schema['x-pattern-hint']})` : ''}`;
+    return undefined;
+  };
   r.get('/plugins', wrap(() => plugins.list().map(pluginView)));
   r.put('/plugins/:pid/config', wrap(async (req) => {
     const pid = req.params.pid as string; const p = plugins.get(pid);
     if (!p?.globalConfigSchema) throw new Error('plugin has no global config');
-    pluginConfig.saveFromUi(pid, z.record(z.string(), z.any()).parse(req.body));
+    const body = z.record(z.string(), z.any()).parse(req.body);
+    const bad = patternViolation(p.globalConfigSchema, body); if (bad) throw new Error(bad);
+    pluginConfig.saveFromUi(pid, body);
     await manager.applyPlugin(pid);
     return pluginView(p);
   }));

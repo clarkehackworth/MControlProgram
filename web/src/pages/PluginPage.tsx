@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { api, useApi, type PluginMeta, type Server } from '../api'
 import { Alert, Json, Modal, useAction } from '../components/ui'
-import SchemaForm, { defaultsFor } from '../components/SchemaForm'
+import SchemaForm, { defaultsFor, schemaError } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
 import SshPublicKey from '../plugins/SshPublicKey'
 import PairServer from '../plugins/PairServer'
@@ -72,7 +72,7 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
   const items: any[] = p.globalConfig?.[k] ?? []
   const users = usersOf(p, k, servers)
   const fk = fieldOf(p, k)
-  const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
+  const cols = Object.entries<any>(schema.items.properties).filter(([c, s]) => c !== 'name' && !s['x-secret'] && !s['x-hidden'] && !s['x-no-column'] && ['string', 'integer', 'number'].includes(s.type) && s.format !== 'multiline').slice(0, 4)
   const actions = p.globalActions.filter((a) => !HIDDEN_ACTIONS.includes(a.key) && (!a.inventory || a.inventory === k))
   const [editing, setEditing] = useState<{ index: number; value: any }>()
   const [wizard, setWizard] = useState(false)
@@ -120,7 +120,7 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
         {p.id === 'ssh' && k === 'hosts' && editing.index >= 0 && editing.value.auth === 'key' && <SshPublicKey name={editing.value.name} />}
         <div className="row between" style={{ marginTop: 12 }}>
           <button onClick={() => setEditing(undefined)}>Cancel</button>
-          <button className="primary" disabled={busy || !editing.value.name} onClick={() => run(async () => {
+          <button className="primary" title={schemaError(schema.items, editing.value)} disabled={busy || !editing.value.name || !!schemaError(schema.items, editing.value)} onClick={() => run(async () => {
             await save(editing.index < 0 ? [...items, editing.value] : items.map((x, j) => (j === editing.index ? editing.value : x)))
             setEditing(undefined); await reload()
           })}>Save</button>

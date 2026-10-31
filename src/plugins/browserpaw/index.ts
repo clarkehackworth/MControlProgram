@@ -175,7 +175,7 @@ const hostSchema = {
   type: 'object',
   required: ['name', 'sshHost'],
   properties: {
-    name: { type: 'string', title: 'Name', pattern: NAME.source },
+    name: { type: 'string', title: 'Name', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (must have a pinned host key). MControlProgram runs setup commands as that user.', 'x-options-from': 'ssh:hosts' },
     description: { type: 'string', title: 'Description' },
     browserpawDir: { type: 'string', title: 'BrowserPaw checkout', description: 'Built BrowserPaw repo on the host (pnpm build). Native host: <dir>/app/native-server/dist/run_host.sh', default: '~/dev/browserpaw' },
@@ -189,7 +189,7 @@ const profileSchema = {
   type: 'object',
   required: ['name', 'host'],
   properties: {
-    name: { type: 'string', title: 'Name', description: 'Also the directory name under the host\'s profiles directory', pattern: NAME.source },
+    name: { type: 'string', title: 'Name', description: 'Also the directory name under the host\'s profiles directory', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
     host: { type: 'string', title: 'Host', 'x-options-from': 'hosts' },
     description: { type: 'string', title: 'Description', description: 'Shown to agents (e.g. which accounts are signed in)' },
     toolProfile: { type: 'string', title: 'BrowserPaw tool profile', enum: ['core', 'full', 'crawl'], default: 'full' },
