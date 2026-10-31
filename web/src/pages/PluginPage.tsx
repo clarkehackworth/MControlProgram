@@ -50,7 +50,7 @@ function ServerToggles({ item, users, reload }: { item: string; users: ReturnTyp
   const { run, busy } = useAction()
   const mine = users.filter((u) => ((u.inst.config[u.field] as string[]) ?? []).includes(item))
   if (mine.length === 0) return <span className="muted small">—</span>
-  return <div className="chips">{mine.map(({ server, inst, dk }) => {
+  return <div className="chips" style={{ flexDirection: 'column', alignItems: 'flex-start' }}>{mine.map(({ server, inst, dk }) => {
     const off = dk ? ((inst.config[dk] as string[]) ?? []) : []
     const on = !off.includes(item)
     return <label key={inst.id} className="chip small toggle" title={dk ? `${on ? 'Disable' : 'Enable'} ${item} for ${inst.name} on ${server.name}` : 'Edit the instance to change'}>

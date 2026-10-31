@@ -35,13 +35,15 @@ export default function Servers() {
           </tbody>
         </table>
       </div>
-      {creating && <CreateServer onClose={() => setCreating(false)} onCreated={() => { setCreating(false); void reload() }} />}
+      {creating && <CreateServer taken={(servers ?? []).map((x) => x.port)} onClose={() => setCreating(false)} onCreated={() => { setCreating(false); void reload() }} />}
     </>
   )
 }
 
-function CreateServer({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const [f, setF] = useState({ name: '', description: '', host: '127.0.0.1', port: 7801, auth_mode: 'bearer', log_level: 'tools' })
+function CreateServer({ taken, onClose, onCreated }: { taken: number[]; onClose: () => void; onCreated: () => void }) {
+  let port = 7801
+  while (taken.includes(port)) port++
+  const [f, setF] = useState({ name: '', description: '', host: '127.0.0.1', port, auth_mode: 'bearer', log_level: 'tools' })
   const { run, error, busy } = useAction()
   const set = (k: string, v: unknown) => setF({ ...f, [k]: v })
   return (
