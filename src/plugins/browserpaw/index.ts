@@ -22,7 +22,7 @@ import { platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, typ
 export { parseStatus, sp } from './platform.js';
 
 interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
-interface ProfileCfg { name: string; host: string; description?: string; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; extraArgs?: string }
+interface ProfileCfg { name: string; host: string; description?: string; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; proxy?: string; proxyBypass?: string; extraArgs?: string }
 interface GlobalCfg { hosts: HostCfg[]; profiles: ProfileCfg[]; startTimeoutSec: number; callTimeoutMs: number }
 interface Cfg { profiles: string[]; profilesDisabled?: string[]; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
 type Log = PluginContext['log'];
@@ -108,7 +108,7 @@ async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: 
   const pf = await platformOf(ssh, h, log);
   if (!st.chromiumPid) {
     const r = await setupProfile(ssh, h, p, log);
-    await run(ssh, h, pf, pf.launch(r, { browser: h.browser ?? 'chromium', toolProfile: p.toolProfile || 'full', headless: !!p.headless, extraArgs: p.extraArgs ?? '', env: launchEnv(h, pf), task: `MControlProgram-BrowserPaw-${p.name}` }), log);
+    await run(ssh, h, pf, pf.launch(r, { browser: h.browser ?? 'chromium', toolProfile: p.toolProfile || 'full', headless: !!p.headless, extraArgs: p.extraArgs ?? '', proxy: p.proxy?.trim() || undefined, proxyBypass: p.proxyBypass?.trim() || undefined, env: launchEnv(h, pf), task: `MControlProgram-BrowserPaw-${p.name}` }), log);
     log.info(`browserpaw: launched ${h.browser ?? 'chromium'} for profile ${p.name} on ${h.name} (${pf.os})`);
   }
   for (const until = Date.now() + timeoutSec * 1000; Date.now() < until;) {
@@ -173,6 +173,8 @@ const profileSchema = {
     toolProfile: { type: 'string', title: 'BrowserPaw tool profile', enum: ['core', 'full', 'crawl'], default: 'full' },
     headless: { type: 'boolean', title: 'Headless', description: 'No window (human handoff for 2FA/captchas will not be possible)', default: false },
     autoStart: { type: 'boolean', title: 'Start on demand', description: 'Launch Chromium when an agent calls a tool and the profile is not running', default: true },
+    proxy: { type: 'string', title: 'Proxy server', description: 'Chromium --proxy-server, e.g. socks5://10.0.0.5:1080, http://proxy.lan:3128, or per-scheme rules like http=p1:3128;https=p2:3128. Empty = the system proxy settings. Applies when the browser starts; use Stop, then start again, after changing it. Credentials are not supported (Chromium ignores user:pass here and would prompt); use an IP-allowlisted proxy or a local unauthenticated forwarder.', pattern: '^[^\\s\'"@]+$', 'x-pattern-hint': 'no spaces, quotes or user:pass@' },
+    proxyBypass: { type: 'string', title: 'Proxy bypass list', description: 'Chromium --proxy-bypass-list, semicolon-separated, e.g. *.lan;192.168.0.0/16. Loopback is always direct (the BrowserPaw bridge is unaffected).', pattern: '^[^\\s\'"]+$', 'x-pattern-hint': 'no spaces or quotes; separate entries with ;' },
     extraArgs: { type: 'string', title: 'Extra Chromium arguments', description: 'Appended verbatim to the command line' },
   },
 };

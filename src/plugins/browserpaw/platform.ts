@@ -21,7 +21,7 @@ export const HOST_NAME = 'com.chromemcp.nativehost';
 
 /** Absolute paths as resolved on the host by `inspect`. */
 export interface Resolved { dir: string; ext: string; extensionId: string; nativeHost: string; chromium: string }
-export interface LaunchOpts { browser: Browser; toolProfile: string; headless: boolean; extraArgs: string; env: [string, string][]; task: string }
+export interface LaunchOpts { browser: Browser; toolProfile: string; headless: boolean; extraArgs: string; env: [string, string][]; task: string; proxy?: string; proxyBypass?: string }
 
 export interface Platform {
   os: Os;
@@ -170,6 +170,8 @@ function commonArgs(o: LaunchOpts) {
     // branded Chrome/Edge 137+ ignore --load-extension unless this feature is disabled
     ...(o.browser !== 'chromium' ? ['--disable-features=DisableLoadExtensionCommandLineSwitch'] : []),
     ...(o.headless ? ['--headless=new'] : []),
+    ...(o.proxy ? [`--proxy-server=${o.proxy}`] : []),
+    ...(o.proxy && o.proxyBypass ? [`--proxy-bypass-list=${o.proxyBypass}`] : []),
   ];
 }
 

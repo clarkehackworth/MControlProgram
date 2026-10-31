@@ -163,3 +163,16 @@ test('POSIX scripts run under sh: inspect, setup, status (linux and macos varian
   }
   fs.rmSync(root, { recursive: true, force: true });
 });
+
+test('proxy settings become chromium flags, quoted per OS', async () => {
+  const r = { dir: '/p', ext: '/e', extensionId: 'x', nativeHost: '/n', chromium: '/c' };
+  const base = { browser: 'chromium' as const, toolProfile: 'full', headless: false, extraArgs: '', env: [] as [string, string][], task: 'T' };
+  const l = platforms.linux.launch(r, { ...base, proxy: 'socks5://10.0.0.5:1080', proxyBypass: '*.lan;192.168.0.0/16' });
+  assert.match(l, /'--proxy-server=socks5:\/\/10\.0\.0\.5:1080' '--proxy-bypass-list=\*\.lan;192\.168\.0\.0\/16'/);
+  assert.doesNotMatch(platforms.linux.launch(r, { ...base, proxyBypass: '*.lan' }), /proxy/); // bypass alone is meaningless
+  const w = platforms.windows.launch({ ...r, dir: 'C:\\p', ext: 'C:\\e', chromium: 'C:\\c.exe' }, { ...base, proxy: 'http=p1:3128;https=p2:3128' });
+  assert.match(w, /--proxy-server=http=p1:3128;https=p2:3128/);
+  const { default: bp } = await import('../src/plugins/browserpaw/index.js');
+  const s = (bp.globalConfigSchema as any).properties.profiles.items.properties.proxy.pattern;
+  assert.ok(new RegExp(s).test('socks5://h:1080') && !new RegExp(s).test('http://user:pw@h:3128') && !new RegExp(s).test("x' && rm -rf ~"));
+});
