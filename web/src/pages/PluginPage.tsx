@@ -4,6 +4,7 @@ import { api, useApi, type PluginMeta, type Server } from '../api'
 import { Alert, Json, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import SshAddHost from '../plugins/SshAddHost'
+import SshPublicKey from '../plugins/SshPublicKey'
 import PairServer from '../plugins/PairServer'
 import SshDeleteHost from '../plugins/SshDeleteHost'
 
@@ -111,6 +112,7 @@ function Inventory({ p, k, servers, reload }: { p: PluginMeta; k: string; server
       {editing && <Modal title={editing.index < 0 ? `Add to ${schema.title ?? k}` : `Edit ${editing.value.name}`} onClose={() => setEditing(undefined)}>
         <p className="muted small">Shared by every <code>{p.id}</code> instance on every server. Saving restarts those instances. Secrets show as •••••••• — leave them to keep the stored value.</p>
         <SchemaForm schema={schema.items} value={editing.value} onChange={(v) => setEditing({ ...editing, value: v })} />
+        {p.id === 'ssh' && k === 'hosts' && editing.index >= 0 && editing.value.auth === 'key' && <SshPublicKey name={editing.value.name} />}
         <div className="row between" style={{ marginTop: 12 }}>
           <button onClick={() => setEditing(undefined)}>Cancel</button>
           <button className="primary" disabled={busy || !editing.value.name} onClick={() => run(async () => {
