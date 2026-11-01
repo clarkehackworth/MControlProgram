@@ -219,9 +219,10 @@ function Sessions({ server, reload }: { server: Server; reload: () => Promise<vo
   )
 }
 
-// Configured hosts (ssh) / upstream servers (mcp) from the instance status.
+// Exposed hosts (ssh) / upstream servers (mcp) / profiles (browserpaw) / credentials (web) from the instance status.
 function InstanceItems({ inst }: { inst: InstanceStatus }) {
-  const items: string[] = (inst.status?.hosts ?? inst.status?.servers ?? []).map((x: any) => (typeof x === 'string' ? x : x.name + (x.transport ? ` (${x.transport})` : '')))
+  const s = inst.status ?? {}
+  const items: string[] = (s.hosts ?? s.servers ?? s.profiles ?? s.credentials ?? []).map((x: any) => (typeof x === 'string' ? x : x.name + (x.transport ? ` (${x.transport})` : '') + (x.cachedTools !== undefined ? ` (${x.cachedTools} tools)` : '')))
   return items.length > 0 ? <div className="chips">{items.map((n) => <span className="chip mono" key={n}>{n}</span>)}</div> : null
 }
 
