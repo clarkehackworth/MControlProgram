@@ -78,6 +78,8 @@ export interface PluginContext {
 export interface PluginInstance {
   tools: ToolDefinition[];
   resources?: ResourceDefinition[];
+  /** Usage notes appended to the server's MCP instructions. `{prefix}` is replaced by this instance's tool prefix. */
+  instructions?: string;
   /** Called when the server starts or the instance is (re)configured. */
   start?(): Promise<void> | void;
   /** Called on server stop, instance removal, or before reconfiguration. Must release connections. */

@@ -348,6 +348,12 @@ const plugin: MControlProgramPlugin = {
 
     return {
       tools,
+      instructions: `Browser automation (BrowserPaw):
+- Every browser tool requires a \`profile\` argument. Call {prefix}_profiles first to see the profiles, which host each runs on, and whether it is running. Stopped profiles may start on demand (the first call can be slow).
+- Typical flow: {prefix}_get_windows_and_tabs, then {prefix}_chrome_navigate {url, background: true}, then {prefix}_chrome_read_dom (numbered elements) or {prefix}_chrome_get_markdown (article text), then act by number with {prefix}_chrome_interact_index / {prefix}_chrome_fill_index.
+- Prefer the numbered tools over CSS selectors; use {prefix}_chrome_batch_actions for 2+ predictable steps.
+- Use screenshots / {prefix}_chrome_computer only for canvas or unlabeled UIs. For CAPTCHA, 2FA or payments, call {prefix}_chrome_request_human_intervention.
+- Close tabs you opened when done.`,
       start() {
         // Learn tools from profiles that are already running; never launch browsers at gateway start.
         for (const n of names) if (cachedTools(n).length === 0) {

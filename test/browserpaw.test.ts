@@ -176,3 +176,9 @@ test('proxy settings become chromium flags, quoted per OS', async () => {
   const s = (bp.globalConfigSchema as any).properties.profiles.items.properties.proxy.pattern;
   assert.ok(new RegExp(s).test('socks5://h:1080') && !new RegExp(s).test('http://user:pw@h:3128') && !new RegExp(s).test("x' && rm -rf ~"));
 });
+
+test('browserpaw instance supplies usage instructions with a {prefix} placeholder', async () => {
+  const p = plugins.get('browserpaw')!;
+  const inst = await p.create({ instanceId: 'i', instanceName: 'bp', serverId: 's', config: { profiles: [] }, pluginConfig: { hosts: [], profiles: [] }, global: () => ({}) as any, log: { debug() {}, info() {}, warn() {}, error() {} } as any, dep: depResolver(p) });
+  assert.match(inst.instructions ?? '', /\{prefix\}_profiles/);
+});

@@ -175,7 +175,7 @@ export class RunningServer {
     }
     const id = randomUUID();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => id, onsessionclosed: (s) => void this.closeSession(s, 'client closed') });
-    const mcp = new McpServer({ name: `mcontrolprogram:${sanitize(this.record.name)}`, version: '0.1.0' }, { instructions: this.record.instructions || undefined, capabilities: { tools: { listChanged: true }, resources: {}, logging: {} } });
+    const mcp = new McpServer({ name: `mcontrolprogram:${sanitize(this.record.name)}`, version: '0.1.0' }, { instructions: this.instructions() || undefined, capabilities: { tools: { listChanged: true }, resources: {}, logging: {} } });
     const session: Session = { id, transport, mcp, principal, startedAt: Date.now(), lastSeen: Date.now(), calls: 0, tools: new Map(),
       clientInfo: req.body?.params?.clientInfo ? `${req.body.params.clientInfo.name} ${req.body.params.clientInfo.version ?? ''}`.trim() : undefined };
     this.sessions.set(id, session);
@@ -184,6 +184,16 @@ export class RunningServer {
     await mcp.connect(transport);
     this.log.connection(`session opened by ${principal}${session.clientInfo ? ` (${session.clientInfo})` : ''}`, { principal, client: session.clientInfo }, id);
     await transport.handleRequest(req, res, req.body);
+  }
+
+  /** Admin-written server instructions followed by each healthy plugin instance's own usage notes. */
+  private instructions() {
+    const parts = [this.record.instructions.trim()];
+    for (const li of this.live.values()) {
+      if (li.error || !li.instance.instructions) continue;
+      parts.push(li.instance.instructions.replaceAll('{prefix}', sanitize(li.record.name || li.plugin.toolPrefix || li.plugin.id)));
+    }
+    return parts.filter(Boolean).join('\n\n');
   }
 
   async closeSession(id: string, reason: string) {

@@ -8,6 +8,7 @@ services:
       - "7801:7801"      # MCP servers: add one line per server port you create
     volumes:
       - ./data:/data:z
+      - ./test/fixtures:/app/fixtures:ro,z # lets the mcp plugin run the echo test server: node /app/fixtures/echo-mcp.mjs
     environment:
       # Optional. If unset, /data/master.key is generated on first run; keep it with the DB.
       # MCONTROLPROGRAM_MASTER_KEY:
