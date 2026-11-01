@@ -110,9 +110,11 @@ function htmlToText(html: string): string {
     .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
-// ---- request log + plugin-wide blocks (own tables: changing blocks must not restart instances / drop cookie jars) ----
+// ---- request log + plugin-wide access rules (own tables: changing rules must not restart instances / drop cookie jars) ----
 export type BlockKind = 'domain' | 'url' | 'regex';
-interface Block { id: number; kind: BlockKind; value: string; note: string; created_at: number }
+export type RuleAction = 'block' | 'allow';
+export type Policy = 'allow' | 'deny';
+interface Rule { id: number; action: RuleAction; kind: BlockKind; value: string; note: string; created_at: number }
 let tablesReady = false;
 const db = () => {
   const d = getDb();
@@ -120,23 +122,35 @@ const db = () => {
     d.exec(`CREATE TABLE IF NOT EXISTS web_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, server_id TEXT, instance TEXT, principal TEXT,
         method TEXT NOT NULL, url TEXT NOT NULL, host TEXT NOT NULL, status INTEGER, error TEXT, blocked TEXT, ms INTEGER);
       CREATE INDEX IF NOT EXISTS web_requests_ts ON web_requests(ts);
-      CREATE TABLE IF NOT EXISTS web_blocks (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));`);
+      CREATE TABLE IF NOT EXISTS web_blocks (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));
+      CREATE TABLE IF NOT EXISTS web_policy (k TEXT PRIMARY KEY, v TEXT NOT NULL);`);
+    for (const sql of ["ALTER TABLE web_blocks ADD COLUMN action TEXT NOT NULL DEFAULT 'block'", 'ALTER TABLE web_requests ADD COLUMN allowed_by TEXT'])
+      try { d.exec(sql); } catch { /* exists */ }
     tablesReady = true;
   }
   return d;
 };
-let blockCache: Block[] | undefined;
-const blocks = () => (blockCache ??= db().prepare('SELECT * FROM web_blocks ORDER BY kind, value').all() as Block[]);
+let ruleCache: Rule[] | undefined;
+let policyCache: Policy | undefined;
+const rules = () => (ruleCache ??= db().prepare('SELECT * FROM web_blocks ORDER BY action, kind, value').all() as Rule[]);
+const policy = (): Policy => (policyCache ??= ((db().prepare("SELECT v FROM web_policy WHERE k='default'").get() as any)?.v === 'deny' ? 'deny' : 'allow'));
+const changed = () => { ruleCache = undefined; policyCache = undefined; };
 
-/** The block rule that matches `u`, if any. Domain = host or any subdomain; URL = prefix; regex = case-insensitive on the full URL. */
-export function blockedBy(u: URL, list: Pick<Block, 'kind' | 'value'>[]): string | undefined {
+const label = (r: Pick<Rule, 'kind' | 'value'>) => `${r.kind}: ${r.value}`;
+/** Domain = host or any subdomain; URL = prefix; regex = case-insensitive on the full URL. */
+export function ruleMatches(r: Pick<Rule, 'kind' | 'value'>, u: URL): boolean {
   const host = u.hostname.toLowerCase();
-  for (const b of list) {
-    const hit = b.kind === 'domain' ? host === b.value || host.endsWith('.' + b.value)
-      : b.kind === 'url' ? u.href.startsWith(b.value)
-      : (() => { try { return new RegExp(b.value, 'i').test(u.href); } catch { return false; } })();
-    if (hit) return `${b.kind}: ${b.value}`;
-  }
+  if (r.kind === 'domain') return host === r.value || host.endsWith('.' + r.value);
+  if (r.kind === 'url') return u.href.startsWith(r.value);
+  try { return new RegExp(r.value, 'i').test(u.href); } catch { return false; }
+}
+/** Block rules always win; otherwise an allow rule, otherwise the default policy. */
+export function verdict(u: URL, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy): { blocked?: string; allowedBy?: string } {
+  const b = list.find((r) => r.action === 'block' && ruleMatches(r, u));
+  if (b) return { blocked: label(b) };
+  const a = list.find((r) => r.action === 'allow' && ruleMatches(r, u));
+  if (a) return { allowedBy: label(a) };
+  return def === 'deny' ? { blocked: 'default: deny' } : { allowedBy: 'default: allow' };
 }
 
 export function normalizeBlock(kind: string, raw: string): { kind: BlockKind; value: string } {
@@ -168,19 +182,39 @@ const plugin: MControlProgramPlugin = {
       if (q.method) { where.push('method = ?'); args.push(q.method); }
       if (q.server) { where.push('server_id = ?'); args.push(q.server); }
       if (q.outcome === 'blocked') where.push('blocked IS NOT NULL');
+      if (q.outcome === 'allowed') where.push('blocked IS NULL');
       if (q.outcome === 'error') where.push('blocked IS NULL AND (error IS NOT NULL OR status >= 400)');
-      if (q.outcome === 'ok') where.push('blocked IS NULL AND error IS NULL AND status < 400');
       const limit = Math.min(Number(q.limit) || 500, 5000);
       const rows = db().prepare(`SELECT * FROM web_requests WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1);
       return { rows: rows.slice(0, limit), more: rows.length > limit };
     } },
-    blocks: { title: 'Blocks', run: async () => blocks() },
-    block: { title: 'Block', run: async ({ kind, value, note }) => {
-      const b = normalizeBlock(kind, value);
-      db().prepare('INSERT INTO web_blocks(kind,value,note,created_at) VALUES(?,?,?,?) ON CONFLICT(kind,value) DO UPDATE SET note=excluded.note').run(b.kind, b.value, String(note ?? ''), Date.now());
-      blockCache = undefined; return b;
+    rules: { title: 'Access rules', run: async () => ({ policy: policy(), rules: rules() }) },
+    /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks that conflict with a new allow).
+     *  With the default policy at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
+    rule: { title: 'Add rule', run: async ({ action, kind, value, note, remove }) => {
+      if (action !== 'block' && action !== 'allow') throw new Error('action must be block or allow');
+      const r = normalizeBlock(kind, value);
+      const d = db();
+      const store = action === 'block' || policy() === 'deny';
+      d.transaction(() => {
+        for (const id of (Array.isArray(remove) ? remove : [])) d.prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id));
+        if (store) d.prepare('INSERT INTO web_blocks(action,kind,value,note,created_at) VALUES(?,?,?,?,?) ON CONFLICT(kind,value) DO UPDATE SET action=excluded.action, note=excluded.note, created_at=excluded.created_at')
+          .run(action, r.kind, r.value, String(note ?? ''), Date.now());
+      })();
+      changed(); return { ...r, action, stored: store };
     } },
-    unblock: { title: 'Unblock', run: async ({ id }) => { db().prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id)); blockCache = undefined; } },
+    delete_rule: { title: 'Delete rule', run: async ({ id }) => { db().prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id)); changed(); } },
+    /** Switch the default policy; `allow` = domains to add as allow rules in the same step (so switching to deny doesn't break current traffic). */
+    set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }) => {
+      if (p !== 'allow' && p !== 'deny') throw new Error('policy must be allow or deny');
+      const d = db();
+      const doms = (Array.isArray(allow) ? allow : []).map((x: string) => normalizeBlock('domain', x).value);
+      d.transaction(() => {
+        for (const v of doms) d.prepare("INSERT INTO web_blocks(action,kind,value,note,created_at) VALUES('allow','domain',?,'added when switching to deny',?) ON CONFLICT(kind,value) DO NOTHING").run(v, Date.now());
+        d.prepare("INSERT INTO web_policy(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(p);
+      })();
+      changed(); return { policy: p };
+    } },
     clear_requests: { title: 'Clear request log', run: async () => { db().prepare('DELETE FROM web_requests').run(); } },
   },
   defaultGlobalConfig: { credentials: [] },
@@ -208,16 +242,17 @@ const plugin: MControlProgramPlugin = {
 
     const record = (method: string, u: URL, r: { status?: number; error?: string; blocked?: string; ms?: number }, c: Caller) => {
       try {
-        db().prepare('INSERT INTO web_requests(ts,server_id,instance,principal,method,url,host,status,error,blocked,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-          .run(Date.now(), ctx.serverId, ctx.instanceName, c.principal ?? null, method, u.href, u.hostname, r.status ?? null, r.error ?? null, r.blocked ?? null, r.ms ?? null);
+        const allowedBy = r.blocked ? null : verdict(u, rules(), policy()).allowedBy ?? null;
+        db().prepare('INSERT INTO web_requests(ts,server_id,instance,principal,method,url,host,status,error,blocked,allowed_by,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+          .run(Date.now(), ctx.serverId, ctx.instanceName, c.principal ?? null, method, u.href, u.hostname, r.status ?? null, r.error ?? null, r.blocked ?? null, allowedBy, r.ms ?? null);
       } catch (e) { ctx.log.warn(`request log write failed: ${(e as Error).message}`); }
     };
-    class Blocked extends Error { constructor(public rule: string) { super(`url blocked by administrator (${rule})`); } }
+    class Blocked extends Error { constructor(public rule: string) { super(rule === 'default: deny' ? 'url not on the administrator\'s allow list' : `url blocked by administrator (${rule})`); } }
 
     function checkUrl(raw: string): URL {
       const u = new URL(raw);
       if (!/^https?:$/.test(u.protocol)) throw new Error('only http/https allowed');
-      const b = blockedBy(u, blocks()); if (b) throw new Blocked(b);
+      const v = verdict(u, rules(), policy()); if (v.blocked) throw new Blocked(v.blocked);
       if (cfg.blockPrivateNetworks && PRIVATE.some((r) => r.test(u.hostname))) throw new Error('private network addresses are blocked');
       for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p})`);
       const allow = (cfg.allowUrls ?? []).filter(Boolean);
@@ -306,7 +341,7 @@ const plugin: MControlProgramPlugin = {
         {
           name: 'policy', description: 'Show this gateway\'s URL policy (allowed/denied patterns, methods) and which origins have credentials configured.',
           annotations: { readOnlyHint: true },
-          handler: async () => text(JSON.stringify({ blocked: blocks().map((b) => ({ kind: b.kind, value: b.value })), allowUrls: cfg.allowUrls, denyUrls: cfg.denyUrls, allowMethods: cfg.allowMethods, blockPrivateNetworks: cfg.blockPrivateNetworks,
+          handler: async () => text(JSON.stringify({ defaultPolicy: policy(), rules: rules().map((r) => ({ action: r.action, kind: r.kind, value: r.value })), allowUrls: cfg.allowUrls, denyUrls: cfg.denyUrls, allowMethods: cfg.allowMethods, blockPrivateNetworks: cfg.blockPrivateNetworks,
             credentials: creds.map((c) => ({ name: c.name, urlPattern: c.urlPattern })) }, null, 2)),
         },
         {
