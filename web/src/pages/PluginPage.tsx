@@ -7,6 +7,7 @@ import SshAddHost from '../plugins/SshAddHost'
 import SshPublicKey from '../plugins/SshPublicKey'
 import PairServer from '../plugins/PairServer'
 import SshDeleteHost from '../plugins/SshDeleteHost'
+import WebTraffic from '../plugins/WebTraffic'
 
 /** Array-of-object properties of a plugin's global config (SSH hosts, upstream servers, credentials…). */
 export function inventoryKeys(p: PluginMeta): string[] {
@@ -14,7 +15,7 @@ export function inventoryKeys(p: PluginMeta): string[] {
 }
 
 // ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
-const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key']
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key', 'requests', 'blocks', 'block', 'unblock', 'clear_requests']
 
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
@@ -30,6 +31,7 @@ export default function PluginPage() {
       <h1 style={{ marginBottom: 4 }}>{p.name}</h1>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
       {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} options={optionSources(p, plugins)} />)}
+      {p.id === 'web' && <WebTraffic />}
     </>
   )
 }

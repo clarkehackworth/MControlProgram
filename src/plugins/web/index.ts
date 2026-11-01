@@ -6,6 +6,7 @@ import { z } from 'zod';
 import type { MControlProgramPlugin, PluginContext, PluginInstance } from '../../core/plugin-api.js';
 import { text, errorResult } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
+import { getDb } from '../../core/db.js';
 
 interface CredCfg { name: string; urlPattern: string; type: 'header' | 'basic' | 'bearer' | 'query'; headerName?: string; username?: string; secret: string }
 interface Cfg {
@@ -109,11 +110,79 @@ function htmlToText(html: string): string {
     .replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+// ---- request log + plugin-wide blocks (own tables: changing blocks must not restart instances / drop cookie jars) ----
+export type BlockKind = 'domain' | 'url' | 'regex';
+interface Block { id: number; kind: BlockKind; value: string; note: string; created_at: number }
+let tablesReady = false;
+const db = () => {
+  const d = getDb();
+  if (!tablesReady) {
+    d.exec(`CREATE TABLE IF NOT EXISTS web_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, server_id TEXT, instance TEXT, principal TEXT,
+        method TEXT NOT NULL, url TEXT NOT NULL, host TEXT NOT NULL, status INTEGER, error TEXT, blocked TEXT, ms INTEGER);
+      CREATE INDEX IF NOT EXISTS web_requests_ts ON web_requests(ts);
+      CREATE TABLE IF NOT EXISTS web_blocks (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));`);
+    tablesReady = true;
+  }
+  return d;
+};
+let blockCache: Block[] | undefined;
+const blocks = () => (blockCache ??= db().prepare('SELECT * FROM web_blocks ORDER BY kind, value').all() as Block[]);
+
+/** The block rule that matches `u`, if any. Domain = host or any subdomain; URL = prefix; regex = case-insensitive on the full URL. */
+export function blockedBy(u: URL, list: Pick<Block, 'kind' | 'value'>[]): string | undefined {
+  const host = u.hostname.toLowerCase();
+  for (const b of list) {
+    const hit = b.kind === 'domain' ? host === b.value || host.endsWith('.' + b.value)
+      : b.kind === 'url' ? u.href.startsWith(b.value)
+      : (() => { try { return new RegExp(b.value, 'i').test(u.href); } catch { return false; } })();
+    if (hit) return `${b.kind}: ${b.value}`;
+  }
+}
+
+export function normalizeBlock(kind: string, raw: string): { kind: BlockKind; value: string } {
+  const v = String(raw ?? '').trim();
+  if (!v) throw new Error('value is required');
+  if (kind === 'domain') {
+    const d = (/^[a-z]+:\/\//i.test(v) ? new URL(v).hostname : v.split('/')[0]!).replace(/^\*?\./, '').toLowerCase();
+    if (!/^[a-z0-9.-]+$|^\[[0-9a-f:]+\]$/i.test(d)) throw new Error(`"${v}" is not a domain`);
+    return { kind, value: d };
+  }
+  if (kind === 'url') {
+    const u = new URL(/^[a-z]+:\/\//i.test(v) ? v : `https://${v}`); // throws on garbage
+    return { kind, value: u.href };
+  }
+  if (kind === 'regex') { new RegExp(v, 'i'); return { kind, value: v }; }
+  throw new Error(`unknown block kind "${kind}"`);
+}
+
 const plugin: MControlProgramPlugin = {
   id: 'web', name: 'Web', version: '0.1.0',
   description: 'HTTP requests and page fetching with URL filtering and server-side credential injection.',
   configSchema,
   globalConfigSchema,
+  globalActions: {
+    // ponytail: driven by the custom Traffic panel on the plugin page; hidden from the generic inventory buttons
+    requests: { title: 'Request log', run: async (q) => {
+      const where = ['ts >= ?', 'ts <= ?']; const args: any[] = [Number(q.since) || 0, Number(q.until) || Date.now()];
+      if (q.q) { where.push('(url LIKE ? OR principal LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`); }
+      if (q.method) { where.push('method = ?'); args.push(q.method); }
+      if (q.server) { where.push('server_id = ?'); args.push(q.server); }
+      if (q.outcome === 'blocked') where.push('blocked IS NOT NULL');
+      if (q.outcome === 'error') where.push('blocked IS NULL AND (error IS NOT NULL OR status >= 400)');
+      if (q.outcome === 'ok') where.push('blocked IS NULL AND error IS NULL AND status < 400');
+      const limit = Math.min(Number(q.limit) || 500, 5000);
+      const rows = db().prepare(`SELECT * FROM web_requests WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1);
+      return { rows: rows.slice(0, limit), more: rows.length > limit };
+    } },
+    blocks: { title: 'Blocks', run: async () => blocks() },
+    block: { title: 'Block', run: async ({ kind, value, note }) => {
+      const b = normalizeBlock(kind, value);
+      db().prepare('INSERT INTO web_blocks(kind,value,note,created_at) VALUES(?,?,?,?) ON CONFLICT(kind,value) DO UPDATE SET note=excluded.note').run(b.kind, b.value, String(note ?? ''), Date.now());
+      blockCache = undefined; return b;
+    } },
+    unblock: { title: 'Unblock', run: async ({ id }) => { db().prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id)); blockCache = undefined; } },
+    clear_requests: { title: 'Clear request log', run: async () => { db().prepare('DELETE FROM web_requests').run(); } },
+  },
   defaultGlobalConfig: { credentials: [] },
   defaultConfig: { allowUrls: [], denyUrls: [], allowMethods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'], blockPrivateNetworks: true, followRedirects: true,
     maxResponseBytes: 1_000_000, timeoutMs: 30000, maxConcurrent: 8, userAgent: 'MControlProgram/0.1 (+mcp-gateway)', defaultHeaders: {}, credentials: [],
@@ -137,9 +206,18 @@ const plugin: MControlProgramPlugin = {
       return j;
     };
 
+    const record = (method: string, u: URL, r: { status?: number; error?: string; blocked?: string; ms?: number }, c: Caller) => {
+      try {
+        db().prepare('INSERT INTO web_requests(ts,server_id,instance,principal,method,url,host,status,error,blocked,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
+          .run(Date.now(), ctx.serverId, ctx.instanceName, c.principal ?? null, method, u.href, u.hostname, r.status ?? null, r.error ?? null, r.blocked ?? null, r.ms ?? null);
+      } catch (e) { ctx.log.warn(`request log write failed: ${(e as Error).message}`); }
+    };
+    class Blocked extends Error { constructor(public rule: string) { super(`url blocked by administrator (${rule})`); } }
+
     function checkUrl(raw: string): URL {
       const u = new URL(raw);
       if (!/^https?:$/.test(u.protocol)) throw new Error('only http/https allowed');
+      const b = blockedBy(u, blocks()); if (b) throw new Blocked(b);
       if (cfg.blockPrivateNetworks && PRIVATE.some((r) => r.test(u.hostname))) throw new Error('private network addresses are blocked');
       for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p})`);
       const allow = (cfg.allowUrls ?? []).filter(Boolean);
@@ -162,7 +240,11 @@ const plugin: MControlProgramPlugin = {
 
     async function doFetch(method: string, url: string, hdrs: Record<string, string> | undefined, body: string | undefined, caller: Caller) {
       if (!(cfg.allowMethods ?? []).includes(method)) throw new Error(`method ${method} not allowed`);
-      let u = checkUrl(url);
+      let u: URL;
+      try { u = checkUrl(url); } catch (e) {
+        if (e instanceof Blocked) record(method, new URL(url), { blocked: e.rule }, caller);
+        throw e;
+      }
       if (inflight >= cfg.maxConcurrent) throw new Error('too many concurrent requests');
       const jar = jarFor(caller);
       inflight++; total++;
@@ -173,14 +255,22 @@ const plugin: MControlProgramPlugin = {
         for (;;) {
           const headers = new Headers({ 'user-agent': cfg.userAgent, ...(cfg.defaultHeaders ?? {}), ...(hdrs ?? {}) });
           headers.delete('cookie'); // agents never set or see cookies directly; the jar owns them
+          const logged = new URL(u); // before applyCreds: query-type credentials must never reach the log
           cred = applyCreds(u, headers);
           const ck = jar?.header(u); if (ck) headers.set('cookie', ck);
-          res = await fetch(u, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(cfg.timeoutMs) });
+          const th = Date.now();
+          try { res = await fetch(u, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(cfg.timeoutMs) }); }
+          catch (e) { record(method, logged, { error: (e as Error).message, ms: Date.now() - th }, caller); throw e; }
+          record(method, logged, { status: res.status, ms: Date.now() - th }, caller);
           jar?.store(u, res.headers.getSetCookie());
           const loc = res.headers.get('location');
           if (!cfg.followRedirects || !loc || ![301, 302, 303, 307, 308].includes(res.status) || hops++ >= 10) break;
           await res.body?.cancel();
-          u = checkUrl(new URL(loc, u).href);
+          const next = new URL(loc, u).href;
+          try { u = checkUrl(next); } catch (e) {
+            if (e instanceof Blocked) record(method, new URL(next), { blocked: e.rule }, caller);
+            throw e;
+          }
           if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) { method = 'GET'; body = undefined; }
         }
         const reader = res.body?.getReader();
@@ -206,6 +296,7 @@ const plugin: MControlProgramPlugin = {
         reaper = setInterval(() => {
           const idle = effective(cfg.cookieIdleSec, ctx.global().stateIdleSec);
           for (const [k, j] of jars) if (Date.now() - j.lastUsed > idle * 1000) { jars.delete(k); ctx.log.debug(`cookie jar ${k} discarded (idle)`); }
+          db().prepare('DELETE FROM web_requests WHERE ts < ?').run(Date.now() - ctx.global().logRetentionDays * 86400_000);
         }, 60_000);
       },
       stop() { if (reaper) clearInterval(reaper); jars.clear(); },
@@ -215,7 +306,7 @@ const plugin: MControlProgramPlugin = {
         {
           name: 'policy', description: 'Show this gateway\'s URL policy (allowed/denied patterns, methods) and which origins have credentials configured.',
           annotations: { readOnlyHint: true },
-          handler: async () => text(JSON.stringify({ allowUrls: cfg.allowUrls, denyUrls: cfg.denyUrls, allowMethods: cfg.allowMethods, blockPrivateNetworks: cfg.blockPrivateNetworks,
+          handler: async () => text(JSON.stringify({ blocked: blocks().map((b) => ({ kind: b.kind, value: b.value })), allowUrls: cfg.allowUrls, denyUrls: cfg.denyUrls, allowMethods: cfg.allowMethods, blockPrivateNetworks: cfg.blockPrivateNetworks,
             credentials: creds.map((c) => ({ name: c.name, urlPattern: c.urlPattern })) }, null, 2)),
         },
         {
