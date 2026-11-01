@@ -271,8 +271,9 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
         <input type="text" placeholder="Search URL or agent…" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} style={{ width: 220 }} />
       </div>
       {error && <Alert kind="err">{error}</Alert>}
+      <div style={{ overflowX: 'auto' }}>
       <table>
-        <thead><tr><th>Time</th><th>Server</th><th>Agent</th><th>Method</th><th>URL</th><th>Access</th><th>Response</th><th></th></tr></thead>
+        <thead><tr><th>Time</th><th>Server / agent</th><th>Method</th><th>URL</th><th>Access</th><th>Response</th><th></th></tr></thead>
         <tbody>
           {rows.map((r) => {
             const now = verdict(r.url, state.rules, state.policy)
@@ -282,10 +283,9 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
             const Verb = now.blocked ? 'Allow' : 'Block'
             return <tr key={r.id} className="log-row">
               <td className="ts">{fmt(r.ts)}</td>
-              <td className="small">{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}</td>
-              <td className="small muted">{r.principal ?? '—'}</td>
+              <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
               <td><Badge kind={r.method === 'GET' || r.method === 'HEAD' ? undefined : 'warn'}>{r.method}</Badge></td>
-              <td className="mono" style={{ maxWidth: 480, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.url}>{r.url}</td>
+              <td className="mono" style={{ width: '100%', maxWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.url}>{r.url}</td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 {r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
@@ -295,15 +295,16 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
                 {r.blocked ? <span className="muted small">—</span> : r.error ? <><Badge kind="err">failed</Badge> <span className="muted small" title={r.error}>{r.error.slice(0, 40)}</span></>
                   : <><Badge kind={r.status! >= 400 ? 'err' : r.status! >= 300 ? 'info' : undefined}>{r.status}</Badge>{r.ms != null && <span className="muted small"> {r.ms} ms</span>}</>}
               </td>
-              <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'nowrap' }}>
+              <td><div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
                 <button className={`sm${now.blocked ? '' : ' danger'}`} title={`${Verb} ${r.host} and its subdomains`} onClick={() => onRule({ action: next, kind: 'domain', value: r.host, url: r.url })}>{Verb} domain</button>
                 <button className={`sm${now.blocked ? '' : ' danger'}`} title={`${Verb} URLs starting with ${base}`} onClick={() => onRule({ action: next, kind: 'url', value: base, url: r.url })}>{Verb} URL</button>
               </div></td>
             </tr>
           })}
-          {rows.length === 0 && <tr><td colSpan={8} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
+          {rows.length === 0 && <tr><td colSpan={7} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
         </tbody>
       </table>
+      </div>
       {data?.more && <p className="muted small">Showing the newest {rows.length}. Narrow the timeframe or filters to see older requests.</p>}
     </div>
   )
