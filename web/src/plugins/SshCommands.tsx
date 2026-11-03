@@ -2,11 +2,11 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, useApi, type Server } from '../api'
 import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
 
-type Kind = 'program' | 'prefix' | 'regex'
+type Kind = 'program' | 'prefix' | 'regex' | 'write'
 type Action = 'block' | 'allow'
 type Policy = 'allow' | 'deny'
 interface Rule { id: number; action: Action; kind: Kind; value: string; host: string; note: string; created_at: number }
-interface Cmd { id: number; ts: number; server_id: string; instance: string; principal: string | null; host: string; tool: string; command: string; exit_code: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now_blocked?: boolean; programs?: string[]; single?: boolean }
+interface Cmd { id: number; ts: number; server_id: string; instance: string; principal: string | null; host: string; tool: string; command: string; exit_code: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now_blocked?: boolean; programs?: string[]; single?: string; writes?: string[]; unknown?: string[] }
 interface Target { action: Action; kind: Kind; value: string; host?: string; command?: string }
 interface Preview { total: number; hits: number; example?: string; conflicts: Rule[] }
 
@@ -16,12 +16,14 @@ const KINDS: { kind: Kind; title: string; label: string; help: string; placehold
   { kind: 'program', title: 'Programs', label: 'Program', help: 'A program name, wherever it runs in the command line: after ; && | $( … and behind sudo, env, xargs and similar. Several names separated by spaces add one rule each.', placeholder: 'rm' },
   { kind: 'prefix', title: 'Commands', label: 'Command prefix', help: 'Each command in the line that starts with this, in whole words ("git status" matches "git status -s", not "git statusx").', placeholder: 'git status' },
   { kind: 'regex', title: 'Patterns', label: 'Pattern (regex)', help: 'Regular expression tested against each command in the line (block rules also test the whole line). Case-sensitive.', placeholder: '^systemctl (status|restart) ' },
+  { kind: 'write', title: 'Written files', label: 'Write to (path)', help: 'Output redirects (>, >>, &>) into this file or directory. "/tmp" covers /tmp/x but not /tmpfoo. /dev/null is always allowed. Only redirects: programs that write files themselves (cp, tee, sed -i…) are controlled by program rules.', placeholder: '/tmp' },
 ]
 const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour', 3600e3], ['Last 24 hours', 86400e3], ['Last 7 days', 7 * 86400e3], ['Last 30 days', 30 * 86400e3]]
 const ruleText = (s: string | null) => s === 'default: deny' ? 'not on allow list' : s === 'default: allow' ? 'allowed by default' : s ?? ''
 const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
 const toLocalInput = (ts: number) => new Date(ts - new Date().getTimezoneOffset() * 60e3).toISOString().slice(0, 16)
 const isCmd = (t: string) => t === 'exec' || t === 'shell'
+const dirOf = (f: string) => f.includes('/') ? f.replace(/\/[^/]*$/, '') || '/' : f
 
 /** SSH plugin: admin command rules (default policy + block/allow by program, command prefix, regex; optionally per host) and the log of what agents ran. */
 export default function SshCommands({ hosts }: { hosts: string[] }) {
@@ -69,8 +71,9 @@ export default function SshCommands({ hosts }: { hosts: string[] }) {
           desc={policy === 'deny' ? 'Every command in a line must match one.' : 'Not in use while the default is allow; kept for when you switch to deny.'} dim={policy !== 'deny'} />}
         <p className="muted small" style={{ marginBottom: 0 }}>
           Applies to <code>exec</code> and <code>shell_send</code> on every SSH instance and host, immediately (open shells are kept). Each host's own command patterns are checked after these.
-          A guardrail, not a sandbox: <code>sh -c</code>, <code>eval</code>, <code>su</code>, interpreters (<code>python -c</code>…) and <code>$VAR</code> can run anything, so block lists are advisory.
-          For real control use deny by default and don't allow shells or interpreters.
+          Commands are found everywhere in the line: pipes, <code>&&</code>, <code>$( )</code>, <code>sudo</code>/<code>xargs</code>/<code>find -exec</code>, and inside <code>sh -c "…"</code> and <code>ssh host "…"</code>.
+          Under deny by default a line that can't be fully checked (a program or script built from <code>$VARs</code>, a shell reading stdin or a script file, syntax errors) is refused.
+          Still a guardrail, not a sandbox: interpreters (<code>python -c</code>, <code>perl -e</code>, <code>node</code>…) and scripts on disk run code that isn't checked, so don't allow them unless you trust what agents run.
         </p>
       </div>
       <CommandLog state={state} hosts={hosts} onRule={setDialog} />
@@ -116,7 +119,7 @@ function DenyDialog({ onClose, onDone }: { onClose: () => void; onDone: () => Pr
       <p>Agents will only be able to run commands on the allow list. Everything else is refused, and shows as <Badge kind="err">Blocked</Badge> in the command log with an <em>Allow</em> button.</p>
       {error && <Alert kind="err">{error}</Alert>}
       {!progs ? <p className="muted">Checking recent commands…</p> : progs.length === 0 ? <p className="muted small">No recent commands would be affected.</p> : <>
-        <p className="small"><strong>Keep these working?</strong> They were run in the last 7 days and aren't on the allow list yet. Ticked programs are added to it, on all hosts. Untick shells and interpreters (sh, bash, python…): allowing them allows everything.</p>
+        <p className="small"><strong>Keep these working?</strong> They were run in the last 7 days and aren't on the allow list yet. Ticked programs are added to it, on all hosts. Untick interpreters (python, perl, node…): what they run isn't checked. Allowing a shell (sh, bash) is safer, since the commands inside sh -c are checked too.</p>
         <div className="row small" style={{ gap: 12 }}><a href="#" onClick={(e) => { e.preventDefault(); setPicked(new Set(progs.map(([p]) => p))) }}>Select all</a><a href="#" onClick={(e) => { e.preventDefault(); setPicked(new Set()) }}>Select none</a></div>
         <div style={{ maxHeight: 260, overflow: 'auto', margin: '6px 0' }}>
           {progs.map(([p, n]) => <label key={p} style={{ display: 'block' }}><input type="checkbox" checked={picked.has(p)} onChange={() => toggle(p)} /> <span className="mono">{p}</span> <span className="muted small">{n} time{n === 1 ? '' : 's'}</span></label>)}
@@ -280,6 +283,8 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
                 {r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
                 {changed && <div className="small" style={{ fontStyle: 'italic' }}>now {r.now_blocked ? 'blocked' : 'allowed'}</div>}
+                {!!r.writes?.length && <div className="muted small" title={r.writes.join('\n')}>writes {r.writes.join(', ').slice(0, 40)}</div>}
+                {!!r.unknown?.length && <div className="small" style={{ color: "var(--warn)" }} title={r.unknown.join('\n')}>can't fully check</div>}
               </td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 {r.blocked || (r.tool === 'shell' && !r.error) ? <span className="muted small">—</span> : r.error ? <><Badge kind="err">failed</Badge> <span className="muted small" title={r.error}>{r.error.slice(0, 40)}</span></>
@@ -288,7 +293,8 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
               </td>
               <td>{cmd && <div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
                 {progs.length > 0 && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} ${progs.join(', ')}`} onClick={() => onRule({ action: next, kind: 'program', value: progs.join(' '), host: r.host, command: r.command })}>{Verb} program{progs.length > 1 ? 's' : ''}</button>}
-                {r.single && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} this exact command`} onClick={() => onRule({ action: next, kind: 'prefix', value: r.command, host: r.host, command: r.command })}>{Verb} command</button>}
+                {r.single && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} this exact command`} onClick={() => onRule({ action: next, kind: 'prefix', value: r.single!, host: r.host, command: r.command })}>{Verb} command</button>}
+                {!!r.writes?.length && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} writing into ${dirOf(r.writes[0]!)}`} onClick={() => onRule({ action: next, kind: 'write', value: dirOf(r.writes![0]!), host: r.host, command: r.command })}>{Verb} writes</button>}
               </div>}</td>
             </tr>
           })}
