@@ -12,6 +12,7 @@
  * it with ssh `forwardOut`, and talks MCP over the tunnel. Agents never see SSH, ports or the bridge token.
  */
 import http from 'node:http';
+import { exec } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -24,7 +25,7 @@ import { HOST_NAME, platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_W
 export { parseStatus, sp } from './platform.js';
 import { sp } from './platform.js';
 
-interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; manual?: boolean; homeDir?: string; bridgeHost?: string; bridgeToken?: string; repoUrl?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
+interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; native?: boolean; manual?: boolean; homeDir?: string; bridgeHost?: string; bridgeToken?: string; repoUrl?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
 interface ProfileCfg { name: string; host: string; description?: string; bridgePort?: number; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; proxy?: string; proxyBypass?: string; extraArgs?: string }
 interface GlobalCfg { hosts: HostCfg[]; profiles: ProfileCfg[]; startTimeoutSec: number; callTimeoutMs: number }
 interface Cfg { profiles: string[]; profilesDisabled?: string[]; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
@@ -33,12 +34,24 @@ interface CachedTool { name: string; title?: string; description?: string; input
 
 const NAME = /^[a-zA-Z0-9_-]+$/;
 
+// ---------- native hosts: same commands, run on the MControlProgram machine itself ----------
+
+/** Stands in for the ssh plugin: commands run locally and the "tunnel" is the bridge's own loopback port. */
+const local: SshApi = {
+  hostNames: () => [],
+  exec: (_host, cmd) => new Promise((resolve) => exec(cmd, { timeout: 120_000, maxBuffer: 16 << 20 }, (e: any, stdout, stderr) => resolve({ stdout, stderr, code: e ? (typeof e.code === 'number' ? e.code : 1) : 0 }))),
+  openTunnel: async (_host, _remoteHost, port) => ({ port, close() {} }),
+};
+const via = (ssh: SshApi, h: HostCfg) => (h.native ? local : ssh);
+
 // ---------- host OS ----------
 
 /** Detected OS per ssh host, for hosts configured as `auto`. Cleared by "Check host". */
 const detected = new Map<string, Os>();
 async function platformOf(ssh: SshApi, h: HostCfg, log: Log): Promise<Platform> {
+  ssh = via(ssh, h);
   if (h.os && h.os !== 'auto') return platforms[h.os];
+  if (h.native) return platforms[process.platform === 'darwin' ? 'macos' : process.platform === 'win32' ? 'windows' : 'linux'];
   let os = detected.get(h.sshHost);
   if (!os) {
     os = osFromUname((await ssh.exec(h.sshHost, PROBE_UNIX, log).catch(() => ({ stdout: '' }))).stdout);
@@ -52,7 +65,7 @@ async function platformOf(ssh: SshApi, h: HostCfg, log: Log): Promise<Platform> 
 
 /** Run a platform script; output normalized to \n line endings. */
 async function run(ssh: SshApi, h: HostCfg, pf: Platform, script: string, log: Log) {
-  const r = await ssh.exec(h.sshHost, pf.wrap(script), log);
+  const r = await via(ssh, h).exec(h.sshHost, pf.wrap(script), log);
   return { ...r, stdout: r.stdout.replace(/\r/g, '') };
 }
 
@@ -218,6 +231,7 @@ async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: 
 // ---------- MCP over the tunnel ----------
 
 async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status['bridge']>, log: Log) {
+  ssh = via(ssh, h);
   if (h.manual) {
     if (!bridge.token) throw new Error(`host ${h.name}: set "Bridge token" (run \`cat ~/.chrome-mcp/bridge-token\` on the host)`);
     const transport = new StreamableHTTPClientTransport(new URL(`${bridgeAddr(h, bridge.port)}/mcp`), { fetch: bridgeFetch(h), requestInit: { headers: { authorization: `Bearer ${bridge.token}` } } });
@@ -254,6 +268,7 @@ const hostSchema = {
   required: ['name'],
   properties: {
     name: { type: 'string', title: 'Name', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
+    native: { type: 'boolean', title: 'Native (this machine)', description: 'Run the browser on the machine MControlProgram itself runs on (inside its container if it is containerised, so the browser, git, node and a display must exist there). Commands run locally; no ssh, and the bridge is reached on 127.0.0.1. Paths and ~ are the MControlProgram user\'s.', default: false },
     manual: { type: 'boolean', title: 'Manual (no ssh)', description: 'The browser runs on a machine MControlProgram cannot ssh to (e.g. the docker host). You run the setup commands yourself ("Set up & start" shows them) and MControlProgram reaches the BrowserPaw bridge over http at the address below.', default: false },
     homeDir: { type: 'string', title: 'Home directory (manual)', description: 'Absolute home of the user running the browser, e.g. /Users/you or /home/you. Manual hosts only.' },
     bridgeHost: { type: 'string', title: 'Bridge address (manual)', description: 'Host the BrowserPaw bridge (127.0.0.1 on the browser machine) is reachable at from MControlProgram. Empty = host.docker.internal (Docker Desktop forwards it to the host loopback).' },

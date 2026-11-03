@@ -171,6 +171,10 @@ When an agent calls a tool, the plugin finds the profile's bridge: it is the lis
 
 The SSH user needs a normal shell, because the plugin runs setup commands as that user. Don't reuse a `command="true"` tunnel-only key for this host.
 
+### Native host (this machine)
+
+Tick **Native (this machine)** to run the browser where MControlProgram itself runs. The same setup, clone/build, launch and status commands run locally instead of over ssh, and the bridge is reached on `127.0.0.1`. **Set up & start** and start on demand work as for ssh hosts. If MControlProgram is in a container, git, node, the browser and a display (`DISPLAY`, via **Launch environment**) must exist inside that container; for a browser on the Docker host use a manual host instead.
+
 ### Manual hosts (no ssh)
 
 For a browser on a machine MControlProgram can't ssh to (typically the Docker host itself), tick **Manual (no ssh)** on the host and set:
