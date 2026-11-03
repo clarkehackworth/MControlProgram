@@ -11,6 +11,8 @@
  * MControlProgram finds the listening bridge whose process descends from the profile's browser, tunnels to
  * it with ssh `forwardOut`, and talks MCP over the tunnel. Agents never see SSH, ports or the bridge token.
  */
+import http from 'node:http';
+import { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
@@ -18,12 +20,12 @@ import { text, errorResult } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
 import { setting } from '../../core/db.js';
 import type { SshApi } from '../ssh/index.js';
-import { platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, type Os, type Browser, type Platform, type Resolved, type Status } from './platform.js';
+import { HOST_NAME, platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, type Os, type Browser, type Platform, type Resolved, type Status } from './platform.js';
 export { parseStatus, sp } from './platform.js';
 import { sp } from './platform.js';
 
-interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; repoUrl?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
-interface ProfileCfg { name: string; host: string; description?: string; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; proxy?: string; proxyBypass?: string; extraArgs?: string }
+interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; manual?: boolean; homeDir?: string; bridgeHost?: string; bridgeToken?: string; repoUrl?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
+interface ProfileCfg { name: string; host: string; description?: string; bridgePort?: number; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; proxy?: string; proxyBypass?: string; extraArgs?: string }
 interface GlobalCfg { hosts: HostCfg[]; profiles: ProfileCfg[]; startTimeoutSec: number; callTimeoutMs: number }
 interface Cfg { profiles: string[]; profilesDisabled?: string[]; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
 type Log = PluginContext['log'];
@@ -120,7 +122,75 @@ async function setupProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log) {
   return r;
 }
 
+// ---------- manual hosts (no ssh): the user runs the commands, the bridge is reached over plain http ----------
+
+const BRIDGE_PORTS = Array.from({ length: 11 }, (_, k) => 12306 + k);
+const bridgeAddr = (h: HostCfg, port: number) => `http://${h.bridgeHost || 'host.docker.internal'}:${port}`;
+
+/** fetch with a forced Host header (global fetch ignores it). The bridge only accepts a loopback Host. */
+function bridgeFetch(h: HostCfg): typeof fetch {
+  return ((input: any, init: any = {}) => new Promise<Response>((resolve, reject) => {
+    const u = new URL(typeof input === 'string' ? input : input.url ?? String(input));
+    const headers = Object.fromEntries(new Headers(init.headers));
+    headers.host = `127.0.0.1:${u.port}`;
+    const req = http.request({ host: u.hostname, port: u.port, path: u.pathname + u.search, method: init.method ?? 'GET', headers, signal: init.signal }, (res) => {
+      const nobody = [204, 205, 304].includes(res.statusCode ?? 0);
+      resolve(new Response(nobody ? null : (Readable.toWeb(res) as any), { status: res.statusCode, statusText: res.statusMessage, headers: res.headers as any }));
+    });
+    req.on('error', reject);
+    req.end(init.body);
+  })) as typeof fetch;
+}
+
+async function manualStatus(h: HostCfg, p: ProfileCfg): Promise<Status> {
+  const f = bridgeFetch(h);
+  const up = await Promise.all((p.bridgePort ? [p.bridgePort] : BRIDGE_PORTS).map((port) => f(`${bridgeAddr(h, port)}/ping`, { signal: AbortSignal.timeout(2000) }).then((r) => r.status < 500 ? port : 0, () => 0)));
+  const port = up.find(Boolean);
+  return port ? { bridge: { pid: 0, port, token: h.bridgeToken ?? '' } } : {};
+}
+
+/** What the user must run on the machine that hosts the browser (no ssh for this host). */
+function manualInstructions(h: HostCfg, p: ProfileCfg) {
+  const os = h.os;
+  if (os !== 'macos' && os !== 'linux') throw new Error(`host ${h.name}: set Operating system to macos or linux (Windows has no manual mode)`);
+  if (!h.homeDir) throw new Error(`host ${h.name}: set "Home directory" (e.g. /Users/you) so the setup commands can use absolute paths`);
+  const pf = platforms[os];
+  const home = h.homeDir.replace(/\/+$/, '');
+  const ex = (x: string) => (x.startsWith('~/') ? home + x.slice(1) : x);
+  const x = paths(h, pf, p);
+  const bp = ex((h.browserpawDir || '~/dev/browserpaw').replace(/[\\/]+$/, ''));
+  const [ext, nh, dir] = [ex(x.ext), ex(x.nativeHost), ex(x.profile!)];
+  const node = [
+    'const fs=require("fs"),c=require("crypto"),[ext,d,nh,tp]=process.argv.slice(1);',
+    'let k;try{k=require(ext+"/manifest.json").key}catch(e){}',
+    'const id=[...c.createHash("sha256").update(k?Buffer.from(k,"base64"):Buffer.from(ext)).digest("hex").slice(0,32)].map(x=>String.fromCharCode(97+parseInt(x,16))).join("");',
+    'fs.writeFileSync(d+"/browserpaw-host.sh","#!/bin/sh\\nexport CHROME_MCP_TOOL_PROFILE="+tp+"\\nexec \\""+nh+"\\" \\"$@\\"\\n",{mode:0o700});',
+    `fs.writeFileSync(d+"/NativeMessagingHosts/${HOST_NAME}.json",JSON.stringify({name:"${HOST_NAME}",description:"BrowserPaw (MControlProgram profile ${p.name})",path:d+"/browserpaw-host.sh",type:"stdio",allowed_origins:["chrome-extension://"+id+"/"]},null,2),{mode:0o600});`,
+  ].join('');
+  const launch = pf.launch({ dir, ext, nativeHost: nh, chromium: ex(x.chromium), extensionId: '' }, { browser: h.browser ?? 'chromium', toolProfile: p.toolProfile || 'full', headless: !!p.headless, extraArgs: p.extraArgs ?? '', proxy: p.proxy?.trim() || undefined, proxyBypass: p.proxyBypass?.trim() || undefined, env: launchEnv(h, pf), task: '' });
+  const script = [
+    'export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin"',
+    '[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1',
+    'set -e',
+    `[ -d ${q(bp)}/.git ] || git clone ${q(h.repoUrl || DEFAULT_REPO)} ${q(bp)}`,
+    `if [ ! -d ${q(ext)} ] || [ ! -f ${q(nh)} ]; then (cd ${q(bp)} && { command -v pnpm >/dev/null || corepack enable pnpm; } && pnpm install && pnpm build); fi`,
+    `mkdir -p ${q(dir + '/NativeMessagingHosts')}`,
+    `node -e '${node}' ${q(ext)} ${q(dir)} ${q(nh)} ${q(p.toolProfile || 'full')}`,
+    launch,
+  ].join('\n');
+  return {
+    steps: [
+      `1. Open a terminal on ${h.name} (the machine that will show the browser), logged in as the user who should own it. It needs git, node >= 22.6 and ${h.browser ?? 'chromium'} installed.`,
+      '2. Paste and run the script below. The first run clones and builds BrowserPaw (several minutes) and then opens the browser; later runs just open it.',
+      '3. First time only: once the browser is open, run `cat ~/.chrome-mcp/bridge-token` in that terminal and paste the result into this host\'s "Bridge token" field.',
+      `4. Press Status here. When the bridge is reachable at ${bridgeAddr(h, p.bridgePort ?? 12306)} (ports 12306-12316) the profile is ready.`,
+    ],
+    script,
+  };
+}
+
 async function status(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log): Promise<Status> {
+  if (h.manual) return manualStatus(h, p);
   const pf = await platformOf(ssh, h, log);
   return parseStatus((await run(ssh, h, pf, pf.status(paths(h, pf, p).profile!), log)).stdout);
 }
@@ -129,6 +199,7 @@ async function status(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log): Promise
 async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: number, log: Log) {
   let st = await status(ssh, h, p, log);
   if (st.bridge) return st;
+  if (h.manual) throw new Error(`profile ${p.name}: its browser is not running on ${h.name}, which is a manual host (no ssh). An admin must run "Set up & start" on the plugin page and follow the commands it shows.`);
   const pf = await platformOf(ssh, h, log);
   if (!st.chromiumPid) {
     const r = await setupProfile(ssh, h, p, log);
@@ -147,6 +218,13 @@ async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: 
 // ---------- MCP over the tunnel ----------
 
 async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status['bridge']>, log: Log) {
+  if (h.manual) {
+    if (!bridge.token) throw new Error(`host ${h.name}: set "Bridge token" (run \`cat ~/.chrome-mcp/bridge-token\` on the host)`);
+    const transport = new StreamableHTTPClientTransport(new URL(`${bridgeAddr(h, bridge.port)}/mcp`), { fetch: bridgeFetch(h), requestInit: { headers: { authorization: `Bearer ${bridge.token}` } } });
+    const client = new Client({ name: 'mcontrolprogram', version: '0.1.0' });
+    await client.connect(transport);
+    return client;
+  }
   const t = await ssh.openTunnel(h.sshHost, '127.0.0.1', bridge.port, log);
   try {
     const transport = new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${t.port}/mcp`), { requestInit: { headers: { authorization: `Bearer ${bridge.token}` } } });
@@ -173,10 +251,14 @@ async function refreshToolCache(client: Client, profile: string) {
 
 const hostSchema = {
   type: 'object',
-  required: ['name', 'sshHost'],
+  required: ['name'],
   properties: {
     name: { type: 'string', title: 'Name', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
-    sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (must have a pinned host key). MControlProgram runs setup commands as that user.', 'x-options-from': 'ssh:hosts' },
+    manual: { type: 'boolean', title: 'Manual (no ssh)', description: 'The browser runs on a machine MControlProgram cannot ssh to (e.g. the docker host). You run the setup commands yourself ("Set up & start" shows them) and MControlProgram reaches the BrowserPaw bridge over http at the address below.', default: false },
+    homeDir: { type: 'string', title: 'Home directory (manual)', description: 'Absolute home of the user running the browser, e.g. /Users/you or /home/you. Manual hosts only.' },
+    bridgeHost: { type: 'string', title: 'Bridge address (manual)', description: 'Host the BrowserPaw bridge (127.0.0.1 on the browser machine) is reachable at from MControlProgram. Empty = host.docker.internal (Docker Desktop forwards it to the host loopback).' },
+    bridgeToken: { type: 'string', title: 'Bridge token (manual)', description: 'Output of `cat ~/.chrome-mcp/bridge-token` on the browser machine (exists after the browser has started once). Manual hosts only.', format: 'password' },
+    sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (must have a pinned host key). MControlProgram runs setup commands as that user. Not used for manual hosts.', 'x-options-from': 'ssh:hosts' },
     os: { type: 'string', title: 'Operating system', enum: ['auto', 'linux', 'macos', 'windows'], default: 'auto', description: 'auto: detected over ssh (uname, else PowerShell). Windows needs OpenSSH Server and PowerShell; macOS and Linux need sh.' },
     browser: { type: 'string', title: 'Browser', enum: ['chromium', 'chrome', 'edge'], default: 'chromium', description: 'Picks the default binary path and, on Windows, the registry key for native messaging. Branded Chrome/Edge get --disable-features=DisableLoadExtensionCommandLineSwitch so --load-extension still works.' },
     description: { type: 'string', title: 'Description' },
@@ -195,6 +277,7 @@ const profileSchema = {
     name: { type: 'string', title: 'Name', description: 'Also the directory name under the host\'s profiles directory', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
     host: { type: 'string', title: 'Host', 'x-options-from': 'hosts' },
     description: { type: 'string', title: 'Description', description: 'Shown to agents (e.g. which accounts are signed in)' },
+    bridgePort: { type: 'integer', title: 'Bridge port (manual hosts)', description: 'Pin the bridge port (12306-12316) of this profile\'s browser. Empty = the first port that answers, which is only right with one running profile per manual host.', minimum: 12306, maximum: 12316 },
     toolProfile: { type: 'string', title: 'BrowserPaw tool profile', enum: ['core', 'full', 'crawl'], default: 'full' },
     headless: { type: 'boolean', title: 'Headless', description: 'No window (human handoff for 2FA/captchas will not be possible)', default: false },
     autoStart: { type: 'boolean', title: 'Start on demand', description: 'Launch Chromium when an agent calls a tool and the profile is not running', default: true },
@@ -217,7 +300,7 @@ const plugin: MControlProgramPlugin = {
   id: 'browserpaw',
   name: 'BrowserPaw',
   version: '0.2.0',
-  description: 'Run isolated Chromium profiles with the BrowserPaw extension on SSH hosts and give agents their browser tools. MControlProgram sets up the profiles, launches Chromium and tunnels to the bridge; agents never get SSH access or the bridge token.',
+  description: 'Run isolated Chromium profiles with the BrowserPaw extension on SSH hosts and give agents their browser tools. MControlProgram sets up the profiles, launches Chromium and tunnels to the bridge; agents never get SSH access or the bridge token. Hosts without ssh can be "manual": the admin runs the shown setup script and MControlProgram reaches the bridge over http.',
   dependencies: { ssh: '^0.2.0' },
   globalConfigSchema: {
     type: 'object',
@@ -235,6 +318,7 @@ const plugin: MControlProgramPlugin = {
       async run({ name }, a: PluginActionContext) {
         const g = a.config as GlobalCfg;
         const h = g.hosts.find((x) => x.name === name); if (!h) throw new Error('unknown host');
+        if (h.manual) { const ok = !!(await manualStatus(h, { name: '', host: h.name })).bridge; return { ok, manual: true, message: ok ? 'a BrowserPaw bridge answers' : `no BrowserPaw bridge answers at ${bridgeAddr(h, 12306)} (ports 12306-12316): start a profile's browser first (see Set up & start)` }; }
         detected.delete(h.sshHost); // re-detect
         const i = await inspect(a.dep<SshApi>('ssh'), h, a.log);
         return { ok: !!(i.ext && i.nativeHost && i.chromium), os: i.pf.os + (h.os && h.os !== 'auto' ? ' (configured)' : ' (detected)'), extension: i.ext ?? `MISSING: ${i.paths.ext}`, extensionId: i.extensionId, nativeHost: i.nativeHost ?? `MISSING: ${i.paths.nativeHost}`, browser: i.chromium ?? `MISSING: ${i.paths.chromium}` };
@@ -246,6 +330,7 @@ const plugin: MControlProgramPlugin = {
         const g = { ...plugin.defaultGlobalConfig, ...a.config } as GlobalCfg;
         const { p, h } = lookup(g, String(name));
         const ssh = a.dep<SshApi>('ssh');
+        if (h.manual && !(await status(ssh, h, p, a.log)).bridge) return { ok: false, manual: true, message: 'The browser is not reachable yet. Run the script below on the browser machine, then press Set up & start again.', ...manualInstructions(h, p) };
         const st = await startProfile(ssh, h, p, g.startTimeoutSec, a.log);
         const client = await connectBridge(ssh, h, st.bridge!, a.log);
         try {
@@ -260,6 +345,7 @@ const plugin: MControlProgramPlugin = {
       async run({ name }, a: PluginActionContext) {
         const { p, h } = lookup(a.config as GlobalCfg, String(name));
         const ssh = a.dep<SshApi>('ssh');
+        if (h.manual) return { ok: false, manual: true, message: 'Manual host: close the browser window (or quit that Chromium profile) on the browser machine.' };
         const st = await status(ssh, h, p, a.log);
         if (!st.chromiumPid) return { ok: true, running: false };
         const pf = await platformOf(ssh, h, a.log);
@@ -272,7 +358,7 @@ const plugin: MControlProgramPlugin = {
       async run({ name }, a: PluginActionContext) {
         const { p, h } = lookup(a.config as GlobalCfg, String(name));
         const st = await status(a.dep<SshApi>('ssh'), h, p, a.log);
-        return { dir: st.dir ?? 'not set up', running: !!st.chromiumPid, chromiumPid: st.chromiumPid, bridgePort: st.bridge?.port, cachedTools: cachedTools(p.name).length };
+        return { dir: st.dir ?? (h.manual ? 'manual host' : 'not set up'), running: !!st.chromiumPid || !!(h.manual && st.bridge), chromiumPid: st.chromiumPid, bridgePort: st.bridge?.port, cachedTools: cachedTools(p.name).length };
       },
     },
   },

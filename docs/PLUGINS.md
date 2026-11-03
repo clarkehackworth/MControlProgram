@@ -171,6 +171,16 @@ When an agent calls a tool, the plugin finds the profile's bridge: it is the lis
 
 The SSH user needs a normal shell, because the plugin runs setup commands as that user. Don't reuse a `command="true"` tunnel-only key for this host.
 
+### Manual hosts (no ssh)
+
+For a browser on a machine MControlProgram can't ssh to (typically the Docker host itself), tick **Manual (no ssh)** on the host and set:
+
+- **Operating system** (`macos` or `linux`) and **Home directory** (e.g. `/Users/you`), so the generated commands use absolute paths.
+- **Bridge address**: where MControlProgram reaches the bridge. Empty = `host.docker.internal`, which Docker Desktop forwards to the host's loopback. The bridge only listens on `127.0.0.1` there and rejects any other `Host` header, so the plugin sends `Host: 127.0.0.1:<port>` itself.
+- **Bridge token**: `cat ~/.chrome-mcp/bridge-token` on that machine (the file exists after the browser has started once).
+
+Nothing runs automatically. **Set up & start** on a profile shows steps and a shell script to paste into a terminal on that machine: it clones and builds BrowserPaw if needed, writes the profile's native messaging manifest and launches the browser. After that the plugin finds the bridge by probing ports 12306-12316 (pin one with the profile's **Bridge port** if several profiles run on the host). Stopping is done by closing the browser; "Start on demand" can't launch it, so agents get an error when it isn't running.
+
 **Operating systems.** Each browser host has an **Operating system** setting (`auto`, `linux`, `macos`, `windows`) and a **Browser** setting (`chromium`, `chrome`, `edge`). With `auto`, the plugin runs `uname -s` and falls back to a PowerShell probe; **Check host** shows the result and re-detects. Empty binary, profiles-directory and environment fields use per-OS defaults. The per-OS command sets live in `src/plugins/browserpaw/platform.ts`:
 
 | | Linux | macOS | Windows |
