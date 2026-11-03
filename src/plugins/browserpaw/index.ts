@@ -20,8 +20,9 @@ import { setting } from '../../core/db.js';
 import type { SshApi } from '../ssh/index.js';
 import { platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, type Os, type Browser, type Platform, type Resolved, type Status } from './platform.js';
 export { parseStatus, sp } from './platform.js';
+import { sp } from './platform.js';
 
-interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
+interface HostCfg { name: string; sshHost: string; os?: Os | 'auto'; browser?: Browser; description?: string; browserpawDir?: string; repoUrl?: string; extensionDir?: string; chromium?: string; profilesDir?: string; env?: string }
 interface ProfileCfg { name: string; host: string; description?: string; toolProfile?: 'core' | 'full' | 'crawl'; headless?: boolean; autoStart?: boolean; proxy?: string; proxyBypass?: string; extraArgs?: string }
 interface GlobalCfg { hosts: HostCfg[]; profiles: ProfileCfg[]; startTimeoutSec: number; callTimeoutMs: number }
 interface Cfg { profiles: string[]; profilesDisabled?: string[]; allowTools: string[]; denyTools: string[]; idleDisconnectSec: number }
@@ -83,11 +84,34 @@ async function inspect(ssh: SshApi, h: HostCfg, log: Log, p?: ProfileCfg) {
   return { pf, ext: o.ext || undefined, extensionId: o.ext ? pf.extensionId(o.ext, key) : undefined, nativeHost: o.nativehost || undefined, chromium: o.chromium || undefined, dir: o.dir || undefined, paths: x };
 }
 
+const DEFAULT_REPO = 'https://github.com/GoldenLoaf24h/browserpaw.git';
+const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+/** Clone (if absent) and build BrowserPaw on a unix host. Needs git, node and pnpm (or corepack) there. */
+async function installBrowserpaw(ssh: SshApi, h: HostCfg, pf: Platform, log: Log) {
+  if (pf.os === 'windows') throw new Error(`host ${h.name}: automatic BrowserPaw install is not supported on Windows; clone and build it there (see INSTALL.md)`);
+  const dir = sp((h.browserpawDir || '~/dev/browserpaw').replace(/[\\/]+$/, ''));
+  log.info(`browserpaw: cloning/building BrowserPaw on ${h.name} (this can take several minutes)`);
+  const script = [
+    'export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/share/pnpm"',
+    // ssh sessions skip the profile, so pick up nvm if it is there
+    '[ -s "$HOME/.nvm/nvm.sh" ] && . "$HOME/.nvm/nvm.sh" >/dev/null 2>&1',
+    'set -e',
+    `[ -d ${dir}/.git ] || { mkdir -p ${dir} && git clone ${q(h.repoUrl || DEFAULT_REPO)} ${dir}; }`,
+    `cd ${dir}`,
+    'command -v pnpm >/dev/null 2>&1 || corepack enable pnpm',
+    'pnpm install && pnpm build',
+  ].join('\n');
+  const r = await run(ssh, h, pf, script, log);
+  if (r.code !== 0) throw new Error(`BrowserPaw clone/build failed on ${h.name} (exit ${r.code}): ${(r.stderr || r.stdout).trim().split('\n').slice(-8).join('\n')}`);
+}
+
 /** Create the profile dir and its native messaging registration. Idempotent. */
 async function setupProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, log: Log) {
-  const i = await inspect(ssh, h, log, p);
+  let i = await inspect(ssh, h, log, p);
+  if (!i.ext || !i.nativeHost) { await installBrowserpaw(ssh, h, i.pf, log); i = await inspect(ssh, h, log, p); }
   const missing = [!i.ext && `extension dir ${i.paths.ext}`, !i.nativeHost && `native host ${i.paths.nativeHost}`, !i.chromium && `browser binary "${i.paths.chromium}"`].filter(Boolean);
-  if (missing.length) throw new Error(`host ${h.name} (${i.pf.os}) is missing: ${missing.join(', ')}. Build/install BrowserPaw there (see its INSTALL.md) or fix the host paths.`);
+  if (missing.length) throw new Error(`host ${h.name} (${i.pf.os}) is missing: ${missing.join(', ')}. The build ran but did not produce them, or the paths are wrong; check the host's BrowserPaw checkout/extension dir.`);
   if (!i.dir) throw new Error(`could not create profile dir ${i.paths.profile}`);
   const r = i as typeof i & Resolved;
   const out = kv((await run(ssh, h, i.pf, i.pf.setup(r, p.name, h.browser ?? 'chromium', p.toolProfile || 'full'), log)).stdout);
@@ -157,6 +181,7 @@ const hostSchema = {
     browser: { type: 'string', title: 'Browser', enum: ['chromium', 'chrome', 'edge'], default: 'chromium', description: 'Picks the default binary path and, on Windows, the registry key for native messaging. Branded Chrome/Edge get --disable-features=DisableLoadExtensionCommandLineSwitch so --load-extension still works.' },
     description: { type: 'string', title: 'Description' },
     browserpawDir: { type: 'string', title: 'BrowserPaw checkout', description: 'Built BrowserPaw repo on the host (pnpm build). Native host: <dir>/app/native-server/dist/run_host.sh (run_host.bat on Windows). ~/ means the ssh user\'s home on every OS.', default: '~/dev/browserpaw' },
+    repoUrl: { type: 'string', title: 'BrowserPaw repo URL', description: 'Cloned into the checkout dir by "Set up & start" when the extension or native host is missing (then pnpm install && pnpm build; needs git and node on the host). Empty = ' + DEFAULT_REPO },
     extensionDir: { type: 'string', title: 'Extension dir', description: 'Unpacked extension (chrome-mv3). Default: <checkout>/app/chrome-extension/.output/chrome-mv3' },
     chromium: { type: 'string', title: 'Browser binary', description: 'Empty = per OS/browser default. Linux: chromium, google-chrome, microsoft-edge (on PATH). macOS: /Applications/<App>.app/Contents/MacOS/<App>. Windows: ~/AppData/Local/Chromium/Application/chrome.exe, C:/Program Files/Google/Chrome/Application/chrome.exe, C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe' },
     profilesDir: { type: 'string', title: 'Profiles directory', description: 'Empty = ~/.local/share/mcontrolprogram-browserpaw (Linux), ~/Library/Application Support/mcontrolprogram-browserpaw (macOS), ~/AppData/Local/mcontrolprogram-browserpaw (Windows)' },
