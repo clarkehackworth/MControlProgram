@@ -210,7 +210,8 @@ export function parseStatus(out: string): Status {
   for (const l of sockOut.split('\n')) {
     // ss / our Windows lines: "… 127.0.0.1:PORT … pid=PID"; lsof: "COMMAND PID USER … TCP 127.0.0.1:PORT (LISTEN)"
     const m = /\s127\.0\.0\.1:(\d+)\s.*\bpid=(\d+)/.exec(l) ?? ((x) => x && [x[0], x[2], x[1]])(/^\S+\s+(\d+)\s.*\s127\.0\.0\.1:(\d+)\s+\(LISTEN\)/.exec(l));
-    if (m && descends(Number(m[2]))) return { dir, chromiumPid, bridge: { pid: Number(m[2]), port: Number(m[1]), token } };
+    // only the bridge's port range: the bridge's own children (e.g. the Jev decider on 8009) also descend from chromium
+    if (m && Number(m[1]) >= 12306 && Number(m[1]) <= 12316 && descends(Number(m[2]))) return { dir, chromiumPid, bridge: { pid: Number(m[2]), port: Number(m[1]), token } };
   }
   return { dir, chromiumPid };
 }

@@ -81,6 +81,10 @@ test('parseStatus finds the bridge port from ss, tied to the profile chromium by
   assert.deepEqual(parseStatus(out.replace(tok, 'garbage')), { dir, chromiumPid: 100 });
   assert.deepEqual(parseStatus(`dir=${dir}\n  300 1 chromium --user-data-dir=${dir}-other\n@@SS@@\n\n@@TOKEN@@\n`), { dir });
   assert.deepEqual(parseStatus(''), {});
+  // The bridge's own children (e.g. the local Jev decider on 8009) also descend from chromium: skip them.
+  const decider = '    LISTEN 0      2048       127.0.0.1:8009       0.0.0.0:*    users:(("python3",pid=202,fd=7))';
+  const withDecider = out.replace(`  201   200 node`, `  202   201 python3 -m uvicorn decider.serve:app\n  201   200 node`).replace('@@SS@@\n', `@@SS@@\n${decider.trim()}\n`);
+  assert.deepEqual(parseStatus(withDecider), { dir, chromiumPid: 100, bridge: { pid: 201, port: 12307, token: tok } });
 });
 
 test('plugin config schema patterns reject bad profile names (same rule the UI enforces)', async () => {
