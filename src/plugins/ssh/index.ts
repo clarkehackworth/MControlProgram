@@ -15,9 +15,11 @@ import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginAction
 import { effective } from '../../core/global-config.js';
 import { text, errorResult } from '../../core/plugin-api.js';
 import { pluginConfig } from '../../core/store.js';
+import { localClient } from './local.js';
+import * as cmdRules from './rules.js';
 
 export interface HostCfg {
-  name: string; host: string; port?: number; username: string; auth: 'key' | 'password' | 'agent';
+  name: string; host: string; port?: number; username: string; auth: 'key' | 'password' | 'agent' | 'native';
   privateKey?: string; passphrase?: string; password?: string; description?: string; hostKey?: string;
   allowCommands?: string[]; denyCommands?: string[]; allowShell?: boolean; allowSftp?: boolean; sftpRoot?: string;
 }
@@ -27,15 +29,15 @@ interface Cfg { hosts: string[]; hostsDisabled?: string[]; execTimeoutMs: number
 type Resolved = Omit<Cfg, 'hosts'> & Omit<GlobalCfg, 'hosts'> & { hosts: HostCfg[] }
 
 const hostSchema = {
-  type: 'object', required: ['name', 'host', 'username', 'auth'],
+  type: 'object', required: ['name', 'auth'],
   properties: {
     name: { type: 'string', title: 'Name', description: 'Identifier agents use (e.g. "prod-web-1")' },
     description: { type: 'string', title: 'Description', description: 'Shown to agents in list_hosts' },
-    host: { type: 'string', title: 'Hostname / IP' },
-    port: { type: 'integer', title: 'Port', default: 22 },
+    host: { type: 'string', title: 'Hostname / IP', 'x-show-if': { auth: ['key', 'password', 'agent'] } },
+    port: { type: 'integer', title: 'Port', default: 22, 'x-show-if': { auth: ['key', 'password', 'agent'] } },
     hostKey: { type: 'string', title: 'Pinned host key (SHA256 fingerprint)', 'x-no-column': true, description: 'Set on the first "Test connection" (compare with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on the host) or paste it. Connections presenting a different key are refused. Clear to re-pin.' },
-    username: { type: 'string', title: 'Username' },
-    auth: { type: 'string', title: 'Auth method', enum: ['key', 'password', 'agent'], default: 'key' },
+    username: { type: 'string', title: 'Username', 'x-show-if': { auth: ['key', 'password', 'agent'] } },
+    auth: { type: 'string', title: 'Auth method', enum: ['key', 'password', 'agent', 'native'], default: 'key', description: 'native = no ssh: commands, shells and files are on the machine MControlProgram itself runs on (inside its container if containerised), as the user it runs as. Agents with access get that machine\'s privileges, including MControlProgram\'s own data; restrict with command patterns and an SFTP root.' },
     privateKey: { type: 'string', title: 'Private key (PEM)', format: 'multiline', 'x-secret': true, 'x-show-if': { auth: 'key' } },
     passphrase: { type: 'string', title: 'Key passphrase', 'x-secret': true, 'x-show-if': { auth: 'key' } },
     password: { type: 'string', title: 'Password', 'x-secret': true, 'x-show-if': { auth: 'password' } },
@@ -122,6 +124,7 @@ class Conn {
 
 function connect(host: HostCfg, cfg: { connectTimeoutMs: number; keepaliveSec: number }, log: PluginContext['log']): Promise<Conn> {
   const c = new Conn(host);
+  if (host.auth === 'native') { c.client = localClient() as unknown as InstanceType<typeof Client>; c.ready = true; return Promise.resolve(c); }
   const opts: ConnectConfig = {
     host: host.host, port: host.port ?? 22, username: host.username, readyTimeout: cfg.connectTimeoutMs, keepaliveInterval: cfg.keepaliveSec * 1000,
   };
@@ -188,6 +191,7 @@ async function pin(a: PluginActionContext, name: string, hostKey?: string) {
  * Refuses hosts without a pinned host key, since tunnels typically carry credentials.
  */
 export async function openTunnel(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, remoteHost: string, remotePort: number, log: PluginContext['log']) {
+  if (host.auth === 'native') return { port: remotePort, close() {} }; // already local: the "tunnel" is the port itself
   if (!host.hostKey) throw new Error(`ssh host "${host.name}" has no pinned host key; run "Test connection" on it in the SSH plugin first`);
   let conn: Promise<Conn> | undefined;
   const getConn = () => {
@@ -247,7 +251,7 @@ const pinnedHost = (name: string) => {
   const g = { ...plugin.defaultGlobalConfig, ...pluginConfig.decrypted('ssh') } as GlobalCfg;
   const h = g.hosts.find((x) => x.name === name);
   if (!h) throw new Error(`ssh host "${name}" is not in the SSH plugin inventory`);
-  if (!h.hostKey) throw new Error(`ssh host "${name}" has no pinned host key; run "Test connection" on it in the SSH plugin first`);
+  if (!h.hostKey && h.auth !== 'native') throw new Error(`ssh host "${name}" has no pinned host key; run "Test connection" on it in the SSH plugin first`);
   return { h, g };
 };
 const api: SshApi = {
@@ -266,6 +270,7 @@ const plugin: MControlProgramPlugin = {
   defaultGlobalConfig: { hosts: [], connectTimeoutMs: 15000, keepaliveSec: 30 },
 
   globalActions: {
+    ...cmdRules.actions,
     add_host: {
       title: 'Add host',
       /**
@@ -279,8 +284,8 @@ const plugin: MControlProgramPlugin = {
         const name = String(p.name ?? '').trim();
         if (!/^[a-zA-Z0-9_.-]+$/.test(name)) throw new Error('name must be letters, digits, dot, dash or underscore');
         if (g.hosts.some((h) => h.name === name)) throw new Error(`host "${name}" already exists`);
-        if (!p.host || !p.username) throw new Error('host and username are required');
-        const h: HostCfg = { name, host: String(p.host), port: Number(p.port) || 22, username: String(p.username), description: p.description ? String(p.description) : undefined, auth: p.auth === 'password' ? 'password' : p.auth === 'agent' ? 'agent' : 'key', allowShell: true, allowSftp: true };
+        if (p.auth !== 'native' && (!p.host || !p.username)) throw new Error('host and username are required');
+        const h: HostCfg = { name, host: String(p.host ?? ''), port: Number(p.port) || 22, username: String(p.username ?? ''), description: p.description ? String(p.description) : undefined, auth: p.auth === 'password' ? 'password' : p.auth === 'agent' ? 'agent' : p.auth === 'native' ? 'native' : 'key', allowShell: true, allowSftp: true };
         let publicKey: string | undefined;
         if (h.auth === 'password') {
           if (!p.password) throw new Error('password is required');
@@ -413,6 +418,20 @@ const plugin: MControlProgramPlugin = {
       if (c.sftp) return resolve(c.sftp);
       c.client.sftp((err, s) => { if (err) return reject(err); c.sftp = s; s.on('close', () => (c.sftp = undefined)); resolve(s); });
     });
+    /** Plugin-wide command rules, then the host's own patterns. Throws (and logs) if refused. */
+    const who = (c: { principal?: string }) => ({ serverId: ctx.serverId, instance: ctx.instanceName, principal: c.principal });
+    const log = (e: Omit<cmdRules.LogEntry, 'serverId' | 'instance' | 'principal'>, c: { principal?: string }) => {
+      try { cmdRules.record({ ...who(c), ...e }); } catch (err) { ctx.log.warn(`command log write failed: ${(err as Error).message}`); }
+    };
+    const admit = (h: HostCfg, tool: string, cmd: string, c: { principal?: string }) => {
+      const v = cmdRules.verdict(cmd, h.name, cmdRules.rules(), cmdRules.policy());
+      if (v.blocked) {
+        log({ host: h.name, tool, command: cmd, blocked: v.blocked }, c);
+        throw new Error(v.blocked === 'default: deny' ? 'command not on the administrator\'s allow list' : `command blocked by administrator (${v.blocked})`);
+      }
+      try { checkCommand(h, cmd); } catch (e) { log({ host: h.name, tool, command: cmd, blocked: `host policy: ${(e as Error).message}` }, c); throw e; }
+      return v.allowedBy;
+    };
     const hostArg = z.string().describe('Host name from list_hosts');
     const shellName = z.string().regex(/^[a-zA-Z0-9_-]+$/).optional().describe('Shell name (default "default"); use different names for parallel shells on one host');
     // Shell key = scope qualifier + name. Agents only ever see their own qualifier's shells.
@@ -449,6 +468,7 @@ const plugin: MControlProgramPlugin = {
         // Reaper: closes idle/dead shells, then idle host connections. Runs regardless of agent behaviour.
         idleTimer = setInterval(async () => {
           const now = Date.now();
+          try { cmdRules.prune(ctx.global().logRetentionDays); } catch { /* db closed */ }
           const shellIdle = effective(cfg.shellIdleSec, ctx.global().stateIdleSec), connIdle = effective(cfg.idleDisconnectSec, ctx.global().connectionIdleSec);
           for (const [name, p] of conns) {
             const c = await p.catch(() => undefined);
@@ -495,7 +515,7 @@ const plugin: MControlProgramPlugin = {
           name: 'list_hosts', description: 'List SSH hosts available through this gateway and what each allows.',
           annotations: { readOnlyHint: true },
           handler: async () => text(JSON.stringify(cfg.hosts.map((h) => ({
-            name: h.name, description: h.description, user: h.username, host: h.host, port: h.port ?? 22,
+            name: h.name, description: h.description, ...(h.auth === 'native' ? { native: true } : { user: h.username, host: h.host, port: h.port ?? 22 }),
             shell: h.allowShell !== false, sftp: h.allowSftp !== false, sftpRoot: h.sftpRoot, commandPolicy: { allow: h.allowCommands ?? [], deny: h.denyCommands ?? [] },
             connected: conns.has(h.name),
           })), null, 2)),
@@ -505,10 +525,12 @@ const plugin: MControlProgramPlugin = {
           inputSchema: { host: hostArg, command: z.string().describe('Shell command line'), timeoutMs: z.number().int().positive().optional().describe('Override exec timeout') },
           handler: async ({ host, command, timeoutMs }, c) => {
             try {
-              const h = hostByName(host); checkCommand(h, command);
+              const h = hostByName(host); const allowedBy = admit(h, 'exec', command, c);
               const conn = await getConn(host);
               c.log.connection(`exec on ${host}: ${command.slice(0, 200)}`, undefined, c.sessionId);
-              const r = await exec(conn, command, c.signal, timeoutMs);
+              const t0 = Date.now();
+              const r = await exec(conn, command, c.signal, timeoutMs).catch((e) => { log({ host, tool: 'exec', command, allowedBy, error: (e as Error).message, ms: Date.now() - t0 }, c); throw e; });
+              log({ host, tool: 'exec', command, allowedBy, exitCode: r.code, error: r.signal ? `signal ${r.signal}` : undefined, ms: Date.now() - t0 }, c);
               const body = `${clip(r.stdout, cfg.maxOutputBytes)}${r.stderr ? `\n[stderr]\n${clip(r.stderr, cfg.maxOutputBytes)}` : ''}\n[exit ${r.code ?? r.signal ?? '?'}]`;
               return { content: [{ type: 'text', text: body }], isError: r.code !== 0, structuredContent: { exitCode: r.code, stdout: clip(r.stdout, cfg.maxOutputBytes), stderr: clip(r.stderr, cfg.maxOutputBytes) } };
             } catch (e) { return errorResult(e); }
@@ -537,8 +559,9 @@ const plugin: MControlProgramPlugin = {
           handler: async ({ host, name, input, waitMs, raw }, c) => {
             try {
               const h = hostByName(host);
-              checkCommand(h, input);
+              const allowedBy = admit(h, 'shell', input, c);
               const { conn, sh, id, opened } = await getShell(host, name ?? 'default', c);
+              log({ host, tool: 'shell', command: input, allowedBy }, c);
               sh.buf = '';
               sh.ch.write(raw ? input : input + '\n');
               conn.lastUsed = sh.lastUsed = Date.now();
@@ -583,11 +606,11 @@ const plugin: MControlProgramPlugin = {
         {
           name: 'sftp_list', description: 'List a directory over SFTP.', annotations: { readOnlyHint: true },
           inputSchema: { host: hostArg, path: z.string() },
-          handler: async ({ host, path }) => {
+          handler: async ({ host, path }, _c) => {
             try {
               const h = hostByName(host); if (h.allowSftp === false) throw new Error('sftp disabled for this host');
               const s = await getSftp(await getConn(host));
-              const p = sftpPath(h, path);
+              const p = sftpPath(h, path); log({ host, tool: 'sftp_list', command: p }, _c);
               const list = await new Promise<any[]>((res, rej) => s.readdir(p, (e, l) => (e ? rej(e) : res(l))));
               return text(list.map((e) => `${e.longname}`).join('\n') || '(empty)');
             } catch (e) { return errorResult(e); }
@@ -596,11 +619,11 @@ const plugin: MControlProgramPlugin = {
         {
           name: 'sftp_read', description: 'Read a file over SFTP (text; truncated at max output size).', annotations: { readOnlyHint: true },
           inputSchema: { host: hostArg, path: z.string() },
-          handler: async ({ host, path }) => {
+          handler: async ({ host, path }, _c) => {
             try {
               const h = hostByName(host); if (h.allowSftp === false) throw new Error('sftp disabled for this host');
               const s = await getSftp(await getConn(host));
-              const p = sftpPath(h, path);
+              const p = sftpPath(h, path); log({ host, tool: 'sftp_read', command: p }, _c);
               const buf = await new Promise<Buffer>((res, rej) => s.readFile(p, (e, d) => (e ? rej(e) : res(d))));
               return text(clip(buf.toString('utf8'), cfg.maxOutputBytes));
             } catch (e) { return errorResult(e); }
@@ -616,6 +639,7 @@ const plugin: MControlProgramPlugin = {
               const p = sftpPath(h, path);
               await new Promise<void>((res, rej) => s.writeFile(p, Buffer.from(content, 'utf8'), mode ? { mode } : {}, (e) => (e ? rej(e) : res())));
               c.log.connection(`sftp write ${host}:${p} (${content.length} bytes)`, undefined, c.sessionId);
+              log({ host, tool: 'sftp_write', command: `${p} (${content.length} bytes)` }, c);
               return text(`wrote ${content.length} bytes to ${p}`);
             } catch (e) { return errorResult(e); }
           },

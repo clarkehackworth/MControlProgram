@@ -154,11 +154,17 @@ export default {
 - A plugin whose dependencies are missing or out of range is **not loaded**, and neither is anything that depends on it. The reason shows on the Plugins page after a reload.
 - `ctx.dep(id)` throws for a plugin you did not declare, so dependencies stay explicit.
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
-- Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key.
+- Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
 - The "Used by" column (server toggles + Pair server) appears only on inventories that an instance config selects from (`x-options-from`). An inventory that other inventory items point at by name can say so with `'x-referenced-by': { inventory, field, title }`; its table then lists those items instead (and the delete confirmation warns about them).
 - `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
 - A global action with `inventory: '<key>'` only shows as a row button on that inventory table.
+
+## Built-in: ssh command log and rules
+
+The SSH plugin page has **Command rules** and a **Command log**, like the Web plugin's access rules and request log. Every agent `exec`, `shell_send` and `sftp_*` call is logged (host, agent, command or path, exit code, time; never output), pruned after the global log retention.
+
+Rules live in their own tables (`ssh_rules`, `ssh_policy`), apply live to every SSH instance without restarts, and only to agent `exec` / `shell_send` (not to `SshApi` calls from other plugins such as browserpaw). A command line is split into simple commands at `;` `&` `|` `&&` `||` newlines `(` `)` `$(` and backticks, honouring quotes. Rule kinds: **program** (a command's first word, plus what `sudo`, `env`, `xargs`, `timeout`… run), **prefix** (a simple command starting with it, whole words) and **regex**, each for all hosts or one. Block rules win; under deny by default every simple command in the line needs an allow rule. The host's own `allowCommands` / `denyCommands` patterns are checked after. It's a guardrail, not a sandbox: `sh -c`, `eval`, `su`, interpreters and `$VAR` programs can run anything, so rely on deny by default and don't allow shells or interpreters.
 
 ## Built-in: browserpaw
 
