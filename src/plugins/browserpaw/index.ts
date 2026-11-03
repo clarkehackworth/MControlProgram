@@ -99,7 +99,7 @@ async function inspect(ssh: SshApi, h: HostCfg, log: Log, p?: ProfileCfg) {
   return { pf, ext: o.ext || undefined, extensionId: o.ext ? pf.extensionId(o.ext, key) : undefined, nativeHost: o.nativehost || undefined, chromium: o.chromium || undefined, dir: o.dir || undefined, paths: x };
 }
 
-const DEFAULT_REPO = 'https://github.com/GoldenLoaf24h/browserpaw.git';
+const DEFAULT_REPO = 'https://github.com/clarkehackworth/browserpaw.git';
 const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /** Clone (if absent) and build BrowserPaw on a unix host. Needs git, node and pnpm (or corepack) there. */

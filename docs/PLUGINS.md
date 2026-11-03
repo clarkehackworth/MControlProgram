@@ -168,7 +168,7 @@ Rules live in their own tables (`ssh_rules`, `ssh_policy`), apply live to every 
 
 ## Built-in: browserpaw
 
-Runs isolated Chromium profiles with the [BrowserPaw](https://github.com/GoldenLoaf24h/browserpaw) extension on SSH hosts. Admins configure:
+Runs isolated Chromium profiles with the [BrowserPaw](https://github.com/clarkehackworth/browserpaw) extension on SSH hosts. Admins configure:
 
 - **Browser hosts**: an SSH host from the ssh plugin (with a pinned key), the BrowserPaw checkout and extension dir there, the Chromium binary, the profiles directory and the launch environment (`DISPLAY=:0`). Use **Check host** to verify.
 - **Profiles**: each one is its own `--user-data-dir` with its own logins and its own BrowserPaw bridge. **Set up & start** creates the directory, a per-profile `NativeMessagingHosts/` manifest (allowing only the extension's id), and a host wrapper that sets the tool profile. It then launches Chromium with `--load-extension` and caches the tool list.
