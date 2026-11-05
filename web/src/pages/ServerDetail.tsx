@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, fmtTime, useApi, type ApprovalPolicy, type Instance, type InstanceStatus, type PluginMeta, type Server } from '../api'
 import { Alert, Badge, CopyButton, Field, Modal, useAction } from '../components/ui'
-import SchemaForm from '../components/SchemaForm'
+import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import { AuthSelect, LogSelect } from './Servers'
 import { LogTable } from './Logs'
 
@@ -87,6 +87,8 @@ function PluginsTab({ server, reload }: { server: Server; reload: () => Promise<
   const [plugins] = useApi<PluginMeta[]>('/plugins')
   const { run, error } = useAction()
   const [gating, setGating] = useState<Instance>()
+  const [editing, setEditing] = useState<Instance>()
+  const editMeta = plugins?.find((p) => p.id === editing?.plugin_id)
   const statusOf = (i: Instance): InstanceStatus | undefined => server.status.instances.find((s) => s.id === i.id)
   return (
     <div className="card">
@@ -104,13 +106,21 @@ function PluginsTab({ server, reload }: { server: Server; reload: () => Promise<
                 <td>{!inst.enabled ? <Badge>disabled</Badge> : st?.error ? <Badge kind="err">error</Badge> : st ? <Badge kind="ok">active</Badge> : <Badge kind="warn">not running</Badge>}</td>
                 <td>{st && <InstanceItems inst={st} />}</td>
                 <td><input type="checkbox" checked={inst.enabled} onChange={(e) => run(async () => { await api(`/instances/${inst.id}`, { method: 'PUT', body: { enabled: e.target.checked } }); await reload() })} /></td>
-                <td><div className="row">{st && <ToolsButton inst={st} />}<button className="sm" onClick={() => setGating(inst)}>Approval</button></div></td>
+                <td><div className="row">{st && <ToolsButton inst={st} />}{Object.keys(meta?.configSchema?.properties ?? {}).length > 0 && <button className="sm" onClick={() => setEditing({ ...inst, config: { ...defaultsFor(meta!.configSchema), ...meta!.defaultConfig, ...inst.config } })}>Settings</button>}<button className="sm" onClick={() => setGating(inst)}>Approval</button></div></td>
               </tr>
             )
           })}
           {server.instances.length === 0 && <tr><td colSpan={5} className="muted">No plugins are loaded.</td></tr>}
         </tbody>
       </table>
+      {editing && editMeta && <Modal title={`Settings — ${editing.name}`} onClose={() => setEditing(undefined)}>
+        <p className="muted small">Applies to this server only. Saving restarts the instance.</p>
+        <ConfigEditor schema={editMeta.configSchema} value={editing.config} onChange={(c) => setEditing({ ...editing, config: c })} options={editMeta.globalConfig} />
+        <div className="row between" style={{ marginTop: 12 }}>
+          <button onClick={() => setEditing(undefined)}>Cancel</button>
+          <button className="primary" onClick={() => run(async () => { await api(`/instances/${editing.id}`, { method: 'PUT', body: { config: editing.config } }); setEditing(undefined); await reload() })}>Save & restart</button>
+        </div>
+      </Modal>}
       {gating && <Modal title={`Approval — ${gating.name}`} onClose={() => setGating(undefined)}>
         <ApprovalEditor value={gating.approval} onChange={(a) => setGating({ ...gating, approval: a })} tools={statusOf(gating)?.tools} />
         <div className="row between" style={{ marginTop: 12 }}>

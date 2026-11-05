@@ -78,8 +78,9 @@ function posix(os: 'linux' | 'macos'): Platform {
       const put = (content: string, file: string, mode: string) => `printf %s ${sq(content)} > ${sq(file)} && chmod ${mode} ${sq(file)}`;
       return [`mkdir -p ${sq(`${r.dir}/NativeMessagingHosts`)}`, put(wrapper, `${r.dir}/browserpaw-host.sh`, '700'), put(manifest, `${r.dir}/NativeMessagingHosts/${HOST_NAME}.json`, '600'), 'echo done=1'].join(' && ');
     },
-    // markers are written split (@@S''S@@) so `ps` listing our own shell cannot fake them
-    status: (d) => `[ -d ${sp(d)} ] && echo "dir=$(cd ${sp(d)} && pwd -P)"; ps -eo pid=,ppid=,args=; echo @@S''S@@; ss -ltnpH 2>/dev/null || lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null; echo @@TOK''EN@@; cat "$HOME"/.chrome-mcp/bridge-token 2>/dev/null; true`,
+    // markers are written split (@@S''S@@) so `ps` listing our own shell cannot fake them.
+    // ss and lsof live in /usr/sbin or /sbin, which launchd/ssh PATHs often lack; without them no bridge is ever found.
+    status: (d) => `PATH="$PATH:/usr/sbin:/sbin"; [ -d ${sp(d)} ] && echo "dir=$(cd ${sp(d)} && pwd -P)"; ps -eo pid=,ppid=,args=; echo @@S''S@@; ss -ltnpH 2>/dev/null || lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null; echo @@TOK''EN@@; cat "$HOME"/.chrome-mcp/bridge-token 2>/dev/null; true`,
     launch(r, o) {
       const env = o.env.map(([k, v]) => `export ${k}=${sq(v)};`).join(' ');
       const args = [`--user-data-dir=${sq(r.dir)}`, `--load-extension=${sq(r.ext)}`, ...commonArgs(o).map(sq), o.extraArgs].filter(Boolean).join(' ');

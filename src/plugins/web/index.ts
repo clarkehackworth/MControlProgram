@@ -7,6 +7,9 @@ import type { MControlProgramPlugin, PluginContext, PluginInstance } from '../..
 import { text, errorResult } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
 import { getDb } from '../../core/db.js';
+import { BlockList, isIP, type LookupFunction } from 'node:net';
+import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
+import { Agent, fetch, Headers, type Response } from 'undici';
 
 interface CredCfg { name: string; urlPattern: string; type: 'header' | 'basic' | 'bearer' | 'query'; headerName?: string; username?: string; secret: string }
 interface Cfg {
@@ -22,7 +25,7 @@ const configSchema = {
     allowUrls: { type: 'array', title: 'Allowed URL patterns (regex)', description: 'If non-empty, requests must match one of these. Example: ^https://api\\.github\\.com/', items: { type: 'string' } },
     denyUrls: { type: 'array', title: 'Denied URL patterns (regex)', description: 'Checked before the allow list.', items: { type: 'string' } },
     allowMethods: { type: 'array', title: 'Allowed HTTP methods', default: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'], items: { type: 'string', enum: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'] } },
-    blockPrivateNetworks: { type: 'boolean', title: 'Block private/loopback addresses', description: 'Refuse localhost, 10/8, 172.16/12, 192.168/16, 169.254/16, ::1', default: true },
+    blockPrivateNetworks: { type: 'boolean', title: 'Block private/loopback addresses', description: 'Refuse localhost, 10/8, 100.64/10, 127/8, 172.16/12, 192.168/16, 169.254/16, ::1, fc00::/7, fe80::/10, including names that resolve to them (e.g. app.local)', default: true },
     followRedirects: { type: 'boolean', title: 'Follow redirects', default: true },
     maxResponseBytes: { type: 'integer', title: 'Max response bytes', default: 1000000 },
     timeoutMs: { type: 'integer', title: 'Request timeout (ms)', default: 30000 },
@@ -59,7 +62,15 @@ const globalConfigSchema = {
   },
 };
 
-const PRIVATE = [/^localhost$/i, /^127\./, /^10\./, /^172\.(1[6-9]|2\d|3[01])\./, /^192\.168\./, /^169\.254\./, /^0\./, /^\[?::1\]?$/, /^\[?fc/i, /^\[?fd/i, /^\[?fe80/i];
+const PRIVATE = new BlockList();
+for (const [a, n] of [['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.168.0.0', 16]] as const) PRIVATE.addSubnet(a, n, 'ipv4');
+for (const [a, n] of [['::', 128], ['::1', 128], ['fc00::', 7], ['fe80::', 10]] as const) PRIVATE.addSubnet(a, n, 'ipv6');
+/** True for loopback/private/link-local IPs (incl. v4-mapped v6) and localhost names. */
+export function isPrivateHost(host: string): boolean {
+  const h = host.replace(/^\[|\]$/g, '').toLowerCase();
+  const fam = isIP(h);
+  return fam ? PRIVATE.check(h, fam === 4 ? 'ipv4' : 'ipv6') : h === 'localhost' || h.endsWith('.localhost');
+}
 
 interface Cookie { name: string; value: string; domain: string; hostOnly: boolean; path: string; secure: boolean; expires?: number }
 /** Minimal RFC 6265 jar: one per isolation scope. No HttpOnly/SameSite enforcement needed (no scripts run here). */
@@ -249,11 +260,27 @@ const plugin: MControlProgramPlugin = {
     };
     class Blocked extends Error { constructor(public rule: string) { super(rule === 'default: deny' ? 'url not on the administrator\'s allow list' : `url blocked by administrator (${rule})`); } }
 
+    /** Deny checks that also apply to an address a name resolves to (block rules, denyUrls, private ranges). Allow rules don't: allowing a name allows what it resolves to. */
+    function checkAddress(ip: string, name: string) {
+      const u = new URL(`http://${isIP(ip) === 6 ? `[${ip}]` : ip}/`);
+      const b = rules().find((r) => r.action === 'block' && ruleMatches(r, u));
+      if (b) throw new Blocked(`${label(b)} (${name} → ${ip})`);
+      if (cfg.blockPrivateNetworks && isPrivateHost(ip)) throw new Error(`private network addresses are blocked (${name} → ${ip})`);
+      for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p}; ${name} → ${ip})`);
+    }
+    // Checked at connect time on the address actually dialed, so DNS rebinding can't swap in a private IP after the check.
+    const guardedLookup: LookupFunction = (host, opts, cb) => dnsLookup(host, { ...opts, all: true }, (err, addrs: LookupAddress[]) => {
+      if (err) return cb(err, '', 0);
+      try { for (const a of addrs) checkAddress(a.address, host); } catch (e) { return cb(e as NodeJS.ErrnoException, '', 0); }
+      if (opts.all) (cb as any)(null, addrs); else cb(null, addrs[0]!.address, addrs[0]!.family);
+    });
+    const dispatcher = new Agent({ connect: { lookup: guardedLookup } });
+
     function checkUrl(raw: string): URL {
       const u = new URL(raw);
       if (!/^https?:$/.test(u.protocol)) throw new Error('only http/https allowed');
       const v = verdict(u, rules(), policy()); if (v.blocked) throw new Blocked(v.blocked);
-      if (cfg.blockPrivateNetworks && PRIVATE.some((r) => r.test(u.hostname))) throw new Error('private network addresses are blocked');
+      if (cfg.blockPrivateNetworks && isPrivateHost(u.hostname)) throw new Error('private network addresses are blocked');
       for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p})`);
       const allow = (cfg.allowUrls ?? []).filter(Boolean);
       if (allow.length && !allow.some((p) => re(p).test(u.href))) throw new Error('url not in allow list');
@@ -294,8 +321,13 @@ const plugin: MControlProgramPlugin = {
           cred = applyCreds(u, headers);
           const ck = jar?.header(u); if (ck) headers.set('cookie', ck);
           const th = Date.now();
-          try { res = await fetch(u, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(cfg.timeoutMs) }); }
-          catch (e) { record(method, logged, { error: (e as Error).message, ms: Date.now() - th }, caller); throw e; }
+          try { res = await fetch(u, { method, headers, body, redirect: 'manual', signal: AbortSignal.timeout(cfg.timeoutMs), dispatcher }); }
+          catch (e) {
+            const cause = (e as Error).cause; // undici wraps lookup/connect errors in "fetch failed"
+            if (cause instanceof Blocked) record(method, logged, { blocked: cause.rule }, caller);
+            else record(method, logged, { error: cause instanceof Error ? cause.message : (e as Error).message, ms: Date.now() - th }, caller);
+            throw cause instanceof Error ? cause : e;
+          }
           record(method, logged, { status: res.status, ms: Date.now() - th }, caller);
           jar?.store(u, res.headers.getSetCookie());
           const loc = res.headers.get('location');
@@ -334,7 +366,7 @@ const plugin: MControlProgramPlugin = {
           db().prepare('DELETE FROM web_requests WHERE ts < ?').run(Date.now() - ctx.global().logRetentionDays * 86400_000);
         }, 60_000);
       },
-      stop() { if (reaper) clearInterval(reaper); jars.clear(); },
+      stop() { if (reaper) clearInterval(reaper); jars.clear(); void dispatcher.close(); },
       onSessionClosed(sessionId) { if (cfg.cookieScope === 'session') jars.delete(`session:${sessionId}`); },
       status: () => ({ inflight, total, failed, credentials: creds.map((c) => c.name), cookieScope: cfg.cookies ? cfg.cookieScope : 'off', cookieIdleSec: effective(cfg.cookieIdleSec, ctx.global().stateIdleSec), cookieJars: jars.size }),
       tools: [

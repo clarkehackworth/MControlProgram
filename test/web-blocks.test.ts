@@ -60,5 +60,18 @@ test('blocks: normalize, match, enforce live (incl. redirects), and log every at
   const latest = (await act('requests', { since: 0, limit: 2 }) as any).rows;
   assert.deepEqual(latest.map((x: any) => [x.blocked, x.allowed_by]), [['default: deny', null], [null, 'domain: 127.0.0.1']]);
   await act('set_policy', { policy: 'allow' });
+
+  // rules and private ranges also apply to the address a name resolves to (app.local → 192.168.x)
+  const port = (site.address() as any).port;
+  await act('rule', { action: 'block', kind: 'domain', value: '127.0.0.1' });
+  const viaName = await req(`http://localhost:${port}/`);
+  assert.match(viaName.content[0].text, /blocked by administrator \(domain: 127\.0\.0\.1 \(localhost → 127\.0\.0\.1\)\)/);
+  assert.equal((await act('requests', { since: 0, limit: 1 }) as any).rows[0].blocked, 'domain: 127.0.0.1 (localhost → 127.0.0.1)');
+  await act('delete_rule', { id: (await act('rules') as any).rules[0].id });
+  assert.equal((await req(`http://localhost:${port}/`)).isError, false);
+
+  const { isPrivateHost } = await import('../src/plugins/web/index.js');
+  for (const h of ['localhost', 'a.localhost', '127.9.9.9', '10.1.2.3', '192.168.0.5', '[::1]', '[::ffff:7f00:1]', '[fd00::1]', '0.0.0.0']) assert.ok(isPrivateHost(h), h);
+  for (const h of ['8.8.8.8', 'example.com', '[2606:4700::1]', '172.32.0.1']) assert.ok(!isPrivateHost(h), h);
   inst.stop?.(); site.close();
 });
