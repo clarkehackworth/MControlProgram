@@ -81,6 +81,8 @@ const db = () => {
   }
   return d;
 };
+/** Host-scoped rules follow a host rename (a clashing rule already on the new name wins). The log keeps the old name: it's history. */
+export function renameHost(from: string, to: string) { db().prepare('UPDATE OR IGNORE ssh_rules SET host=? WHERE host=?').run(to, from); db().prepare('DELETE FROM ssh_rules WHERE host=?').run(from); changed(); }
 let ruleCache: Rule[] | undefined;
 let policyCache: Policy | undefined;
 export const rules = () => (ruleCache ??= db().prepare('SELECT * FROM ssh_rules ORDER BY action, kind, value').all() as Rule[]);

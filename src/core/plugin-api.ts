@@ -120,6 +120,8 @@ export interface MControlProgramPlugin {
   dependencies?: Record<string, string>;
   /** What this plugin offers to plugins that depend on it (see `dependencies`). */
   api?: unknown;
+  /** An inventory item (global config array `key`) was renamed; references in configs are already rewritten. Update anything else keyed by the name. */
+  onRenamed?(key: string, from: string, to: string): void;
   /** Default tool prefix (defaults to id). */
   toolPrefix?: string;
   create(ctx: PluginContext): PluginInstance | Promise<PluginInstance>;

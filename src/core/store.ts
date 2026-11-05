@@ -185,3 +185,58 @@ export const logs = {
   },
   clear: (serverId?: string) => serverId ? getDb().prepare('DELETE FROM logs WHERE server_id=?').run(serverId) : getDb().prepare('DELETE FROM logs').run(),
 };
+
+/**
+ * Inventory renames: an item that keeps its position in its array but changes `name` (to a name not already used) is a rename.
+ * Rewrites every reference by name: instance fields with `x-options-from` (and their `x-disabled-key` lists), and string fields
+ * in any plugin's global config pointing at it (`"<key>"` from the same plugin, `"<pluginId>:<key>"` from others).
+ * Returns the renames found (`key` → old → new) so plugins can update their own tables; touched plugin/instance ids for restarts.
+ */
+export function propagateRenames(pluginId: string, before: Record<string, any>, after: Record<string, any>) {
+  const found: { key: string; from: string; to: string }[] = [];
+  for (const k of Object.keys(pluginConfig.schema(pluginId).properties ?? {})) {
+    const a = before[k], b = after[k];
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) continue; // ponytail: add/delete + rename in one save isn't detected
+    const an = a.map((x) => x?.name), bn = b.map((x) => x?.name);
+    an.forEach((from, i) => { const to = bn[i]; if (typeof from === 'string' && typeof to === 'string' && from !== to && !bn.includes(from) && !an.includes(to)) found.push({ key: k, from, to }); });
+  }
+  const touchedPlugins = new Set<string>(), touchedInstances: { id: string; server: string }[] = [];
+  if (!found.length) return { renames: found, touchedPlugins, touchedInstances };
+  /** Rewrite `obj` (config shaped by `schema`); `ref(src)` = the rename map for an `x-options-from` source, if it points at us. */
+  const rewrite = (obj: any, schema: any, ref: (src: string) => Map<string, string> | undefined): boolean => {
+    let hit = false;
+    if (!obj || typeof obj !== 'object' || !schema) return false;
+    if (Array.isArray(obj)) { for (const v of obj) hit = rewrite(v, schema.items, ref) || hit; return hit; }
+    for (const [f, fs] of Object.entries<any>(schema.properties ?? {})) {
+      const m = ref(fs['x-options-from'] ?? fs.items?.['x-options-from'] ?? '');
+      if (m && typeof obj[f] === 'string' && m.has(obj[f])) { obj[f] = m.get(obj[f]); hit = true; }
+      else if (m && Array.isArray(obj[f])) {
+        for (const lk of [f, fs['x-disabled-key']].filter(Boolean)) if (Array.isArray(obj[lk]) && obj[lk].some((n: string) => m.has(n))) { obj[lk] = obj[lk].map((n: string) => m.get(n) ?? n); hit = true; }
+      } else if (typeof obj[f] === 'object') hit = rewrite(obj[f], fs, ref) || hit;
+    }
+    return hit;
+  };
+  const mapFor = (fromPlugin: string) => (src: string) => {
+    const [pid, key] = src.includes(':') ? src.split(':') as [string, string] : [fromPlugin, src];
+    if (pid !== pluginId) return undefined;
+    const m = new Map(found.filter((r) => r.key === key).map((r) => [r.from, r.to] as const));
+    return m.size ? m : undefined;
+  };
+  // the plugin's own config: `after` is what is about to be saved, so rewrite it in place
+  if (rewrite(after, pluginConfig.schema(pluginId), mapFor(pluginId))) touchedPlugins.add(pluginId);
+  for (const p of plugins.list()) {
+    if (p.id !== pluginId) {
+      const g = pluginConfig.raw(p.id);
+      if (rewrite(g, p.globalConfigSchema, mapFor(p.id))) { pluginConfig.saveRaw(p.id, g); touchedPlugins.add(p.id); }
+    }
+  }
+  for (const r of getDb().prepare('SELECT id, server_id, plugin_id, config FROM plugin_instances').all() as Row[]) {
+    const p = plugins.get(r.plugin_id); const c = JSON.parse(r.config);
+    if (p && rewrite(c, p.configSchema, mapFor(p.id))) {
+      getDb().prepare("UPDATE plugin_instances SET config=?, updated_at=datetime('now') WHERE id=?").run(JSON.stringify(c), r.id);
+      touchedInstances.push({ id: r.id, server: r.server_id });
+    }
+  }
+  return { renames: found, touchedPlugins, touchedInstances };
+}
+

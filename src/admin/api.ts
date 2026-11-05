@@ -2,7 +2,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { servers, instances, bearerTokens, admins, logs, pluginConfig } from '../core/store.js';
+import { servers, instances, bearerTokens, admins, logs, pluginConfig, propagateRenames } from '../core/store.js';
 import { approvals } from '../core/approvals.js';
 import { plugins, loadPlugins, depResolver } from '../core/plugin-loader.js';
 import { manager } from '../mcp/manager.js';
@@ -89,8 +89,11 @@ export function adminApi() {
     if (!p?.globalConfigSchema) throw new Error('plugin has no global config');
     const body = z.record(z.string(), z.any()).parse(req.body);
     const bad = patternViolation(p.globalConfigSchema, body); if (bad) throw new Error(bad);
+    const { renames, touchedPlugins, touchedInstances } = propagateRenames(pid, pluginConfig.raw(pid), body);
     pluginConfig.saveFromUi(pid, body);
-    await manager.applyPlugin(pid);
+    for (const r of renames) p.onRenamed?.(r.key, r.from, r.to);
+    for (const id of new Set([pid, ...touchedPlugins])) await manager.applyPlugin(id);
+    for (const i of touchedInstances) await manager.applyInstance(i.id, i.server);
     return pluginView(p);
   }));
   r.post('/plugins/:pid/actions/:action', wrap(async (req) => {

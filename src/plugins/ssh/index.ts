@@ -268,6 +268,7 @@ const plugin: MControlProgramPlugin = {
   defaultConfig: { hosts: [], execTimeoutMs: 120000, maxOutputBytes: 200000, idleDisconnectSec: 0, shellIdleSec: 0, shellScope: 'principal' },
   globalConfigSchema,
   defaultGlobalConfig: { hosts: [], connectTimeoutMs: 15000, keepaliveSec: 30 },
+  onRenamed: (key, from, to) => { if (key === 'hosts') cmdRules.renameHost(from, to); },
 
   globalActions: {
     ...cmdRules.actions,
