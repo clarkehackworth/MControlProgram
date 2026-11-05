@@ -14,6 +14,7 @@
  *   OpenSSH kills a session's processes when it ends).
  */
 import { createHash } from 'node:crypto';
+import { pwnfoxExtensions, type PwnfoxColor } from './pwnfox.js';
 
 export type Os = 'linux' | 'macos' | 'windows';
 export type Browser = 'chromium' | 'chrome' | 'edge';
@@ -21,7 +22,7 @@ export const HOST_NAME = 'com.chromemcp.nativehost';
 
 /** Absolute paths as resolved on the host by `inspect`. */
 export interface Resolved { dir: string; ext: string; extensionId: string; nativeHost: string; chromium: string }
-export interface LaunchOpts { browser: Browser; toolProfile: string; headless: boolean; extraArgs: string; env: [string, string][]; task: string; proxy?: string; proxyBypass?: string }
+export interface LaunchOpts { browser: Browser; toolProfile: string; headless: boolean; extraArgs: string; env: [string, string][]; task: string; proxy?: string; proxyBypass?: string; pwnfoxColor?: PwnfoxColor }
 
 export interface Platform {
   os: Os;
@@ -83,14 +84,18 @@ function posix(os: 'linux' | 'macos'): Platform {
     status: (d) => `PATH="$PATH:/usr/sbin:/sbin"; [ -d ${sp(d)} ] && echo "dir=$(cd ${sp(d)} && pwd -P)"; ps -eo pid=,ppid=,args=; echo @@S''S@@; ss -ltnpH 2>/dev/null || lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null; echo @@TOK''EN@@; cat "$HOME"/.chrome-mcp/bridge-token 2>/dev/null; true`,
     launch(r, o) {
       const env = o.env.map(([k, v]) => `export ${k}=${sq(v)};`).join(' ');
-      const args = [`--user-data-dir=${sq(r.dir)}`, `--load-extension=${sq(r.ext)}`, ...commonArgs(o).map(sq), o.extraArgs].filter(Boolean).join(' ');
+      // PwnFox: header + theme extensions are written under <dir>/pwnfox/ at every launch and loaded beside BrowserPaw
+      const pw = o.pwnfoxColor ? Object.entries(pwnfoxExtensions(o.pwnfoxColor)) : [];
+      const pwWrite = pw.map(([d, files]) => `mkdir -p ${sq(`${r.dir}/pwnfox/${d}`)}` + Object.entries(files).map(([f, c]) => ` && printf %s ${sq(c)} > ${sq(`${r.dir}/pwnfox/${d}/${f}`)}`).join('')).join(' && ');
+      const exts = [r.ext, ...pw.map(([d]) => `${r.dir}/pwnfox/${d}`)].join(',');
+      const args = [`--user-data-dir=${sq(r.dir)}`, `--load-extension=${sq(exts)}`, ...commonArgs(o).map(sq), o.extraArgs].filter(Boolean).join(' ');
       const log = sq(`${r.dir}/chromium.log`);
       const app = /^(.*\.app)\/Contents\/MacOS\//.exec(r.chromium)?.[1];
       // macOS: LaunchServices puts the window on the logged-in user's desktop and detaches it from SSH
       const start = mac && app ? `open -n -a ${sq(app)} --args ${args} about:blank`
         : `if command -v setsid >/dev/null 2>&1; then setsid -f ${sq(r.chromium)} ${args} about:blank >> ${log} 2>&1 < /dev/null; else nohup ${sq(r.chromium)} ${args} about:blank >> ${log} 2>&1 < /dev/null & fi`;
       // ponytail: extraArgs is appended verbatim (shell syntax); it is admin-only config like the ssh host itself
-      return `${env} cd ${sq(r.dir)} && ${start}; echo launched=1`;
+      return `${env} cd ${sq(r.dir)} && ${pwWrite ? pwWrite + ' && ' : ''}${start}; echo launched=1`;
     },
     stop: (pid) => `kill ${pid}`,
     extensionId: (p, key) => idFrom(key ? Buffer.from(key, 'base64') : Buffer.from(p)),
