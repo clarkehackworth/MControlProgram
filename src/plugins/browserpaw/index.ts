@@ -490,8 +490,14 @@ const plugin: MControlProgramPlugin = {
             const { profile, ...rest } = args ?? {};
             const name = pick(profile);
             const prepared = policy.prepareCall(name, t.name, rest, call);
-            const c = await client(name);
-            return (await c.callTool({ name: t.name, arguments: prepared }, undefined, { signal: call.signal, timeout: g.callTimeoutMs })) as unknown as ToolResult;
+            const run = async () => (await (await client(name)).callTool({ name: t.name, arguments: prepared }, undefined, { signal: call.signal, timeout: g.callTimeoutMs })) as unknown as ToolResult;
+            try { return await run(); } catch (e) {
+              // The browser (and so its bridge) restarted: our cached MCP session is gone. Reconnect once.
+              if (!/MCP session ID/i.test((e as Error).message)) throw e;
+              const stale = conns.get(name); conns.delete(name); void stale?.client.close().catch(() => {});
+              ctx.log.info(`browserpaw ${name}: bridge session expired (browser restarted?), reconnecting`);
+              return await run();
+            }
           } catch (e) { return errorResult(e); }
         },
       })));
