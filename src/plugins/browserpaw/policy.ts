@@ -53,8 +53,12 @@ export function push(profile: string, call: BridgeCall): Promise<void> {
       if (r?.status !== 'success' || r.rev !== rev) throw new Error(r?.error ?? 'extension did not acknowledge the policy');
       Object.assign(s, { ackRev: rev, lastPush: Date.now(), error: undefined, rejected: r.rejected ?? [] });
     } catch (e) {
-      s.ackRev = undefined; s.error = `push failed: ${(e as Error).message}`;
-      throw new Error(`browser URL policy could not be applied to profile ${profile} (${(e as Error).message}); browser tools are refused until it is`);
+      let msg = (e as Error).message;
+      // Seen live: after a BrowserPaw update Chromium can keep running the old extension service worker
+      // (even across browser restarts), which has no handler for the policy messages.
+      if (/timed out/i.test(msg)) msg += '. The browser may still be running an older BrowserPaw extension: turn the extension off and on in chrome://extensions on that profile, then retry';
+      s.ackRev = undefined; s.error = `push failed: ${msg}`;
+      throw new Error(`browser URL policy could not be applied to profile ${profile} (${msg}); browser tools are refused until it is`);
     }
   })().finally(() => pushing.delete(profile));
   pushing.set(profile, p);
