@@ -276,13 +276,14 @@ async function refreshToolCache(client: Client, profile: string) {
 const hostSchema = {
   type: 'object',
   required: ['name'],
+  'x-kind-column': { title: 'Type', flags: { native: 'Native', manual: 'Manual' }, default: 'SSH' },
   properties: {
     name: { type: 'string', title: 'Name', pattern: NAME.source, 'x-pattern-hint': 'letters, digits, _ and -' },
     native: { type: 'boolean', title: 'Native (this machine)', description: 'Run the browser on the machine MControlProgram itself runs on (inside its container if it is containerised, so the browser, git, node and a display must exist there). Commands run locally; no ssh, and the bridge is reached on 127.0.0.1. Paths and ~ are the MControlProgram user\'s.', default: false },
     manual: { type: 'boolean', title: 'Manual (no ssh)', description: 'The browser runs on a machine MControlProgram cannot ssh to (e.g. the docker host). You run the setup commands yourself ("Set up & start" shows them) and MControlProgram reaches the BrowserPaw bridge over http at the address below.', default: false },
-    homeDir: { type: 'string', title: 'Home directory (manual)', description: 'Absolute home of the user running the browser, e.g. /Users/you or /home/you. Manual hosts only.' },
-    bridgeHost: { type: 'string', title: 'Bridge address (manual)', description: 'Host the BrowserPaw bridge (127.0.0.1 on the browser machine) is reachable at from MControlProgram. Empty = host.docker.internal (Docker Desktop forwards it to the host loopback).' },
-    bridgeToken: { type: 'string', title: 'Bridge token (manual)', description: 'Output of `cat ~/.chrome-mcp/bridge-token` on the browser machine (exists after the browser has started once). Manual hosts only.', format: 'password' },
+    homeDir: { type: 'string', title: 'Home directory (manual)', 'x-no-column': true, description: 'Absolute home of the user running the browser, e.g. /Users/you or /home/you. Manual hosts only.' },
+    bridgeHost: { type: 'string', title: 'Bridge address (manual)', 'x-no-column': true, description: 'Host the BrowserPaw bridge (127.0.0.1 on the browser machine) is reachable at from MControlProgram. Empty = host.docker.internal (Docker Desktop forwards it to the host loopback).' },
+    bridgeToken: { type: 'string', title: 'Bridge token (manual)', 'x-no-column': true, description: 'Output of `cat ~/.chrome-mcp/bridge-token` on the browser machine (exists after the browser has started once). Manual hosts only.', format: 'password' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (must have a pinned host key). MControlProgram runs setup commands as that user. Not used for manual hosts.', 'x-options-from': 'ssh:hosts' },
     os: { type: 'string', title: 'Operating system', enum: ['auto', 'linux', 'macos', 'windows'], default: 'auto', description: 'auto: detected over ssh (uname, else PowerShell). Windows needs OpenSSH Server and PowerShell; macOS and Linux need sh.' },
     browser: { type: 'string', title: 'Browser', enum: ['chromium', 'chrome', 'edge'], default: 'chromium', description: 'Picks the default binary path and, on Windows, the registry key for native messaging. Branded Chrome/Edge get --disable-features=DisableLoadExtensionCommandLineSwitch so --load-extension still works.' },
