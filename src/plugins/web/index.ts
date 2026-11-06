@@ -172,6 +172,7 @@ const plugin: MControlProgramPlugin = {
     const allCreds = ((ctx.pluginConfig.credentials as CredCfg[] | undefined) ?? []);
     const creds = allCreds.filter((c) => (cfg.credentials ?? []).includes(c.name) && !(cfg.credentialsDisabled ?? []).includes(c.name));
     let inflight = 0; let total = 0; let failed = 0;
+    const waiters: Array<() => void> = []; // ponytail: FIFO wait for a free slot instead of failing parallel tool calls
     const re = (p: string) => safeRegex(p, 'i');
     type Caller = { sessionId?: string; principal?: string };
     const jars = new Map<string, CookieJar>();
@@ -243,7 +244,7 @@ const plugin: MControlProgramPlugin = {
         if (e instanceof Blocked) record(method, new URL(url), { blocked: e.rule }, caller);
         throw e;
       }
-      if (inflight >= cfg.maxConcurrent) throw new Error('too many concurrent requests');
+      while (inflight >= cfg.maxConcurrent) await new Promise<void>((r) => waiters.push(r));
       const jar = jarFor(caller);
       inflight++; total++;
       const t0 = Date.now();
@@ -291,7 +292,7 @@ const plugin: MControlProgramPlugin = {
       } catch (e) {
         ctx.log.connection(`${method} ${u.origin}${u.pathname} FAILED ${(e as Error).message}`, undefined, caller.sessionId);
         throw e;
-      } finally { inflight--; }
+      } finally { inflight--; waiters.shift()?.(); }
     }
 
     return {
