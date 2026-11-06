@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { api, useApi, type Server } from '../api'
 import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
 
@@ -6,11 +6,19 @@ type Kind = 'domain' | 'url' | 'regex'
 type Action = 'block' | 'allow'
 type Policy = 'allow' | 'deny'
 interface Rule { id: number; action: Action; kind: Kind; value: string; note: string; created_at: number }
-interface Req { id: number; ts: number; server_id: string; instance: string; principal: string | null; method: string; url: string; host: string; status: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null }
+interface Req { id: number; ts: number; server_id: string; instance: string; principal: string | null; method: string; url: string; host: string; status: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null
+  // browserpaw only
+  profile?: string; session_id?: string | null; agent_via?: 'tool' | 'inherited' | 'inferred' | null; tab_id?: number | null; type?: string; via?: 'dnr' | 'nav-guard' | 'tool-arg' | 'observed' | 'dropped' }
+type PluginId = 'web' | 'browserpaw'
+interface Sync { inSync: boolean; ackRev: number | null; rev: number; lastPull: number | null; error: string | null; rejected: { id: number; error: string }[] }
 interface Target { action: Action; kind: Kind; value: string; url?: string }
 
-const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/web/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
-const recentRequests = () => act<{ rows: Req[] }>('requests', { since: Date.now() - 7 * 86400e3, limit: 5000 }).then((r) => r.rows)
+const Plugin = createContext<PluginId>('web')
+const actFor = (plugin: PluginId) => <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/${plugin}/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
+const useAct = () => actFor(useContext(Plugin))
+const recentRequests = (act: ReturnType<typeof actFor>) => act<{ rows: Req[] }>('requests', { since: Date.now() - 7 * 86400e3, limit: 5000 }).then((r) => r.rows)
+const VIA: Record<string, string> = { dnr: 'blocked in the browser', 'nav-guard': 'blocked in the browser (scheme)', 'tool-arg': 'refused before reaching the browser', observed: 'seen in the browser', dropped: 'log gap' }
+const AGENT_VIA: Record<string, string> = { tool: 'the agent drove this tab', inherited: 'tab opened from an agent tab', inferred: 'only agent active at the time (best guess)' }
 
 const KINDS: { kind: Kind; title: string; label: string; help: string; placeholder: string }[] = [
   { kind: 'domain', title: 'Domains', label: 'Domain', help: 'The domain and all its subdomains.', placeholder: 'example.com' },
@@ -38,14 +46,29 @@ const urlNoQuery = (u: string) => { try { const x = new URL(u); return x.origin 
 const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
 const toLocalInput = (ts: number) => new Date(ts - new Date().getTimezoneOffset() * 60e3).toISOString().slice(0, 16)
 
-/** Web plugin: admin access rules (default policy + block/allow by domain, URL prefix, regex) and the log of requests agents made. */
-export default function WebTraffic() {
+/** Access rules (default policy + block/allow by domain, URL prefix, regex) and the request log, for the web plugin or the browser (browserpaw). */
+export default function WebTraffic({ plugin = 'web' }: { plugin?: PluginId }) {
+  return <Plugin.Provider value={plugin}><AccessRules plugin={plugin} /></Plugin.Provider>
+}
+
+function AccessRules({ plugin }: { plugin: PluginId }) {
+  const act = useAct()
+  const browser = plugin === 'browserpaw'
+  const [sync, setSync] = useState<Record<string, Sync>>({})
   const [state, setState] = useState<{ policy: Policy; rules: Rule[] }>({ policy: 'allow', rules: [] })
   const [dialog, setDialog] = useState<Target>()
   const [switching, setSwitching] = useState(false)
   const { run, error } = useAction()
-  const load = useCallback(() => run(async () => setState(await act('rules'))), []) // eslint-disable-line react-hooks/exhaustive-deps
+  const load = useCallback(() => run(async () => {
+    setState(await act('rules'))
+    if (browser) setSync((await act<{ profiles: Record<string, Sync> }>('sync_status')).profiles)
+  }), []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load() }, [load])
+  useEffect(() => {
+    if (!browser) return
+    const t = setInterval(() => void act<{ profiles: Record<string, Sync> }>('sync_status').then((r) => setSync(r.profiles)).catch(() => {}), 5000)
+    return () => clearInterval(t)
+  }, [browser]) // eslint-disable-line react-hooks/exhaustive-deps
   const { policy, rules } = state
   const allowCount = rules.filter((r) => r.action === 'allow').length
 
@@ -82,9 +105,17 @@ export default function WebTraffic() {
           desc="Always refused, even if an allow rule also matches." />
         {(policy === 'deny' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} onDelete={del}
           desc={policy === 'deny' ? 'The only URLs agents can reach.' : 'Not in use while the default is allow; kept for when you switch to deny.'} dim={policy !== 'deny'} />}
-        <p className="muted small" style={{ marginBottom: 0 }}>Applies to every Web instance on every server, immediately (no restart, cookie jars are kept), including on redirects. Each instance's own allow/deny lists are checked after these.</p>
+        {browser
+          ? <p className="muted small" style={{ marginBottom: 0 }}>Separate from the Web plugin's list. Applies to every BrowserPaw profile and everything the browser loads (pages, frames, scripts, fetch/XHR, websockets), pushed to running browsers immediately. A browser that hasn't confirmed the current list gets no tool calls and blocks all traffic. <code>file:</code>, <code>chrome:</code>, <code>ftp:</code>, <code>ssh:</code> and other non-web schemes are always refused. Patterns use the browser's regex engine (no lookahead or backreferences).</p>
+          : <p className="muted small" style={{ marginBottom: 0 }}>Applies to every Web instance on every server, immediately (no restart, cookie jars are kept), including on redirects. Each instance's own allow/deny lists are checked after these. Only http and https are ever allowed.</p>}
+        {browser && Object.keys(sync).length > 0 && <div className="row small" style={{ marginTop: 8, flexWrap: 'wrap' }}>
+          <span className="muted">Browsers:</span>
+          {Object.entries(sync).map(([n, x]) => <span key={n} title={[x.error, ...x.rejected.map((r) => `rule ${rules.find((y) => y.id === r.id)?.value ?? r.id}: ${r.error}`), x.lastPull ? `last report ${fmt(x.lastPull)}` : ''].filter(Boolean).join('\n')}>
+            <Badge kind={x.error ? 'err' : x.inSync ? (x.rejected.length ? 'warn' : 'ok') : 'warn'}>{n}: {x.error ? 'error' : x.inSync ? (x.rejected.length ? `${x.rejected.length} rule(s) rejected` : 'in sync') : 'pending'}</Badge>
+          </span>)}
+        </div>}
       </div>
-      <RequestLog state={state} onRule={setDialog} />
+      <RequestLog state={state} onRule={setDialog} browser={browser} />
       {dialog && <RuleDialog init={dialog} state={state} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
       {switching && <DenyDialog rules={rules} onClose={() => setSwitching(false)} onDone={async () => { setSwitching(false); await load() }} />}
     </>
@@ -115,13 +146,14 @@ function RuleGroup({ title, kind, rules, desc, dim, onDelete }: { title: string;
 
 /** Switching to deny: offer to allow every host that was reached recently, so nothing that works today silently breaks. */
 function DenyDialog({ rules, onClose, onDone }: { rules: Rule[]; onClose: () => void; onDone: () => Promise<void> }) {
+  const act = useAct()
   const [hosts, setHosts] = useState<[string, number][]>()
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const { run, busy, error } = useAction()
   useEffect(() => {
-    void recentRequests().then((rows) => {
+    void recentRequests(act).then((rows) => {
       const n = new Map<string, number>()
-      for (const r of rows) if (!r.blocked && verdict(r.url, rules, 'deny').blocked && !rules.some((x) => x.action === 'block' && matches(x, r.url))) n.set(r.host, (n.get(r.host) ?? 0) + 1)
+      for (const r of rows) if (!r.blocked && /^(https?|wss?):/i.test(r.url) && verdict(r.url, rules, 'deny').blocked && !rules.some((x) => x.action === 'block' && matches(x, r.url))) n.set(r.host, (n.get(r.host) ?? 0) + 1)
       const list = [...n].sort((a, b) => b[1] - a[1])
       setHosts(list); setPicked(new Set(list.map(([h]) => h)))
     }).catch(() => setHosts([]))
@@ -149,6 +181,7 @@ function DenyDialog({ rules, onClose, onDone }: { rules: Rule[]; onClose: () => 
 }
 
 function RuleDialog({ init, state, onClose, onDone }: { init: Target; state: { policy: Policy; rules: Rule[] }; onClose: () => void; onDone: () => Promise<void> }) {
+  const act = useAct()
   const { policy, rules } = state
   const [action, setAction] = useState(init.action)
   const [kind, setKind] = useState(init.kind)
@@ -157,7 +190,7 @@ function RuleDialog({ init, state, onClose, onDone }: { init: Target; state: { p
   const [recent, setRecent] = useState<Req[]>([])
   const [keep, setKeep] = useState<Set<number>>(new Set()) // conflicting block rules the admin chose NOT to remove
   const { run, busy, error } = useAction()
-  useEffect(() => { void recentRequests().then(setRecent).catch(() => {}) }, [])
+  useEffect(() => { void recentRequests(act).then(setRecent).catch(() => {}) }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   const k = KINDS.find((x) => x.kind === kind)!
   const v = value.trim()
@@ -228,12 +261,13 @@ function RuleDialog({ init, state, onClose, onDone }: { init: Target; state: { p
   )
 }
 
-function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] }; onRule: (t: Target) => void }) {
-  const [servers] = useApi<Server[]>('/servers')
+function RequestLog({ state, onRule, browser }: { state: { policy: Policy; rules: Rule[] }; onRule: (t: Target) => void; browser: boolean }) {
+  const act = useAct()
+  const [servers] = useApi<Server[]>(browser ? null : '/servers')
   const [range, setRange] = useState<number | 'custom'>(86400e3)
   const [from, setFrom] = useState(() => toLocalInput(Date.now() - 86400e3))
   const [to, setTo] = useState(() => toLocalInput(Date.now()))
-  const [f, setF] = useState({ q: '', method: '', outcome: '', server: '' })
+  const [f, setF] = useState({ q: '', method: '', outcome: '', server: '', profile: '', via: '' })
   const [live, setLive] = useState(true)
   const [data, setData] = useState<{ rows: Req[]; more: boolean }>()
   const { run, error, busy } = useAction()
@@ -265,15 +299,20 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
           {RANGES.map(([l, ms]) => <option key={ms} value={ms}>{l}</option>)}<option value="custom">Custom range…</option>
         </select>
         {range === 'custom' && <><input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} /> <span className="muted">to</span> <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} /></>}
-        <select value={f.outcome} onChange={(e) => setF({ ...f, outcome: e.target.value })} style={{ width: 130 }}><option value="">Allowed & blocked</option><option value="allowed">Allowed</option><option value="blocked">Blocked</option><option value="error">Errors</option></select>
-        <select value={f.server} onChange={(e) => setF({ ...f, server: e.target.value })} style={{ width: 160 }}><option value="">All servers</option>{servers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
-        <select value={f.method} onChange={(e) => setF({ ...f, method: e.target.value })} style={{ width: 120 }}><option value="">All methods</option>{['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].map((m) => <option key={m}>{m}</option>)}</select>
+        <select value={f.outcome} onChange={(e) => setF({ ...f, outcome: e.target.value })} style={{ width: 130 }}><option value="">Allowed & blocked</option><option value="allowed">Allowed</option><option value="blocked">Blocked</option>{!browser && <option value="error">Errors</option>}</select>
+        {browser
+          ? <>
+            <input type="text" placeholder="Profile" value={f.profile} onChange={(e) => setF({ ...f, profile: e.target.value })} style={{ width: 120 }} />
+            <select value={f.via} onChange={(e) => setF({ ...f, via: e.target.value })} style={{ width: 190 }}><option value="">All sources</option>{Object.entries(VIA).map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
+          </>
+          : <select value={f.server} onChange={(e) => setF({ ...f, server: e.target.value })} style={{ width: 160 }}><option value="">All servers</option>{servers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>}
+        {!browser && <select value={f.method} onChange={(e) => setF({ ...f, method: e.target.value })} style={{ width: 120 }}><option value="">All methods</option>{['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].map((m) => <option key={m}>{m}</option>)}</select>}
         <input type="text" placeholder="Search URL or agent…" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} style={{ width: 220 }} />
       </div>
       {error && <Alert kind="err">{error}</Alert>}
       <div style={{ overflowX: 'auto' }}>
       <table>
-        <thead><tr><th>Time</th><th>Server / agent</th><th>Method</th><th>URL</th><th>Access</th><th>Response</th><th></th></tr></thead>
+        <thead><tr><th>Time</th><th>{browser ? 'Profile / agent' : 'Server / agent'}</th><th>{browser ? 'Type' : 'Method'}</th><th>URL</th><th>Access</th>{!browser && <th>Response</th>}<th></th></tr></thead>
         <tbody>
           {rows.map((r) => {
             const now = verdict(r.url, state.rules, state.policy)
@@ -283,25 +322,31 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
             const Verb = now.blocked ? 'Allow' : 'Block'
             return <tr key={r.id} className="log-row">
               <td className="ts">{fmt(r.ts)}</td>
-              <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
-              <td><Badge kind={r.method === 'GET' || r.method === 'HEAD' ? undefined : 'warn'}>{r.method}</Badge></td>
+              {browser
+                ? <td className="small" style={{ whiteSpace: 'nowrap' }}>{r.profile}{r.tab_id != null && r.tab_id >= 0 && <span className="muted"> · tab {r.tab_id}</span>}
+                    <div className="muted" title={r.agent_via ? AGENT_VIA[r.agent_via] : 'no agent had used this tab (the user, or browser background traffic)'}>{r.principal ?? (r.agent_via ? '(unnamed agent)' : 'user / background')}{r.agent_via && r.agent_via !== 'tool' && <> <Badge>{r.agent_via}</Badge></>}</div></td>
+                : <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>}
+              {browser
+                ? <td className="small" style={{ whiteSpace: 'nowrap' }}>{r.type}{r.method && r.method.toUpperCase() !== 'GET' && <> <Badge kind="warn">{r.method.toUpperCase()}</Badge></>}</td>
+                : <td><Badge kind={r.method === 'GET' || r.method === 'HEAD' ? undefined : 'warn'}>{r.method}</Badge></td>}
               <td className="mono" style={{ width: '100%', maxWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.url}>{r.url}</td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 {r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
+                {browser && r.via && <div className="muted small">{VIA[r.via] ?? r.via}</div>}
                 {changed && <div className="small" style={{ fontStyle: 'italic' }}>now {now.blocked ? 'blocked' : 'allowed'}</div>}
               </td>
-              <td style={{ whiteSpace: 'nowrap' }}>
+              {!browser && <td style={{ whiteSpace: 'nowrap' }}>
                 {r.blocked ? <span className="muted small">—</span> : r.error ? <><Badge kind="err">failed</Badge> <span className="muted small" title={r.error}>{r.error.slice(0, 40)}</span></>
                   : <><Badge kind={r.status! >= 400 ? 'err' : r.status! >= 300 ? 'info' : undefined}>{r.status}</Badge>{r.ms != null && <span className="muted small"> {r.ms} ms</span>}</>}
-              </td>
-              <td><div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
+              </td>}
+              <td>{/^(https?|wss?):/i.test(r.url) && <div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
                 <button className={`sm${now.blocked ? '' : ' danger'}`} title={`${Verb} ${r.host} and its subdomains`} onClick={() => onRule({ action: next, kind: 'domain', value: r.host, url: r.url })}>{Verb} domain</button>
                 <button className={`sm${now.blocked ? '' : ' danger'}`} title={`${Verb} URLs starting with ${base}`} onClick={() => onRule({ action: next, kind: 'url', value: base, url: r.url })}>{Verb} URL</button>
-              </div></td>
+              </div>}</td>
             </tr>
           })}
-          {rows.length === 0 && <tr><td colSpan={7} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
+          {rows.length === 0 && <tr><td colSpan={browser ? 6 : 7} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
         </tbody>
       </table>
       </div>

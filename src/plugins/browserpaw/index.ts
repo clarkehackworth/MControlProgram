@@ -15,6 +15,8 @@ import http from 'node:http';
 import { exec } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import * as policy from './policy.js';
+import type { BridgeCall } from './policy.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
 import { text, errorResult } from '../../core/plugin-api.js';
@@ -231,6 +233,13 @@ async function startProfile(ssh: SshApi, h: HostCfg, p: ProfileCfg, timeoutSec: 
 
 // ---------- MCP over the tunnel ----------
 
+/** JSON over the bridge's plain HTTP routes (fork: /url-policy*), same token as /mcp. */
+const bridgeCall = (f: typeof fetch, base: string, token: string): BridgeCall => async (method, path, body) => {
+  const r = await f(`${base}${path}`, { method, headers: { authorization: `Bearer ${token}`, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15_000) });
+  if (r.status === 404) throw new Error('this BrowserPaw build has no URL policy support (needs the clarkehackworth fork; update the checkout and rebuild)');
+  return r.json().catch(() => ({ status: 'error', error: `HTTP ${r.status}` }));
+};
+
 async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status['bridge']>, log: Log) {
   ssh = via(ssh, h);
   if (h.manual) {
@@ -238,7 +247,7 @@ async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status
     const transport = new StreamableHTTPClientTransport(new URL(`${bridgeAddr(h, bridge.port)}/mcp`), { fetch: bridgeFetch(h), requestInit: { headers: { authorization: `Bearer ${bridge.token}` } } });
     const client = new Client({ name: 'mcontrolprogram', version: '0.1.0' });
     await client.connect(transport);
-    return client;
+    return { client, call: bridgeCall(bridgeFetch(h), bridgeAddr(h, bridge.port), bridge.token) };
   }
   const t = await ssh.openTunnel(h.sshHost, '127.0.0.1', bridge.port, log);
   try {
@@ -247,7 +256,7 @@ async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status
     await client.connect(transport);
     const onclose = transport.onclose; // the tunnel lives exactly as long as the transport
     transport.onclose = () => { t.close(); onclose?.(); };
-    return client;
+    return { client, call: bridgeCall(fetch, `http://127.0.0.1:${t.port}`, bridge.token) };
   } catch (e) { t.close(); throw e; }
 }
 
@@ -330,6 +339,7 @@ const plugin: MControlProgramPlugin = {
   },
   defaultGlobalConfig: { hosts: [], profiles: [], startTimeoutSec: 45, callTimeoutMs: 120000 },
   globalActions: {
+    ...policy.actions,
     check_host: {
       title: 'Check host', inventory: 'hosts',
       async run({ name }, a: PluginActionContext) {
@@ -349,8 +359,9 @@ const plugin: MControlProgramPlugin = {
         const ssh = a.dep<SshApi>('ssh');
         if (h.manual && !(await status(ssh, h, p, a.log)).bridge) return { ok: false, manual: true, message: 'The browser is not reachable yet. Run the script below on the browser machine, then press Set up & start again.', ...manualInstructions(h, p) };
         const st = await startProfile(ssh, h, p, g.startTimeoutSec, a.log);
-        const client = await connectBridge(ssh, h, st.bridge!, a.log);
+        const { client, call } = await connectBridge(ssh, h, st.bridge!, a.log);
         try {
+          await policy.push(p.name, call).catch((e) => a.log.warn((e as Error).message));
           const changed = await refreshToolCache(client, p.name);
           if (changed) await a.setConfig(a.config); // reload instances so agents get the (new) tool list
           return { ok: true, chromiumPid: st.chromiumPid, bridgePort: st.bridge!.port, tools: cachedTools(p.name).length };
@@ -400,14 +411,16 @@ const plugin: MControlProgramPlugin = {
     for (const n of cfg.profiles) if (!g.profiles.some((p) => p.name === n)) ctx.log.warn(`profile "${n}" is not configured on the browserpaw plugin`);
     const names = selected.map((p) => p.name);
 
-    const conns = new Map<string, { client: Client; lastUsed: number }>();
+    const conns = new Map<string, { client: Client; call: BridgeCall; lastUsed: number }>();
     const connecting = new Map<string, Promise<Client>>();
     let reaper: NodeJS.Timeout | undefined;
+    let puller: NodeJS.Timeout | undefined;
+    let unlisten: (() => void) | undefined;
     const allowed = (tool: string) => !cfg.denyTools.includes(tool) && (cfg.allowTools.length === 0 || cfg.allowTools.includes(tool));
 
     const client = (name: string): Promise<Client> => {
       const c = conns.get(name);
-      if (c) { c.lastUsed = Date.now(); return Promise.resolve(c.client); }
+      if (c) { c.lastUsed = Date.now(); return policy.ensureSynced(name, c.call).then(() => c.client); }
       let p = connecting.get(name);
       if (!p) {
         p = (async () => {
@@ -417,9 +430,11 @@ const plugin: MControlProgramPlugin = {
             if (prof.autoStart === false) throw new Error(`profile ${name} is not running and "Start on demand" is off; ask an admin to start it`);
             st = await startProfile(ssh, h, prof, g.startTimeoutSec, ctx.log);
           }
-          const cl = await connectBridge(ssh, h, st.bridge!, ctx.log);
-          cl.onclose = () => { if (conns.get(name)?.client === cl) conns.delete(name); };
-          conns.set(name, { client: cl, lastUsed: Date.now() });
+          const { client: cl, call } = await connectBridge(ssh, h, st.bridge!, ctx.log);
+          // Fail closed: no tool call reaches a browser that isn't enforcing the current URL policy.
+          try { await policy.push(name, call); } catch (e) { await cl.close().catch(() => {}); throw e; }
+          cl.onclose = () => { const cur = conns.get(name); if (cur?.client === cl) { conns.delete(name); void policy.pull(name, call); } };
+          conns.set(name, { client: cl, call, lastUsed: Date.now() });
           ctx.log.connection(`browserpaw ${name}: connected (bridge port ${st.bridge!.port})`);
           if (await refreshToolCache(cl, name).catch(() => false)) rebuild();
           return cl;
@@ -456,18 +471,27 @@ const plugin: MControlProgramPlugin = {
       },
     };
 
+    const policyTool: ToolDefinition = {
+      name: 'policy',
+      description: 'Show the administrator\'s browser URL policy (default allow/deny and the block/allow rules). Every profile enforces it on everything the browser loads; non-web schemes (file:, chrome:, ssh:, ...) are always refused.',
+      annotations: { readOnlyHint: true },
+      handler: async () => text(JSON.stringify({ defaultPolicy: policy.store.policy(), rules: policy.store.rules().map(({ action, kind, value }) => ({ action, kind, value })) }, null, 2)),
+    };
+
     const tools: ToolDefinition[] = [];
     // In place: the runtime holds this array, so sessions opened after a refresh see new tools.
     function rebuild() {
       const byName = new Map<string, CachedTool>();
       for (const n of names) for (const t of cachedTools(n)) if (!byName.has(t.name) && allowed(t.name)) byName.set(t.name, t);
-      tools.splice(0, tools.length, profilesTool, ...[...byName.values()].map((t): ToolDefinition => ({
+      tools.splice(0, tools.length, profilesTool, policyTool, ...[...byName.values()].map((t): ToolDefinition => ({
         name: t.name, title: t.title, description: t.description ?? '', jsonSchema: withProfile(t.inputSchema), annotations: t.annotations,
         async handler(args, call) {
           try {
             const { profile, ...rest } = args ?? {};
-            const c = await client(pick(profile));
-            return (await c.callTool({ name: t.name, arguments: rest }, undefined, { signal: call.signal, timeout: g.callTimeoutMs })) as unknown as ToolResult;
+            const name = pick(profile);
+            const prepared = policy.prepareCall(name, t.name, rest, call);
+            const c = await client(name);
+            return (await c.callTool({ name: t.name, arguments: prepared }, undefined, { signal: call.signal, timeout: g.callTimeoutMs })) as unknown as ToolResult;
           } catch (e) { return errorResult(e); }
         },
       })));
@@ -481,24 +505,31 @@ const plugin: MControlProgramPlugin = {
 - Typical flow: {prefix}_get_windows_and_tabs, then {prefix}_chrome_navigate {url, background: true}, then {prefix}_chrome_read_dom (numbered elements) or {prefix}_chrome_get_markdown (article text), then act by number with {prefix}_chrome_interact_index / {prefix}_chrome_fill_index.
 - Prefer the numbered tools over CSS selectors; use {prefix}_chrome_batch_actions for 2+ predictable steps.
 - Use screenshots / {prefix}_chrome_computer only for canvas or unlabeled UIs. For CAPTCHA, 2FA or payments, call {prefix}_chrome_request_human_intervention.
-- Close tabs you opened when done.`,
+- Close tabs you opened when done.
+- The administrator's URL policy applies to everything the browser loads (see {prefix}_policy). Blocked URLs fail; don't retry them or look for workarounds.`,
       start() {
         // Learn tools from profiles that are already running; never launch browsers at gateway start.
         for (const n of names) if (cachedTools(n).length === 0) {
           const { p, h } = lookup(g, n);
           void status(ssh, h, p, ctx.log).then((st) => (st.bridge ? client(n) : undefined)).catch((e) => ctx.log.warn(`browserpaw ${n}: ${(e as Error).message}`));
         }
+        // Rule changes reach every connected browser right away; the 3 s pull also re-pushes on a rev mismatch.
+        unlisten = policy.store.onChange(() => { for (const [n, c] of conns) void policy.push(n, c.call).catch((e) => ctx.log.warn((e as Error).message)); });
+        puller = setInterval(() => { for (const [n, c] of conns) void policy.pull(n, c.call); }, 3_000);
+        puller.unref();
         reaper = setInterval(() => {
+          policy.prune(ctx.global().logRetentionDays);
           const idle = effective(cfg.idleDisconnectSec, ctx.global().connectionIdleSec) * 1000;
-          for (const [n, c] of conns) if (Date.now() - c.lastUsed > idle) { conns.delete(n); void c.client.close(); ctx.log.debug(`idle disconnect ${n}`); }
+          for (const [n, c] of conns) if (Date.now() - c.lastUsed > idle) { conns.delete(n); void policy.pull(n, c.call).finally(() => c.client.close()); ctx.log.debug(`idle disconnect ${n}`); }
         }, 30_000).unref();
       },
       async stop() {
-        clearInterval(reaper);
+        clearInterval(reaper); clearInterval(puller); unlisten?.();
+        await Promise.all([...conns].map(([n, c]) => policy.pull(n, c.call)));
         for (const c of conns.values()) await c.client.close().catch(() => {});
         conns.clear();
       },
-      status: () => ({ profiles: names.map((n) => ({ name: n, connected: conns.has(n), cachedTools: cachedTools(n).length })) }),
+      status: () => { const sy = policy.syncStatus(); return { profiles: names.map((n) => ({ name: n, connected: conns.has(n), cachedTools: cachedTools(n).length, urlPolicy: sy[n] ?? null })) }; },
     };
   },
 };

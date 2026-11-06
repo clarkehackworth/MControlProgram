@@ -7,6 +7,8 @@ import type { MControlProgramPlugin, PluginContext, PluginInstance } from '../..
 import { text, errorResult } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
 import { getDb } from '../../core/db.js';
+import { ruleStore, ruleMatches, verdict, label } from '../../core/url-policy.js';
+export { ruleMatches, verdict, normalizeBlock, type BlockKind, type RuleAction, type Policy } from '../../core/url-policy.js';
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { Agent, fetch, Headers, type Response } from 'undici';
@@ -122,63 +124,20 @@ function htmlToText(html: string): string {
 }
 
 // ---- request log + plugin-wide access rules (own tables: changing rules must not restart instances / drop cookie jars) ----
-export type BlockKind = 'domain' | 'url' | 'regex';
-export type RuleAction = 'block' | 'allow';
-export type Policy = 'allow' | 'deny';
-interface Rule { id: number; action: RuleAction; kind: BlockKind; value: string; note: string; created_at: number }
+const store = ruleStore('web');
+const { rules, policy } = store;
 let tablesReady = false;
 const db = () => {
   const d = getDb();
   if (!tablesReady) {
     d.exec(`CREATE TABLE IF NOT EXISTS web_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, server_id TEXT, instance TEXT, principal TEXT,
         method TEXT NOT NULL, url TEXT NOT NULL, host TEXT NOT NULL, status INTEGER, error TEXT, blocked TEXT, ms INTEGER);
-      CREATE INDEX IF NOT EXISTS web_requests_ts ON web_requests(ts);
-      CREATE TABLE IF NOT EXISTS web_blocks (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));
-      CREATE TABLE IF NOT EXISTS web_policy (k TEXT PRIMARY KEY, v TEXT NOT NULL);`);
-    for (const sql of ["ALTER TABLE web_blocks ADD COLUMN action TEXT NOT NULL DEFAULT 'block'", 'ALTER TABLE web_requests ADD COLUMN allowed_by TEXT'])
-      try { d.exec(sql); } catch { /* exists */ }
+      CREATE INDEX IF NOT EXISTS web_requests_ts ON web_requests(ts);`);
+    try { d.exec('ALTER TABLE web_requests ADD COLUMN allowed_by TEXT'); } catch { /* exists */ }
     tablesReady = true;
   }
   return d;
 };
-let ruleCache: Rule[] | undefined;
-let policyCache: Policy | undefined;
-const rules = () => (ruleCache ??= db().prepare('SELECT * FROM web_blocks ORDER BY action, kind, value').all() as Rule[]);
-const policy = (): Policy => (policyCache ??= ((db().prepare("SELECT v FROM web_policy WHERE k='default'").get() as any)?.v === 'deny' ? 'deny' : 'allow'));
-const changed = () => { ruleCache = undefined; policyCache = undefined; };
-
-const label = (r: Pick<Rule, 'kind' | 'value'>) => `${r.kind}: ${r.value}`;
-/** Domain = host or any subdomain; URL = prefix; regex = case-insensitive on the full URL. */
-export function ruleMatches(r: Pick<Rule, 'kind' | 'value'>, u: URL): boolean {
-  const host = u.hostname.toLowerCase().replace(/\.+$/, ''); // "evil.com." is evil.com
-  if (r.kind === 'domain') return host === r.value || host.endsWith('.' + r.value);
-  if (r.kind === 'url') return u.href.startsWith(r.value);
-  try { return new RegExp(r.value, 'i').test(u.href); } catch { return false; }
-}
-/** Block rules always win; otherwise an allow rule, otherwise the default policy. */
-export function verdict(u: URL, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy): { blocked?: string; allowedBy?: string } {
-  const b = list.find((r) => r.action === 'block' && ruleMatches(r, u));
-  if (b) return { blocked: label(b) };
-  const a = list.find((r) => r.action === 'allow' && ruleMatches(r, u));
-  if (a) return { allowedBy: label(a) };
-  return def === 'deny' ? { blocked: 'default: deny' } : { allowedBy: 'default: allow' };
-}
-
-export function normalizeBlock(kind: string, raw: string): { kind: BlockKind; value: string } {
-  const v = String(raw ?? '').trim();
-  if (!v) throw new Error('value is required');
-  if (kind === 'domain') {
-    const d = (/^[a-z]+:\/\//i.test(v) ? new URL(v).hostname : v.split('/')[0]!).replace(/^\*?\./, '').replace(/\.+$/, '').toLowerCase();
-    if (!/^[a-z0-9.-]+$|^\[[0-9a-f:]+\]$/i.test(d)) throw new Error(`"${v}" is not a domain`);
-    return { kind, value: d };
-  }
-  if (kind === 'url') {
-    const u = new URL(/^[a-z]+:\/\//i.test(v) ? v : `https://${v}`); // throws on garbage
-    return { kind, value: u.href };
-  }
-  if (kind === 'regex') { new RegExp(v, 'i'); return { kind, value: v }; }
-  throw new Error(`unknown block kind "${kind}"`);
-}
 
 const plugin: MControlProgramPlugin = {
   id: 'web', name: 'Web', version: '0.1.0',
@@ -199,33 +158,7 @@ const plugin: MControlProgramPlugin = {
       const rows = db().prepare(`SELECT * FROM web_requests WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1);
       return { rows: rows.slice(0, limit), more: rows.length > limit };
     } },
-    rules: { title: 'Access rules', run: async () => ({ policy: policy(), rules: rules() }) },
-    /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks that conflict with a new allow).
-     *  With the default policy at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
-    rule: { title: 'Add rule', run: async ({ action, kind, value, note, remove }) => {
-      if (action !== 'block' && action !== 'allow') throw new Error('action must be block or allow');
-      const r = normalizeBlock(kind, value);
-      const d = db();
-      const store = action === 'block' || policy() === 'deny';
-      d.transaction(() => {
-        for (const id of (Array.isArray(remove) ? remove : [])) d.prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id));
-        if (store) d.prepare('INSERT INTO web_blocks(action,kind,value,note,created_at) VALUES(?,?,?,?,?) ON CONFLICT(kind,value) DO UPDATE SET action=excluded.action, note=excluded.note, created_at=excluded.created_at')
-          .run(action, r.kind, r.value, String(note ?? ''), Date.now());
-      })();
-      changed(); return { ...r, action, stored: store };
-    } },
-    delete_rule: { title: 'Delete rule', run: async ({ id }) => { db().prepare('DELETE FROM web_blocks WHERE id=?').run(Number(id)); changed(); } },
-    /** Switch the default policy; `allow` = domains to add as allow rules in the same step (so switching to deny doesn't break current traffic). */
-    set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }) => {
-      if (p !== 'allow' && p !== 'deny') throw new Error('policy must be allow or deny');
-      const d = db();
-      const doms = (Array.isArray(allow) ? allow : []).map((x: string) => normalizeBlock('domain', x).value);
-      d.transaction(() => {
-        for (const v of doms) d.prepare("INSERT INTO web_blocks(action,kind,value,note,created_at) VALUES('allow','domain',?,'added when switching to deny',?) ON CONFLICT(kind,value) DO NOTHING").run(v, Date.now());
-        d.prepare("INSERT INTO web_policy(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(p);
-      })();
-      changed(); return { policy: p };
-    } },
+    ...store.actions,
     clear_requests: { title: 'Clear request log', run: async () => { db().prepare('DELETE FROM web_requests').run(); } },
   },
   defaultGlobalConfig: { credentials: [] },

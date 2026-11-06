@@ -1,6 +1,6 @@
 # Spec: URL access policy for BrowserPaw (plus scheme hardening for both plugins)
 
-Status: agreed design, 2026-11-06. Fork-only (`clarkehackworth/browserpaw`); not shaped for upstream.
+Status: implemented 2026-11-06 (branch `browserpaw-url-policy` in both repos); live end-to-end test against a real profile still to do. Fork-only (`clarkehackworth/browserpaw`); not shaped for upstream.
 Touches the browserpaw fork (extension + native server) and MControlProgram (`src/plugins/browserpaw`, `src/plugins/web`, `web/src/plugins`).
 
 ## Decisions
@@ -53,7 +53,7 @@ The web plugin keeps its own table; no behaviour change.
 ### Storage
 
 ```sql
-CREATE TABLE browserpaw_rules (id INTEGER PRIMARY KEY, action TEXT NOT NULL DEFAULT 'block', kind TEXT NOT NULL, value TEXT NOT NULL,
+CREATE TABLE browserpaw_blocks (id INTEGER PRIMARY KEY, action TEXT NOT NULL DEFAULT 'block', kind TEXT NOT NULL, value TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));
 CREATE TABLE browserpaw_policy (k TEXT PRIMARY KEY, v TEXT NOT NULL);   -- 'default' -> allow|deny, 'rev' -> integer
 CREATE TABLE browserpaw_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, profile TEXT NOT NULL,
@@ -74,7 +74,7 @@ CREATE INDEX browserpaw_requests_ts ON browserpaw_requests(ts);
 
 - **On connect** (in `client()` after `connectBridge()`): `PUT /url-policy` `{ rev, policy, rules, schemes, logAllowed }`, then wait for the ack `{ rev, installed, rejected: [{id, error}] }` before forwarding any tool call.
 - **On change**: push to every connected profile right away.
-- **Heartbeat** (about every 15 s, on the existing status timer): `GET /url-policy/state` → `{ rev }`. If it doesn't match, push again.
+- **Heartbeat**: the 3 s event pull returns the extension's `rev`; if it doesn't match, push again. (`GET /url-policy/state` also exists, for debugging.)
 - **Fail closed**: if a profile's ack'd rev ≠ current rev, tool calls to it return `browser policy not in sync for profile X`.
 - **Extension bootstrap**: with no stored policy, the extension installs a block-everything rule. DNR dynamic rules survive browser restarts, so a restarted browser enforces the last list until the next push replaces it.
 - Manual hosts use the same calls through `bridgeFetch`.
@@ -196,6 +196,23 @@ State lives in `chrome.storage.session` (survives service-worker restarts, clear
 ### Self-protection
 - The policy and the owner map change only through native-messaging messages (`url_policy_*`) and the extension's own listeners. There is no MCP tool, popup control or content-script message path to them. Add a test asserting no tool handler references `declarativeNetRequest` or `url_policy`.
 - The popup shows the policy read-only (rev, rule count, in sync).
+
+## As built: where it differs from the design above
+
+- Rule storage and admin actions live in `ruleStore(prefix)` in `src/core/url-policy.ts`, shared by both plugins (tables `web_blocks`/`web_policy` and `browserpaw_blocks`/`browserpaw_policy`). The web plugin's tables and behaviour are unchanged.
+- Events are cursor-paged by `(epoch, seq)`. A new epoch means the browser restarted, so the cursor resets. The extension drops events once MControlProgram has fetched past them.
+- The startup bootstrap block-all and a policy push are serialized, so a push that arrives during service-worker startup can't be overwritten.
+- The extension's own calls to its bridge (127.0.0.1:12306-12316, initiator = this extension) are exempt from block-all, so health checks keep working while out of sync.
+- The agent-facing tool is `{prefix}_policy`, and the agent instructions say blocked URLs fail and shouldn't be retried.
+- MControlProgram-side code: `src/plugins/browserpaw/policy.ts`. Extension: `entrypoints/background/url-policy.ts`.
+
+## To verify in a real browser (unit-tested with fakes only)
+
+- DNR blocks main frame, iframe, fetch from `chrome_javascript`, websocket; `onRuleMatchedDebug` fires (it needs the unpacked extension).
+- Whether DNR applies to requests the extension makes itself (e.g. `chrome_insert_media` fetching from the service worker). The tool-arg pre-check covers that tool's `url` either way.
+- `onCreatedNavigationTarget` inheritance for `target=_blank` and `window.open`.
+- The nav guard on `file:///` and `view-source:file:///`.
+- Restarting the browser with a stale rev: block-all isn't reinstalled (the stored policy is kept), and MControlProgram re-pushes on the first pull.
 
 ## Remaining caveats
 
