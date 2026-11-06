@@ -73,5 +73,18 @@ test('blocks: normalize, match, enforce live (incl. redirects), and log every at
   const { isPrivateHost } = await import('../src/plugins/web/index.js');
   for (const h of ['localhost', 'a.localhost', '127.9.9.9', '10.1.2.3', '192.168.0.5', '[::1]', '[::ffff:7f00:1]', '[fd00::1]', '0.0.0.0']) assert.ok(isPrivateHost(h), h);
   for (const h of ['8.8.8.8', 'example.com', '[2606:4700::1]', '172.32.0.1']) assert.ok(!isPrivateHost(h), h);
+  // trailing dot names the same host: "evil.com." must not slip past a domain/url rule
+  assert.ok(verdict(new URL('https://a.example.com./'), L, 'allow').blocked, 'trailing dot still matches domain rule');
+  assert.deepEqual(normalizeBlock('domain', 'example.com.'), { kind: 'domain', value: 'example.com' });
+  await act('rule', { action: 'block', kind: 'url', value: `http://localhost:${port}/secret/` });
+  assert.match((await req(`http://localhost.:${port}/secret/x`)).content[0].text, /blocked by administrator/, 'trailing dot vs url prefix rule');
+  await act('delete_rule', { id: (await act('rules') as any).rules[0].id });
+
+  // non-http schemes are refused and logged
+  for (const u of ['file:///etc/passwd', 'ftp://example.com/', 'ssh://host/']) {
+    assert.match((await req(u)).content[0].text, /only http\/https allowed/, u);
+    assert.equal((await act('requests', { since: 0, limit: 1 }) as any).rows[0].blocked, `scheme: ${new URL(u).protocol}`, u);
+  }
+
   inst.stop?.(); site.close();
 });

@@ -150,7 +150,7 @@ const changed = () => { ruleCache = undefined; policyCache = undefined; };
 const label = (r: Pick<Rule, 'kind' | 'value'>) => `${r.kind}: ${r.value}`;
 /** Domain = host or any subdomain; URL = prefix; regex = case-insensitive on the full URL. */
 export function ruleMatches(r: Pick<Rule, 'kind' | 'value'>, u: URL): boolean {
-  const host = u.hostname.toLowerCase();
+  const host = u.hostname.toLowerCase().replace(/\.+$/, ''); // "evil.com." is evil.com
   if (r.kind === 'domain') return host === r.value || host.endsWith('.' + r.value);
   if (r.kind === 'url') return u.href.startsWith(r.value);
   try { return new RegExp(r.value, 'i').test(u.href); } catch { return false; }
@@ -168,7 +168,7 @@ export function normalizeBlock(kind: string, raw: string): { kind: BlockKind; va
   const v = String(raw ?? '').trim();
   if (!v) throw new Error('value is required');
   if (kind === 'domain') {
-    const d = (/^[a-z]+:\/\//i.test(v) ? new URL(v).hostname : v.split('/')[0]!).replace(/^\*?\./, '').toLowerCase();
+    const d = (/^[a-z]+:\/\//i.test(v) ? new URL(v).hostname : v.split('/')[0]!).replace(/^\*?\./, '').replace(/\.+$/, '').toLowerCase();
     if (!/^[a-z0-9.-]+$|^\[[0-9a-f:]+\]$/i.test(d)) throw new Error(`"${v}" is not a domain`);
     return { kind, value: d };
   }
@@ -258,7 +258,7 @@ const plugin: MControlProgramPlugin = {
           .run(Date.now(), ctx.serverId, ctx.instanceName, c.principal ?? null, method, u.href, u.hostname, r.status ?? null, r.error ?? null, r.blocked ?? null, allowedBy, r.ms ?? null);
       } catch (e) { ctx.log.warn(`request log write failed: ${(e as Error).message}`); }
     };
-    class Blocked extends Error { constructor(public rule: string) { super(rule === 'default: deny' ? 'url not on the administrator\'s allow list' : `url blocked by administrator (${rule})`); } }
+    class Blocked extends Error { constructor(public rule: string, msg?: string) { super(msg ?? (rule === 'default: deny' ? 'url not on the administrator\'s allow list' : `url blocked by administrator (${rule})`)); } }
 
     /** Deny checks that also apply to an address a name resolves to (block rules, denyUrls, private ranges). Allow rules don't: allowing a name allows what it resolves to. */
     function checkAddress(ip: string, name: string) {
@@ -278,7 +278,9 @@ const plugin: MControlProgramPlugin = {
 
     function checkUrl(raw: string): URL {
       const u = new URL(raw);
-      if (!/^https?:$/.test(u.protocol)) throw new Error('only http/https allowed');
+      if (!/^https?:$/.test(u.protocol)) throw new Blocked(`scheme: ${u.protocol}`, `only http/https allowed (got ${u.protocol})`); // logged like any block
+      // Trailing dots name the same host ("evil.com." = evil.com, "localhost." = localhost); canonicalize so rules, prefixes and private checks all see one form.
+      if (u.hostname.endsWith('.')) u.hostname = u.hostname.replace(/\.+$/, '');
       const v = verdict(u, rules(), policy()); if (v.blocked) throw new Blocked(v.blocked);
       if (cfg.blockPrivateNetworks && isPrivateHost(u.hostname)) throw new Error('private network addresses are blocked');
       for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p})`);

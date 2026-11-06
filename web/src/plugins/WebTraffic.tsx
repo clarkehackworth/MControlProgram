@@ -22,8 +22,8 @@ const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour'
 /** Mirror of the server's ruleMatches()/verdict(): block rules win, then allow rules, then the default policy. */
 function matches(r: Pick<Rule, 'kind' | 'value'>, url: string) {
   if (!r.value) return false
-  let host = ''; try { host = new URL(url).hostname.toLowerCase() } catch { /* not a URL */ }
-  if (r.kind === 'domain') { const d = r.value.toLowerCase().replace(/^\*?\./, ''); return host === d || host.endsWith('.' + d) }
+  let host = ''; try { host = new URL(url).hostname.toLowerCase().replace(/\.+$/, '') } catch { /* not a URL */ }
+  if (r.kind === 'domain') { const d = r.value.toLowerCase().replace(/^\*?\./, '').replace(/\.+$/, ''); return host === d || host.endsWith('.' + d) }
   if (r.kind === 'url') return url.startsWith(r.value)
   try { return new RegExp(r.value, 'i').test(url) } catch { return false }
 }
