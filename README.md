@@ -5,7 +5,21 @@ API tokens, internal networks. Agents connect to MControlProgram over the standa
 [Model Context Protocol](https://modelcontextprotocol.io) (Streamable HTTP) and get **tools**;
 MControlProgram's plugins own the credentials, make the real connections, and enforce policy.
 
-![MControlProgram admin UI: SSH plugin with per-server toggles](docs/images/ssh-plugin.png)
+**SSH** — hosts agents may use, with per-server toggles, global command allow/deny rules (parsed with a real shell grammar, so pipes, `sudo`, `sh -c` and `$( )` are all checked) and a command log.
+
+![SSH plugin: host inventory, per-server toggles and command rules](docs/images/ssh.png)
+
+**Web** — HTTP and page fetching with server-side credential injection, global URL access rules (allow/deny by default, domains, URLs, regex) and a request log with one-click *Block domain* / *Block URL*.
+
+![Web plugin: access rules and request log](docs/images/web.png)
+
+**BrowserPaw** — isolated Chromium profiles on SSH, native or manual hosts, each with its own logins and bridge. Agents get browser tools and never see SSH access or the bridge token.
+
+![BrowserPaw plugin: browser hosts and profiles](docs/images/browserpaw-hosts.png)
+
+BrowserPaw has its own URL access rules, pushed to every profile (fail closed if a browser is out of sync), and a per-agent log of everything the browser loads or is refused.
+
+![BrowserPaw plugin: URL access rules and request log](docs/images/browserpaw-policy.png)
 
 ```
  agent (Claude Code, Cursor, …)  ──MCP/HTTP + auth──▶  MControlProgram MCP server :7801  ──▶  ssh plugin ──▶ hosts
@@ -21,9 +35,11 @@ MControlProgram's plugins own the credentials, make the real connections, and en
 - **Plugins** define a plugin-wide config (shared inventory such as SSH hosts or web credentials,
   edited from the Plugins page with plugin-provided actions and wizards) plus a per-instance config
   (what each MCP server exposes and how). Built-in:
-  `ssh` (exec, persistent shells, SFTP, per-host command allow/deny) and `web` (HTTP requests,
-  page-to-text, URL allow/deny, private-network blocking, server-side credential injection,
-  isolated cookie jars).
+  `ssh` (exec, persistent shells, SFTP, per-host and global command allow/deny, command log),
+  `web` (HTTP requests, page-to-text, global and per-instance URL allow/deny, private-network
+  blocking, server-side credential injection, isolated cookie jars, request log),
+  `mcp` (proxy other MCP servers) and `browserpaw` (agent-driven Chromium profiles on SSH, native
+  or manual hosts, with a managed URL policy and per-agent request log).
 - **Secrets encrypted at rest** (AES-256-GCM, key in `MCONTROLPROGRAM_MASTER_KEY` or `data/master.key`);
   the UI never returns a stored secret.
 - **First-run setup**: no default credentials. The first visit to the admin UI asks you to create
@@ -173,7 +189,7 @@ Things worth knowing before you write a real one:
 ```
 src/core      config, sqlite, crypto, logger, secrets, plugin API + loader, store
 src/mcp       runtime (one Express app + MCP sessions per server), OAuth provider, manager
-src/plugins   built-in ssh, web and mcp plugins
+src/plugins   built-in ssh, web, mcp and browserpaw plugins
 src/admin     REST API for the UI
 web/          Vite + React admin UI
 test/         node:test unit tests (npm test); npm run test:ssh runs live ssh tests against a throwaway sshd

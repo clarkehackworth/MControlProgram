@@ -203,6 +203,14 @@ Nothing runs automatically. **Set up & start** on a profile shows steps and a sh
 
 Windows requirements: OpenSSH Server, the SSH user logged in to a desktop session, and BrowserPaw's `run_host.bat`. Because the HKCU registration is shared, setting up a profile replaces any registration BrowserPaw's own installer made, keeping its allowed origins. Branded Chrome and Edge 137+ ignore `--load-extension` by default, so the plugin adds `--disable-features=DisableLoadExtensionCommandLineSwitch` for them. Linux is tested against a real host. The macOS and Windows commands are covered by unit tests only (macOS shares the POSIX scripts, which the tests run under `sh`).
 
+### URL access policy and request log
+
+The BrowserPaw page has **Access rules** and a **Request log**, like the Web plugin's, but with a separate list. One list (block and allow rules by domain, URL or regex; allow or deny by default) applies to every profile and to everything the browser loads: pages, frames, scripts, fetch/XHR and websockets. It is pushed to running browsers immediately and enforced inside the extension. **Fail closed**: a browser that hasn't confirmed the current list gets no tool calls and blocks all traffic. Non-web schemes (`file:`, `chrome:`, `ftp:`, `ssh:`…) are always refused. Patterns use the browser's regex engine (no lookahead or backreferences). Agents can read the list with the `policy` tool.
+
+Every event is logged with the profile, tab and calling agent (token or OAuth client), whether it was allowed and by which rule, and where it was blocked (before reaching the browser or inside it). The log filters by time, outcome, profile, source and text, and each row has **Block domain** / **Block URL** shortcuts. Design notes: [browserpaw-url-policy.md](browserpaw-url-policy.md).
+
+The hosts table shows a **Type** column (Native / Manual / SSH) and hides the fields that only apply to manual hosts.
+
 ## Raw JSON Schema tools
 
 A tool may give `jsonSchema` (a JSON Schema object) instead of a zod `inputSchema`. MControlProgram
