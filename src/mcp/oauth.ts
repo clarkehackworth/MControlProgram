@@ -9,10 +9,12 @@ import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { randomUUID } from 'node:crypto';
 import { getDb, type Row } from '../core/db.js';
-import { randomToken, sha256, verifyPassword } from '../core/crypto.js';
+import { throttle } from '../core/http-guard.js';
+import { hashPassword, randomToken, sha256, verifyPassword } from '../core/crypto.js';
 import { admins } from '../core/store.js';
 import { log } from '../core/logger.js';
 
+const DUMMY = hashPassword('dummy-for-constant-time');
 const ACCESS_TTL = 3600;            // 1h
 const REFRESH_TTL = 30 * 86400;     // 30d
 const CODE_TTL = 600;               // 10m
@@ -72,8 +74,9 @@ export class MControlProgramOAuthProvider implements OAuthServerProvider {
     const b = req.body ?? {};
     let admin = req.cookies?.mcontrolprogram_session ? admins.sessionUser(req.cookies.mcontrolprogram_session) : undefined;
     if (!admin && b.username && b.password) {
+      if (throttle.blocked(req)) { res.status(429).send('too many failed logins; try again later'); return; }
       const a = admins.get(String(b.username));
-      if (a && verifyPassword(String(b.password), a.password_hash)) admin = { id: a.id, username: a.username };
+      if (verifyPassword(String(b.password), a?.password_hash ?? DUMMY) && a) { admin = { id: a.id, username: a.username }; throttle.ok(req); } else throttle.fail(req);
     }
     const redirect = new URL(String(b.redirect_uri ?? ''), 'http://invalid');
     if (!admin) { res.status(401).type('html').send('<p>Authentication failed. <a href="javascript:history.back()">Back</a></p>'); return; }
@@ -110,10 +113,12 @@ export class MControlProgramOAuthProvider implements OAuthServerProvider {
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string, scopes?: string[]): Promise<OAuthTokens> {
-    const r = getDb().prepare(`SELECT * FROM oauth_tokens WHERE token_hash=? AND kind='refresh' AND client_id=? AND server_id=?`)
+    const r = getDb().prepare(`SELECT t.* FROM oauth_tokens t JOIN oauth_clients c ON c.client_id=t.client_id WHERE t.token_hash=? AND t.kind='refresh' AND t.client_id=? AND t.server_id=? AND c.approved=1`)
       .get(sha256(refreshToken), client.client_id, this.serverId) as Row | undefined;
     if (!r || (r.expires_at && r.expires_at < Date.now() / 1000)) throw new Error('invalid refresh token');
     getDb().prepare('DELETE FROM oauth_tokens WHERE token_hash=?').run(r.token_hash);
+    const had = String(r.scopes ?? '').split(' ').filter(Boolean); // refresh may narrow scopes, never widen them
+    if (scopes?.some((x) => !had.includes(x))) throw new Error('requested scope exceeds the original grant');
     return this.issue(client.client_id, scopes?.join(' ') ?? r.scopes, r.resource);
   }
 
@@ -128,7 +133,7 @@ export class MControlProgramOAuthProvider implements OAuthServerProvider {
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const r = getDb().prepare(`SELECT t.*, c.info FROM oauth_tokens t JOIN oauth_clients c ON c.client_id=t.client_id
-      WHERE t.token_hash=? AND t.kind='access' AND t.server_id=?`).get(sha256(token), this.serverId) as Row | undefined;
+      WHERE t.token_hash=? AND t.kind='access' AND t.server_id=? AND c.approved=1`).get(sha256(token), this.serverId) as Row | undefined;
     if (!r) throw new Error('invalid token');
     if (r.expires_at && r.expires_at < Date.now() / 1000) throw new Error('token expired');
     const info = JSON.parse(r.info);

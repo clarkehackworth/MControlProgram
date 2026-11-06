@@ -12,6 +12,7 @@ import { manager } from './mcp/manager.js';
 import { adminApi } from './admin/api.js';
 import { log, pruneLogs } from './core/logger.js';
 import { approvals } from './core/approvals.js';
+import { guard } from './core/http-guard.js';
 import { pruneOAuth } from './mcp/oauth.js';
 
 async function main() {
@@ -25,6 +26,7 @@ async function main() {
 
   const app = express();
   app.disable('x-powered-by');
+  app.use(guard(config.adminHost, config.publicUrl));
   app.use(express.json({ limit: '4mb' }));
   app.use(cookieParser());
   app.use('/api', adminApi());

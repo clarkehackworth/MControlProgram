@@ -168,6 +168,7 @@ export const admins = {
       .get(sessionId, Date.now()) as Row | undefined;
     return r;
   },
+  deleteOtherSessions: (adminId: number, keep?: string) => getDb().prepare('DELETE FROM admin_sessions WHERE admin_id=? AND id<>?').run(adminId, keep ?? ''),
   deleteSession: (id: string) => getDb().prepare('DELETE FROM admin_sessions WHERE id=?').run(id),
   pruneSessions: () => getDb().prepare('DELETE FROM admin_sessions WHERE expires_at<?').run(Date.now()),
 };

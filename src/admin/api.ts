@@ -7,11 +7,13 @@ import { approvals } from '../core/approvals.js';
 import { plugins, loadPlugins, depResolver } from '../core/plugin-loader.js';
 import { manager } from '../mcp/manager.js';
 import { oauthClients } from '../mcp/oauth.js';
-import { verifyPassword } from '../core/crypto.js';
+import { throttle } from '../core/http-guard.js';
+import { hashPassword, verifyPassword } from '../core/crypto.js';
 import { SERVER_LOG_LEVELS, ScopedLogger, log, onLog } from '../core/logger.js';
 import { setting } from '../core/db.js';
 import { getGlobalConfig, setGlobalConfig, GLOBAL_DEFAULTS } from '../core/global-config.js';
 
+const DUMMY_HASH = hashPassword('dummy-for-constant-time');
 const COOKIE = 'mcontrolprogram_session';
 
 // package.json is the single version source; `npm run redeploy` bumps it.
@@ -40,7 +42,7 @@ export function adminApi() {
     const { username, password } = z.object({ username: z.string().min(1).max(64), password: z.string().min(8) }).parse(req.body);
     admins.create(username, password);
     const sid = admins.createSession(admins.get(username)!.id);
-    res.cookie(COOKIE, sid, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 86400e3 });
+    res.cookie(COOKIE, sid, { httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: 7 * 86400e3 });
     log({ level: 'info', category: 'auth', message: `initial admin "${username}" created via setup` });
     return { username };
   }));
@@ -48,10 +50,13 @@ export function adminApi() {
   // ---- auth ----
   r.post('/auth/login', wrap((req, res) => {
     const { username, password } = z.object({ username: z.string(), password: z.string() }).parse(req.body);
+    if (throttle.blocked(req)) { res.status(429).json({ error: 'too many failed logins; try again later' }); return; }
     const a = admins.get(username);
-    if (!a || !verifyPassword(password, a.password_hash)) { log({ level: 'warn', category: 'auth', message: `admin login failed for ${username}` }); res.status(401).json({ error: 'invalid credentials' }); return; }
+    // verify even for unknown users so response time doesn't reveal which usernames exist
+    if (!verifyPassword(password, a?.password_hash ?? DUMMY_HASH) || !a) { throttle.fail(req); log({ level: 'warn', category: 'auth', message: `admin login failed for ${username}` }); res.status(401).json({ error: 'invalid credentials' }); return; }
+    throttle.ok(req);
     const sid = admins.createSession(a.id);
-    res.cookie(COOKIE, sid, { httpOnly: true, sameSite: 'lax', maxAge: 7 * 86400e3 });
+    res.cookie(COOKIE, sid, { httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: 7 * 86400e3 });
     log({ level: 'info', category: 'auth', message: `admin ${username} logged in` });
     return { username };
   }));
@@ -65,6 +70,7 @@ export function adminApi() {
     const a = admins.get((req as any).admin.username)!;
     if (!verifyPassword(current, a.password_hash)) throw new Error('current password incorrect');
     admins.setPassword(a.id, next);
+    admins.deleteOtherSessions(a.id, req.cookies?.[COOKIE]);
   }));
 
   // ---- plugins ----

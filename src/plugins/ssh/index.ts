@@ -15,6 +15,7 @@ import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginAction
 import { effective } from '../../core/global-config.js';
 import { text, errorResult } from '../../core/plugin-api.js';
 import { pluginConfig } from '../../core/store.js';
+import { safeRegex } from '../../core/safe-regex.js';
 import { localClient } from './local.js';
 import * as cmdRules from './rules.js';
 
@@ -147,9 +148,9 @@ function connect(host: HostCfg, cfg: { connectTimeoutMs: number; keepaliveSec: n
 }
 
 function checkCommand(host: HostCfg, cmd: string) {
-  for (const p of host.denyCommands ?? []) if (new RegExp(p).test(cmd)) throw new Error(`command denied by policy (${p})`);
+  for (const p of host.denyCommands ?? []) if (safeRegex(p).test(cmd)) throw new Error(`command denied by policy (${p})`);
   const allow = (host.allowCommands ?? []).filter(Boolean);
-  if (allow.length && !allow.some((p) => new RegExp(p).test(cmd))) throw new Error('command not in allow list');
+  if (allow.length && !allow.some((p) => safeRegex(p).test(cmd))) throw new Error('command not in allow list');
 }
 
 function sftpPath(host: HostCfg, p: string) {
@@ -159,6 +160,15 @@ function sftpPath(host: HostCfg, p: string) {
   const norm = abs.split('/').reduce<string[]>((a, s) => (s === '..' ? (a.pop(), a) : s && s !== '.' ? [...a, s] : a), []).join('/');
   const full = '/' + norm;
   if (full !== root && !full.startsWith(root + '/')) throw new Error(`path outside sftp root ${root}`);
+  // native host: resolve symlinks (of the deepest existing ancestor, so writes to new files work) and re-check.
+  // ponytail: ssh2 hosts stay lexical (needs a chroot/SFTP subsystem on the remote); TOCTOU between check and use remains.
+  if (host.auth === 'native') {
+    let d = full; const tail: string[] = [];
+    for (;;) { try { d = fs.realpathSync(d); break; } catch { const up = path.dirname(d); if (up === d) break; tail.unshift(path.basename(d)); d = up; } }
+    const real = path.join(d, ...tail); const realRoot = fs.realpathSync(root);
+    if (real !== realRoot && !real.startsWith(realRoot + '/')) throw new Error(`path outside sftp root ${root} (symlink)`);
+    return real;
+  }
   return full;
 }
 

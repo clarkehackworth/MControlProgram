@@ -12,6 +12,7 @@ export { ruleMatches, verdict, normalizeBlock, type BlockKind, type RuleAction, 
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { Agent, fetch, Headers, type Response } from 'undici';
+import { safeRegex } from '../../core/safe-regex.js';
 
 interface CredCfg { name: string; urlPattern: string; type: 'header' | 'basic' | 'bearer' | 'query'; headerName?: string; username?: string; secret: string }
 interface Cfg {
@@ -171,7 +172,7 @@ const plugin: MControlProgramPlugin = {
     const allCreds = ((ctx.pluginConfig.credentials as CredCfg[] | undefined) ?? []);
     const creds = allCreds.filter((c) => (cfg.credentials ?? []).includes(c.name) && !(cfg.credentialsDisabled ?? []).includes(c.name));
     let inflight = 0; let total = 0; let failed = 0;
-    const re = (p: string) => new RegExp(p, 'i');
+    const re = (p: string) => safeRegex(p, 'i');
     type Caller = { sessionId?: string; principal?: string };
     const jars = new Map<string, CookieJar>();
     let reaper: NodeJS.Timeout | undefined;
@@ -247,12 +248,12 @@ const plugin: MControlProgramPlugin = {
       inflight++; total++;
       const t0 = Date.now();
       try {
-        let res: Response; let hops = 0; let cred: string | undefined;
+        let res: Response; let hops = 0; let cred: string | undefined; let shown = u.href; // shown = URL without query credentials
         // Redirects are followed manually so each hop gets policy checks and the right cookies.
         for (;;) {
           const headers = new Headers({ 'user-agent': cfg.userAgent, ...(cfg.defaultHeaders ?? {}), ...(hdrs ?? {}) });
           headers.delete('cookie'); // agents never set or see cookies directly; the jar owns them
-          const logged = new URL(u); // before applyCreds: query-type credentials must never reach the log
+          const logged = new URL(u); shown = logged.href; // before applyCreds: query-type credentials must never reach the log
           cred = applyCreds(u, headers);
           const ck = jar?.header(u); if (ck) headers.set('cookie', ck);
           const th = Date.now();
@@ -286,7 +287,7 @@ const plugin: MControlProgramPlugin = {
         }
         const buf = Buffer.concat(chunks);
         ctx.log.connection(`${method} ${u.origin}${u.pathname} -> ${res.status} ${buf.length}b ${Date.now() - t0}ms${cred ? ` cred=${cred}` : ''}${jar ? ` jar=${scopeKey(caller)}` : ''}`, undefined, caller.sessionId);
-        return { res, buf, truncated, finalUrl: u.href };
+        return { res, buf, truncated, finalUrl: shown };
       } catch (e) {
         ctx.log.connection(`${method} ${u.origin}${u.pathname} FAILED ${(e as Error).message}`, undefined, caller.sessionId);
         throw e;

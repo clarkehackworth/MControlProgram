@@ -105,8 +105,9 @@ export const approvals = {
     const now = db.prepare('SELECT status FROM approvals WHERE id=?').get(id) as Row;
     switch (now.status as ApprovalStatus) {
       case 'approved':
-        db.prepare("UPDATE approvals SET status='used' WHERE id=?").run(id);
-        return undefined;
+        // atomic: concurrent identical calls must not all ride one approval
+        if (db.prepare("UPDATE approvals SET status='used' WHERE id=? AND status='approved'").run(id).changes) return undefined;
+        return { status: 'pending', message: 'This approval was already used by a concurrent call. Call again to request approval anew.' };
       case 'denied':
         return { status: 'denied', message: `Denied: a human reviewer rejected this ${req.tool} call. Do not retry it with the same arguments.` };
       case 'expired':

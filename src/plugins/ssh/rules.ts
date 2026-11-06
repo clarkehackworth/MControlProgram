@@ -10,6 +10,7 @@
  * ponytail: a guardrail, not a sandbox. Interpreters (python -c, perl -e, node…) and scripts on disk run code that
  * isn't checked, so a block list is advisory; deny-by-default with a narrow allow list is the real control.
  */
+import { safeRegex } from '../../core/safe-regex.js';
 import { getDb } from '../../core/db.js';
 
 import { analyze, type Analysis, type Cmd } from './shell-parse.js';
@@ -33,13 +34,13 @@ function matchCmd(r: Pick<Rule, 'kind' | 'value'>, c: Cmd): boolean {
   if (r.kind === 'program') return c.program === r.value;
   // whole words: prefix "ls" matches "ls -la" but not "lsblk"
   if (r.kind === 'prefix') return c.text.startsWith(r.value) && (c.text.length === r.value.length || /\W$/.test(r.value) || /\s/.test(c.text[r.value.length]!));
-  if (r.kind === 'regex') try { return new RegExp(r.value).test(c.text); } catch { return false; }
+  if (r.kind === 'regex') try { return safeRegex(r.value).test(c.text); } catch { return false; }
   return false;
 }
 /** write rules are path prefixes by whole components: "/tmp" covers /tmp and /tmp/x, not /tmpfoo. */
 const matchWrite = (r: Pick<Rule, 'kind' | 'value'>, f: string) => r.kind === 'write' && (f === r.value || f.startsWith(r.value.endsWith('/') ? r.value : r.value + '/'));
 const matchLine = (r: Pick<Rule, 'kind' | 'value'>, line: string, a: Analysis) =>
-  a.commands.some((c) => matchCmd(r, c)) || a.writes.some((f) => matchWrite(r, f)) || (r.kind === 'regex' && (() => { try { return new RegExp(r.value).test(line); } catch { return false; } })());
+  a.commands.some((c) => matchCmd(r, c)) || a.writes.some((f) => matchWrite(r, f)) || (r.kind === 'regex' && (() => { try { return safeRegex(r.value).test(line); } catch { return false; } })());
 const label = (r: Pick<Rule, 'kind' | 'value' | 'host'>) => `${r.kind}: ${r.value}${r.host ? ` @${r.host}` : ''}`;
 
 /** Block rules always win; then every command and written file must be allowed (and nothing unanalyzable); then the default. */
@@ -60,7 +61,7 @@ export function normalize(kind: string, raw: string): { kind: Kind; value: strin
   if (!v) throw new Error('value is required');
   if (kind === 'program') { if (/[\s/;&|`$()'"]/.test(v)) throw new Error(`"${v}" is not a program name (no paths, spaces or shell characters)`); return { kind, value: v }; }
   if (kind === 'prefix') return { kind, value: v };
-  if (kind === 'regex') { new RegExp(v); return { kind, value: v }; }
+  if (kind === 'regex') { safeRegex(v); return { kind, value: v }; }
   if (kind === 'write') return { kind, value: v.length > 1 ? v.replace(/\/+$/, '') : v };
   throw new Error(`unknown rule kind "${kind}"`);
 }

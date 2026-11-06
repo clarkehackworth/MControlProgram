@@ -2,6 +2,7 @@
  * One running MCP server: an Express app on its own port, auth, per-agent sessions,
  * and the live set of plugin instances whose tools are exposed.
  */
+import { guard } from '../core/http-guard.js';
 import { z } from 'zod';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
@@ -52,6 +53,7 @@ export class RunningServer {
     for (const rec of instanceStore.listForServer(this.record.id)) if (rec.enabled) await this.loadInstance(rec);
     const app = express();
     app.disable('x-powered-by');
+    app.use(guard(this.record.host, this.record.public_url));
     app.use(express.json({ limit: '8mb' }));
     app.use(express.urlencoded({ extended: false }));
     app.use(cookieParser());
@@ -165,6 +167,7 @@ export class RunningServer {
     if (sid) {
       const s = this.sessions.get(sid);
       if (!s) { res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'session not found' }, id: null }); return; }
+      if (s.principal !== principal) { res.status(403).json({ jsonrpc: '2.0', error: { code: -32003, message: 'session belongs to another principal' }, id: null }); return; }
       s.lastSeen = Date.now();
       await s.transport.handleRequest(req, res, req.body);
       return;

@@ -2,6 +2,7 @@
  * URL access rules shared by the web plugin (enforced here) and the browserpaw plugin (pushed to the
  * BrowserPaw extension and enforced there with declarativeNetRequest). Each plugin has its own list.
  */
+import { safeRegex } from './safe-regex.js';
 import { getDb } from './db.js';
 
 export type BlockKind = 'domain' | 'url' | 'regex';
@@ -18,7 +19,7 @@ export function ruleMatches(r: Pick<Rule, 'kind' | 'value'>, u: URL): boolean {
   const host = canonicalHost(u.hostname);
   if (r.kind === 'domain') return host === r.value || host.endsWith('.' + r.value);
   if (r.kind === 'url') return u.href.startsWith(r.value);
-  try { return new RegExp(r.value, 'i').test(u.href); } catch { return false; }
+  try { return safeRegex(r.value, 'i').test(u.href); } catch { return false; }
 }
 /** Block rules always win; otherwise an allow rule, otherwise the default policy. */
 export function verdict(u: URL, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy): { blocked?: string; allowedBy?: string } {
@@ -47,7 +48,7 @@ export function normalizeBlock(kind: string, raw: string, opts: { re2?: boolean 
     return { kind, value: u.href };
   }
   if (kind === 'regex') {
-    new RegExp(v, 'i');
+    safeRegex(v, 'i');
     if (opts.re2 && NOT_RE2.test(v)) throw new Error("the browser's regex engine (RE2) does not support lookahead/lookbehind or backreferences");
     return { kind, value: v };
   }

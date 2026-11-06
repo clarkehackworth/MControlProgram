@@ -3,6 +3,7 @@
  * holds their credentials, and re-exposes their tools so every call goes through MControlProgram's
  * auth, logging and approval gate. Upstream tool schemas and annotations are forwarded unchanged.
  */
+import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
@@ -50,6 +51,12 @@ const loadOauth = (name: string): { client?: OAuthClientInformationMixed; tokens
   const raw = setting.get(oauthKey(name)); return raw ? JSON.parse(decrypt(raw)) : {};
 };
 const saveOauth = (name: string, patch: Record<string, unknown>) => setting.set(oauthKey(name), encrypt(JSON.stringify({ ...loadOauth(name), ...patch })));
+// state nonce → server name, one live per server, 10 min. The callback only accepts a state we issued (RFC 6749 §10.12).
+const flows = new Map<string, { name: string; exp: number }>();
+const newFlow = (name: string) => {
+  for (const [k, f] of flows) if (f.name === name || f.exp < Date.now()) flows.delete(k);
+  const n = randomBytes(24).toString('base64url'); flows.set(n, { name, exp: Date.now() + 600_000 }); return n;
+};
 const pendingAuth = new Map<string, URL>(); // server name → authorization URL captured during connect
 const redirectUrl = () => `${mcontrolprogramConfig.publicUrl ?? `http://${mcontrolprogramConfig.adminHost}:${mcontrolprogramConfig.adminPort}`}/api/plugins/mcp/callback`;
 
@@ -57,7 +64,7 @@ function oauthProvider(name: string): OAuthClientProvider {
   return {
     get redirectUrl() { return redirectUrl(); },
     get clientMetadata() { return { client_name: 'MControlProgram', redirect_uris: [redirectUrl()], grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: 'none' }; },
-    state: () => name, // ponytail: state carries the server name back to the callback; CSRF covered by the admin session cookie
+    state: () => newFlow(name),
     clientInformation: () => loadOauth(name).client,
     saveClientInformation: (client) => saveOauth(name, { client }),
     tokens: () => loadOauth(name).tokens,
@@ -161,7 +168,9 @@ const plugin: MControlProgramPlugin = {
       title: 'OAuth callback (internal)',
       async run({ code, state, error, error_description }, { config }) {
         if (error) throw new Error(`${error}: ${error_description ?? ''}`);
-        const s = (config.servers as ServerCfg[]).find((x) => x.name === state);
+        const flow = flows.get(String(state)); flows.delete(String(state));
+        if (!flow || flow.exp < Date.now()) throw new Error('unknown or expired authorization flow; start it again from the MCP plugin page');
+        const s = (config.servers as ServerCfg[]).find((x) => x.name === flow.name);
         if (!s || !code) throw new Error('unknown server or missing code');
         const transport = makeTransport(s) as StreamableHTTPClientTransport;
         await transport.finishAuth(String(code));
