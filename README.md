@@ -26,17 +26,34 @@ agent's exposure at any moment is limited to what you have deliberately opened u
 
 **BrowserPaw** — isolated Chromium profiles on SSH, native or manual hosts, each with its own logins and bridge. Agents get browser tools and never see SSH access or the bridge token.
 
+Every BrowserPaw browser runs from its own dedicated Chromium user-data directory, so profiles are **completely separate** from each other (cookies, logins, history and extensions are never shared) and from the main user's everyday browser on that computer. An agent working in one profile cannot see another profile's sessions, or yours.
+
 ![BrowserPaw plugin: browser hosts and profiles](docs/images/browserpaw-hosts.png)
 
 BrowserPaw has its own URL access rules, pushed to every profile (fail closed if a browser is out of sync), and a per-agent log of everything the browser loads or is refused.
 
 ![BrowserPaw plugin: URL access rules and request log](docs/images/browserpaw-policy.png)
 
-```
- agent (Claude Code, Cursor, …)  ──MCP/HTTP + auth──▶  MControlProgram MCP server :7801  ──▶  ssh plugin ──▶ hosts
- agent                            ──MCP/HTTP + auth──▶  MControlProgram MCP server :7802  ──▶  web plugin ──▶ APIs
-                                                              ▲
-                                             admin UI :7700 ──┘  (servers, plugins, tokens, logs)
+## Architecture
+
+```text
+              ┌──────────────────────────────┐
+              │  AI agent (sandboxed)        │
+              │  Claude Code, Cursor, …      │
+              └──────────────┬───────────────┘
+                             │ MCP/HTTP + auth
+                             ▼
+              ┌──────────────────────────────┐
+              │  MCP server  :7801           │
+              │  tokens / OAuth, logging     │
+              └───────┬──────────┬───────────┘
+          ┌───────────┘          │          └───────────┐
+          ▼                      ▼                      ▼
+   ┌─────────────┐        ┌─────────────┐        ┌─────────────┐
+   │ ssh plugin  │        │ web plugin  │        │ browserpaw  │
+   └──────┬──────┘        └──────┬──────┘        └──────┬──────┘
+          ▼                      ▼                      ▼
+      SSH hosts             APIs / sites          Chromium isolated profiles
 ```
 
 - **Multiple MCP servers**, each on its own port with its own plugins, auth mode, and log level.
