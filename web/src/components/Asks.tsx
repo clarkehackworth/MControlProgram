@@ -5,6 +5,8 @@ import { SshRuleDialog } from '../plugins/SshCommands'
 import { UrlRuleDialog } from '../plugins/WebTraffic'
 
 type RuleAction = 'allow' | 'block'
+/** Asks whose rule is a single per-tool switch: set it directly, no dialog. */
+const direct = (a: Approval) => a.feature === 'tool' || a.feature === 'mcp_tool'
 const urlNoQuery = (u: string) => { try { const x = new URL(u); return x.origin + x.pathname } catch { return u } }
 
 /** Prefill for SSH's rule dialog: block the programs; allow the narrowest thing that lets this line run (written files may still need their own rule). */
@@ -27,10 +29,12 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty 
   const decide = (a: Approval, d: 'approved' | 'denied') => api(`/approvals/${a.id}/${d}`, { method: 'POST' })
   const once = (a: Approval, d: 'approved' | 'denied') => run(async () => { await decide(a, d); await reload() })
   const addRule = (a: Approval, action: RuleAction) => {
-    if (a.feature !== 'tool') return setDialog({ a, action })
-    // core tool gate: the rule is the instance's per-tool rule
+    if (!direct(a)) return setDialog({ a, action })
     void run(async () => {
-      await api(`/instances/${a.instance_id}/tool-rules/${encodeURIComponent(a.subject?.tool ?? a.tool)}`, { method: 'PUT', body: { rule: action === 'allow' ? 'allow' : 'deny' } })
+      const rule = action === 'allow' ? 'allow' : 'deny'
+      // MCP pass-through: the upstream tool's rule; core tool gate: the instance's per-tool rule
+      if (a.feature === 'mcp_tool') await api(`/plugins/mcp/actions/set_tool_rule`, { method: 'POST', body: { upstream: a.subject?.upstream, tool: a.subject?.tool, action: rule } })
+      else await api(`/instances/${a.instance_id}/tool-rules/${encodeURIComponent(a.subject?.tool ?? a.tool)}`, { method: 'PUT', body: { rule } })
       await decide(a, action === 'allow' ? 'approved' : 'denied'); await reload()
     })
   }
@@ -56,8 +60,8 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty 
             </div>
             <div className="row" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               <button className="primary sm" disabled={busy} onClick={() => once(a, 'approved')} title="Run this one call">Allow once</button>
-              <button className="sm" disabled={busy} onClick={() => addRule(a, 'allow')} title={a.feature === 'tool' ? `Always allow ${a.tool}` : 'Add an allow rule, then allow this call'}>Add allow rule{a.feature === 'tool' ? '' : '…'}</button>
-              <button className="sm danger" disabled={busy} onClick={() => addRule(a, 'block')} title={a.feature === 'tool' ? `Disable ${a.tool}` : 'Add a block rule, then deny this call'}>Add block rule{a.feature === 'tool' ? '' : '…'}</button>
+              <button className="sm" disabled={busy} onClick={() => addRule(a, 'allow')} title={direct(a) ? `Always allow ${a.summary || a.tool}` : 'Add an allow rule, then allow this call'}>{direct(a) ? 'Enable tool' : 'Add allow rule…'}</button>
+              <button className="sm danger" disabled={busy} onClick={() => addRule(a, 'block')} title={direct(a) ? `Disable ${a.summary || a.tool}` : 'Add a block rule, then deny this call'}>{direct(a) ? 'Disable tool' : 'Add block rule…'}</button>
               <button className="sm" disabled={busy} onClick={() => once(a, 'denied')} title="Refuse this one call">Deny once</button>
             </div>
           </div>

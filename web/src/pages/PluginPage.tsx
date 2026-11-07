@@ -9,6 +9,7 @@ import PairServer from '../plugins/PairServer'
 import SshDeleteHost from '../plugins/SshDeleteHost'
 import WebTraffic from '../plugins/WebTraffic'
 import SshCommands from '../plugins/SshCommands'
+import McpTools from '../plugins/McpTools'
 
 /** Array-of-object properties of a plugin's global config (SSH hosts, upstream servers, credentials…). */
 export function inventoryKeys(p: PluginMeta): string[] {
@@ -16,7 +17,7 @@ export function inventoryKeys(p: PluginMeta): string[] {
 }
 
 // ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
-const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key', 'requests', 'rules', 'rule', 'delete_rule', 'set_policy', 'clear_requests', 'sync_status', 'commands', 'clear_commands', 'preview', 'explain', 'deny_candidates']
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key', 'requests', 'rules', 'rule', 'delete_rule', 'set_policy', 'clear_requests', 'sync_status', 'commands', 'clear_commands', 'preview', 'explain', 'deny_candidates', 'tool_rules', 'set_tool_rule', 'calls', 'clear_calls']
 
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
@@ -34,6 +35,8 @@ export default function PluginPage() {
       {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} options={optionSources(p, plugins)} />)}
       {p.id === 'web' && <WebTraffic />}
       {p.id === 'browserpaw' && <WebTraffic plugin="browserpaw" />}
+      {p.id === 'mcp' && <McpTools upstreams={((p.globalConfig?.servers ?? []) as { name: string }[]).map((s) => s.name)} />}
+
       {p.id === 'ssh' && <SshCommands hosts={((p.globalConfig?.hosts ?? []) as { name: string }[]).map((h) => h.name)} />}
     </>
   )

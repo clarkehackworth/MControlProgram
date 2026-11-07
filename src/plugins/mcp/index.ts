@@ -17,6 +17,8 @@ import { encrypt, decrypt } from '../../core/crypto.js';
 import { config as mcontrolprogramConfig } from '../../core/config.js';
 import { pluginConfig } from '../../core/store.js';
 import { openTunnel, type HostCfg } from '../ssh/index.js';
+import { ask } from '../../core/plugin-api.js';
+import * as toolRules from './rules.js';
 
 interface ServerCfg {
   name: string; description?: string; transport: 'http' | 'stdio';
@@ -122,7 +124,7 @@ const plugin: MControlProgramPlugin = {
   id: 'mcp',
   name: 'MCP pass-through',
   version: '0.1.0',
-  description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with logging, an expose/hide list, and the gateway allow/ask/deny tool rules.',
+  description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with a call log, an expose/hide list, and per-tool allow/ask/deny rules.',
   globalConfigSchema: {
     type: 'object',
     properties: {
@@ -131,7 +133,9 @@ const plugin: MControlProgramPlugin = {
     },
   },
   defaultGlobalConfig: { servers: [], callTimeoutMs: 60000 },
+  onRenamed: (key, from, to) => { if (key === 'servers') toolRules.renameUpstream(from, to); },
   globalActions: {
+    ...toolRules.actions,
     test_server: {
       title: 'Test server',
       async run({ name }, { config, log }) {
@@ -139,9 +143,10 @@ const plugin: MControlProgramPlugin = {
         if (!s) throw new Error('unknown server');
         try {
           const { client } = await connect(s, log);
-          const tools = (await client.listTools()).tools.map((t) => t.name);
+          const list = (await client.listTools()).tools;
           await client.close();
-          return { ok: true, serverInfo: client.getServerVersion?.(), tools };
+          toolRules.seen(s.name, list);
+          return { ok: true, serverInfo: client.getServerVersion?.(), tools: list.map((t) => t.name) };
         } catch (e) {
           if (e instanceof UnauthorizedError) return { ok: false, needsAuthorization: true, authorizeUrl: pendingAuth.get(s.name)?.toString(), error: 'not authorized: run "Authorize (OAuth)"' };
           throw e;
@@ -191,7 +196,7 @@ const plugin: MControlProgramPlugin = {
       servers: { type: 'array', title: 'Servers to expose', description: 'Empty = no servers.', items: { type: 'string', 'x-options-from': 'servers' }, 'x-disabled-key': 'serversDisabled', default: [] },
       serversDisabled: { type: 'array', items: { type: 'string' }, 'x-hidden': true, default: [] },
       flat: { type: 'boolean', title: 'Flat tool names', description: 'Do not prefix tool names with the server name (use when exposing a single server)', default: false },
-      allowTools: { type: 'array', title: 'Expose only these tools', description: 'Upstream tool names (or server/tool); empty = all. Hidden tools are not listed to agents. To allow, ask or deny calls to exposed tools, use Tool rules on the server.', items: { type: 'string' }, default: [] },
+      allowTools: { type: 'array', title: 'Expose only these tools', description: 'Upstream tool names (or server/tool); empty = all. Hidden tools are not listed to agents. To allow, ask or deny calls to exposed tools, use Access rules on the MCP pass-through plugin page.', items: { type: 'string' }, default: [] },
       denyTools: { type: 'array', title: 'Hide these tools', description: 'Upstream tool names (or server/tool). Wins over the expose list.', items: { type: 'string' }, default: [] },
       idleDisconnectSec: { type: 'integer', title: 'Idle disconnect (seconds)', description: '0 = MControlProgram default', default: 0 },
     },
@@ -232,6 +237,7 @@ const plugin: MControlProgramPlugin = {
           try {
             const c = await client(s);
             const list = (await c.listTools()).tools;
+            toolRules.seen(s.name, list);
             let n = 0;
             for (const t of list) {
               if (!allowed(s.name, t.name)) continue;
@@ -243,9 +249,23 @@ const plugin: MControlProgramPlugin = {
                 jsonSchema: t.inputSchema as Record<string, any>,
                 annotations: t.annotations as ToolDefinition['annotations'],
                 async handler(args, call) {
-                  const c = await client(s);
-                  const r = await c.callTool({ name: t.name, arguments: args }, undefined, { signal: call.signal, timeout: g.callTimeoutMs });
-                  return r as unknown as ToolResult;
+                  const t0 = Date.now();
+                  const entry = { serverId: ctx.serverId, instance: ctx.instanceName, principal: call.principal, upstream: s.name, tool: t.name, args };
+                  const rec = (e: Partial<toolRules.LogEntry>) => { try { toolRules.record({ ...entry, ...e }); } catch (err) { ctx.log.warn(`call log write failed: ${(err as Error).message}`); } };
+                  // read live per call: rule changes apply without reconnecting
+                  const v = toolRules.verdict(s.name, t.name);
+                  if (v.action === 'deny') { rec({ blocked: v.by }); throw new Error(`${s.name}/${t.name} is disabled by the administrator. Tell the user if you need it.`); }
+                  let allowedBy = v.by;
+                  if (v.action === 'ask') {
+                    try { allowedBy = `approved by ${await ask(call, { feature: 'mcp_tool', summary: `${s.name}/${t.name}`, reason: v.by, subject: { upstream: s.name, tool: t.name, args } })}`; }
+                    catch (e) { rec({ blocked: `awaiting approval: ${v.by}` }); throw e; }
+                  }
+                  try {
+                    const c = await client(s);
+                    const r = await c.callTool({ name: t.name, arguments: args }, undefined, { signal: call.signal, timeout: g.callTimeoutMs }) as unknown as ToolResult;
+                    rec({ allowedBy, ms: Date.now() - t0, error: r.isError ? String((r.content?.[0] as any)?.text ?? 'error').slice(0, 500) : undefined });
+                    return r;
+                  } catch (e) { rec({ allowedBy, ms: Date.now() - t0, error: String((e as Error).message ?? e) }); throw e; }
                 },
               });
             }

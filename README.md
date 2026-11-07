@@ -126,9 +126,11 @@ MControlProgram endpoint can front many upstreams with a single login, one log, 
 Configure upstreams on the Plugins page: Streamable HTTP (none / bearer / custom header / OAuth
 2.1 with dynamic registration) or stdio (command, args, env). Secrets such as tokens and env
 values are stored encrypted and never leave MControlProgram; the agent sees only the tools. An instance
-picks which upstreams to expose, optionally flattens names, and can allow or deny individual tools.
-Upstream input schemas and annotations pass through unchanged, so "approve tools that are not
-read-only" works on proxied tools too. For OAuth upstreams, run **Authorize (OAuth)** in the plugin
+picks which upstreams to expose, optionally flattens names, and can hide individual tools.
+The plugin page lists every upstream tool with an **allow / ask / deny** switch, a default policy
+(new installs: ask by default), pending asks (*Enable tool* / *Disable tool* set the switch), and a
+log of every proxied call. Upstream input schemas and annotations pass through unchanged, so
+"approve tools that are not read-only" works on proxied tools too. For OAuth upstreams, run **Authorize (OAuth)** in the plugin
 config and open the link; set `MCONTROLPROGRAM_PUBLIC_URL` if the authorization server must redirect to a
 public address.
 
