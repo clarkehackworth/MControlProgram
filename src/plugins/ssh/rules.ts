@@ -5,6 +5,7 @@
  * Command lines are parsed by shell-parse.ts into every command they run (including through pipes, lists,
  * substitutions, wrappers like sudo/xargs/find -exec, and sh -c / ssh host "…" strings) plus output-redirect targets.
  *   block: any command, written file, or (regex) the whole line matches a block rule;
+ *   ask:   otherwise, the same for an ask rule: a human approves the line (approvals);
  *   allow: under deny-by-default every command and written file must match an allow rule, and the line must be
  *   fully analyzable (no program names or scripts built from $VARs / $( ), no shell reading stdin, no syntax errors).
  * ponytail: a guardrail, not a sandbox. Interpreters (python -c, perl -e, node…) and scripts on disk run code that
@@ -16,8 +17,9 @@ import { getDb } from '../../core/db.js';
 import { analyze, type Analysis, type Cmd } from './shell-parse.js';
 
 export type Kind = 'program' | 'prefix' | 'regex' | 'write';
-export type Action = 'block' | 'allow';
-export type Policy = 'allow' | 'deny';
+export type Action = 'block' | 'ask' | 'allow';
+export type Policy = 'allow' | 'ask' | 'deny';
+const ACTIONS = ['block', 'ask', 'allow'], POLICIES = ['allow', 'ask', 'deny'];
 export interface Rule { id: number; action: Action; kind: Kind; value: string; host: string; note: string; created_at: number }
 type R = Pick<Rule, 'action' | 'kind' | 'value' | 'host'>;
 
@@ -43,16 +45,20 @@ const matchLine = (r: Pick<Rule, 'kind' | 'value'>, line: string, a: Analysis) =
   a.commands.some((c) => matchCmd(r, c)) || a.writes.some((f) => matchWrite(r, f)) || (r.kind === 'regex' && (() => { try { return safeRegex(r.value).test(line); } catch { return false; } })());
 const label = (r: Pick<Rule, 'kind' | 'value' | 'host'>) => `${r.kind}: ${r.value}${r.host ? ` @${r.host}` : ''}`;
 
-/** Block rules always win; then every command and written file must be allowed (and nothing unanalyzable); then the default. */
-export function verdict(line: string, host: string, list: R[], def: Policy): { blocked?: string; allowedBy?: string } {
+/** Block rules always win, then ask rules; then every command and written file must be allowed (and nothing unanalyzable); then the default. */
+export function verdict(line: string, host: string, list: R[], def: Policy): { blocked?: string; ask?: string; allowedBy?: string } {
   const rs = list.filter((r) => !r.host || r.host === host);
   const a = parse(line);
   const b = rs.find((r) => r.action === 'block' && matchLine(r, line, a));
   if (b) return { blocked: label(b) };
+  const q = rs.find((r) => r.action === 'ask' && matchLine(r, line, a));
+  if (q) return { ask: label(q) };
   const allows = rs.filter((r) => r.action === 'allow');
   const by = [...a.commands.map((c) => allows.find((r) => matchCmd(r, c))), ...a.writes.map((f) => allows.find((r) => matchWrite(r, f)))];
   if (!a.unknown.length && by.every(Boolean)) return { allowedBy: by.length ? [...new Set(by.map((r) => label(r!)))].join(', ') : 'nothing to run' };
   if (def === 'allow') return { allowedBy: 'default: allow' };
+  // a human reading the line can judge what the parser can't
+  if (def === 'ask') return { ask: a.unknown.length ? `default: ask (cannot check: ${a.unknown[0]})` : 'default: ask' };
   return { blocked: a.unknown.length ? `cannot check: ${a.unknown[0]}` : 'default: deny' };
 }
 
@@ -87,7 +93,7 @@ export function renameHost(from: string, to: string) { db().prepare('UPDATE OR I
 let ruleCache: Rule[] | undefined;
 let policyCache: Policy | undefined;
 export const rules = () => (ruleCache ??= db().prepare('SELECT * FROM ssh_rules ORDER BY action, kind, value').all() as Rule[]);
-export const policy = (): Policy => (policyCache ??= ((db().prepare("SELECT v FROM ssh_policy WHERE k='default'").get() as any)?.v === 'deny' ? 'deny' : 'allow'));
+export const policy = (): Policy => (policyCache ??= (((v) => POLICIES.includes(v) ? v : 'allow')((db().prepare("SELECT v FROM ssh_policy WHERE k='default'").get() as any)?.v) as Policy));
 const changed = () => { ruleCache = undefined; policyCache = undefined; };
 
 export interface LogEntry { serverId?: string; instance?: string; principal?: string; host: string; tool: string; command: string; exitCode?: number | null; error?: string; blocked?: string; allowedBy?: string; ms?: number }
@@ -96,6 +102,12 @@ export function record(e: LogEntry) {
     .run(Date.now(), e.serverId ?? null, e.instance ?? null, e.principal ?? null, e.host, e.tool, e.command, e.exitCode ?? null, e.error ?? null, e.blocked ?? null, e.allowedBy ?? null, e.ms ?? null);
 }
 export const prune = (days: number) => db().prepare('DELETE FROM ssh_commands WHERE ts < ?').run(Date.now() - days * 86400_000);
+
+/** What the UI needs to offer rules for a line (programs, single command, written files), so it needs no copy of the parser. */
+export function describe(line: string) {
+  const a = parse(line);
+  return { programs: programs(line), writes: [...new Set(a.writes)], unknown: a.unknown, single: a.commands.length === 1 ? a.commands[0]!.text : undefined };
+}
 
 const isCmd = (tool: string) => tool === 'exec' || tool === 'shell';
 const recent = () => db().prepare("SELECT * FROM ssh_commands WHERE ts >= ? AND tool IN ('exec','shell') ORDER BY ts DESC LIMIT 5000").all(Date.now() - 7 * 86400e3) as any[];
@@ -115,7 +127,7 @@ export const actions = {
     const rows = db().prepare(`SELECT * FROM ssh_commands WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1) as any[];
     const rs = rules(); const p = policy();
     // what the current rules would say, and the programs, so the page needs no copy of the parser
-    for (const r of rows) if (isCmd(r.tool)) { const v = verdict(r.command, r.host, rs, p); r.now_blocked = !!v.blocked; const a = parse(r.command); r.programs = programs(r.command); r.writes = [...new Set(a.writes)]; r.unknown = a.unknown; if (a.commands.length === 1) r.single = a.commands[0]!.text; }
+    for (const r of rows) if (isCmd(r.tool)) { const v = verdict(r.command, r.host, rs, p); r.now_blocked = !!v.blocked; r.now_ask = !!v.ask; Object.assign(r, describe(r.command)); }
     return { rows: rows.slice(0, limit), more: rows.length > limit };
   } },
   rules: { title: 'Command rules', run: async () => ({ policy: policy(), rules: rules() }) },
@@ -125,16 +137,18 @@ export const actions = {
     const rows = recent().filter((x) => !r.host || x.host === r.host);
     const hits = rows.filter((x) => matchLine(r, x.command, parse(x.command)));
     const probes = [...hits.map((x) => [x.command, x.host]), ...(command ? [[String(command), r.host]] : []), ...(r.kind === 'write' ? [[`true > '${r.value.replace(/'/g, `'\\''`)}'`, r.host]] : r.kind !== 'regex' ? [[r.value, r.host]] : [])] as [string, string][];
-    const conflicts = action === 'allow' ? rules().filter((b) => b.action === 'block' && (!b.host || !r.host || b.host === r.host) && probes.some(([c, h]) => verdict(c, h || b.host, [b], 'allow').blocked)) : [];
+    // rules that override the draft: blocks override asks and allows, asks override allows
+    const over = action === 'allow' ? ['block', 'ask'] : action === 'ask' ? ['block'] : [];
+    const conflicts = rules().filter((b) => over.includes(b.action) && (!b.host || !r.host || b.host === r.host) && probes.some(([c, h]) => { const v = verdict(c, h || b.host, [b], 'allow'); return v.blocked || v.ask; }));
     return { total: rows.length, hits: hits.length, example: hits[0]?.command, conflicts };
   } },
   /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks in the way of a new allow).
    *  With the default at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
   rule: { title: 'Add rule', run: async ({ action, kind, value, host, note, remove }: any) => {
-    if (action !== 'block' && action !== 'allow') throw new Error('action must be block or allow');
+    if (!ACTIONS.includes(action)) throw new Error('action must be block, ask or allow');
     const r = normalize(kind, value);
     const d = db();
-    const store = action === 'block' || policy() === 'deny';
+    const store = action !== 'allow' || policy() !== 'allow';
     d.transaction(() => {
       for (const id of (Array.isArray(remove) ? remove : [])) d.prepare('DELETE FROM ssh_rules WHERE id=?').run(Number(id));
       if (store) d.prepare('INSERT INTO ssh_rules(action,kind,value,host,note,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(kind,value,host) DO UPDATE SET action=excluded.action, note=excluded.note, created_at=excluded.created_at')
@@ -156,11 +170,11 @@ export const actions = {
   } },
   /** Switch the default policy; `allow` = programs to add as allow rules in the same step. */
   set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }: any) => {
-    if (p !== 'allow' && p !== 'deny') throw new Error('policy must be allow or deny');
+    if (!POLICIES.includes(p)) throw new Error('policy must be allow, ask or deny');
     const d = db();
     const progs = (Array.isArray(allow) ? allow : []).map((x: string) => normalize('program', x).value);
     d.transaction(() => {
-      for (const v of progs) d.prepare("INSERT INTO ssh_rules(action,kind,value,host,note,created_at) VALUES('allow','program',?,'','added when switching to deny',?) ON CONFLICT(kind,value,host) DO NOTHING").run(v, Date.now());
+      for (const v of progs) d.prepare("INSERT INTO ssh_rules(action,kind,value,host,note,created_at) VALUES('allow','program',?,'','added when switching default',?) ON CONFLICT(kind,value,host) DO NOTHING").run(v, Date.now());
       d.prepare("INSERT INTO ssh_policy(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(p);
     })();
     changed(); return { policy: p };

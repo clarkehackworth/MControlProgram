@@ -155,9 +155,19 @@ export function adminApi() {
   r.post('/servers/:id/restart', wrap(async (req) => { const id = req.params.id as string; await manager.stop(id); await manager.start(id); return serverView(id); }));
   r.delete('/servers/:id/sessions/:sid', wrap(async (req) => { await manager.get(req.params.id as string)?.closeSession(req.params.sid as string, 'closed by admin'); }));
 
-  const approvalSchema = z.object({ mode: z.enum(['none', 'writes', 'all', 'list']), tools: z.array(z.string()).optional() });
+  const toolRule = z.enum(['allow', 'ask', 'deny']);
+  const approvalSchema = z.object({ mode: z.enum(['none', 'writes', 'all']), rules: z.record(z.string(), toolRule).optional() });
   // ---- approvals (human-in-the-loop gate) ----
-  r.get('/approvals', wrap(() => ({ pending: approvals.list('pending'), recent: approvals.list('decided', 50) })));
+  r.get('/approvals', wrap((req) => { const plugin = typeof req.query.plugin === 'string' ? req.query.plugin : undefined; return { pending: approvals.list('pending', { plugin }), recent: approvals.list('decided', { limit: 50, plugin }) }; }));
+  // "Add allow/block rule" for the core tool gate. Applied live (the gate re-reads it per call): no instance reload.
+  r.put('/instances/:iid/tool-rules/:tool', wrap((req) => {
+    const inst = instances.get(req.params.iid as string); if (!inst) throw new Error('not found');
+    const rule = z.object({ rule: toolRule.nullable() }).parse(req.body).rule;
+    const rules = { ...inst.approval.rules };
+    if (rule) rules[req.params.tool as string] = rule; else delete rules[req.params.tool as string];
+    return instances.update(inst.id, { approval: { ...inst.approval, rules } }).approval;
+  }));
+  r.post('/approvals/:id/reopen', wrap((req) => approvals.reopen(req.params.id as string, (req as any).admin?.username ?? 'admin')));
   r.post('/approvals/:id/:decision', wrap((req) => {
     const d = z.enum(['approved', 'denied']).parse(req.params.decision);
     return approvals.decide(req.params.id as string, d, (req as any).admin?.username ?? 'admin');
@@ -174,7 +184,8 @@ export function adminApi() {
   r.put('/instances/:iid', wrap(async (req) => {
     const patch = z.object({ name: z.string().regex(/^[a-zA-Z0-9_-]+$/).optional(), enabled: z.boolean().optional(), config: z.record(z.string(), z.any()).optional(), position: z.number().int().optional(), approval: approvalSchema.optional() }).parse(req.body);
     const inst = instances.update(req.params.iid as string, patch);
-    await manager.applyInstance(inst.id, inst.server_id);
+    // approval is read live per call; changing only it must not drop shells / cookie jars
+    if (Object.keys(patch).some((k) => k !== 'approval')) await manager.applyInstance(inst.id, inst.server_id);
     return serverView(inst.server_id);
   }));
   r.delete('/instances/:iid', wrap(async (req) => {

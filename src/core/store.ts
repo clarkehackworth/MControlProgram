@@ -19,12 +19,22 @@ export interface PluginInstanceRecord {
   approval: ApprovalPolicy;
 }
 
-/** Which tools of an instance need a human to approve each call in the admin UI. */
-export interface ApprovalPolicy { mode: 'none' | 'writes' | 'all' | 'list'; tools?: string[] }
+export type ToolRule = 'allow' | 'ask' | 'deny';
+/**
+ * Per-instance tool gate. `rules` (short tool name → allow/ask/deny) win; other tools follow `mode`:
+ * none = allow, writes = ask unless read-only, all = ask.
+ */
+export interface ApprovalPolicy { mode: 'none' | 'writes' | 'all'; rules?: Record<string, ToolRule> }
+
+/** Older rows stored `{ mode: 'list', tools: [...] }`: those tools ask, the rest are allowed. */
+export function normalizeApproval(a: any): ApprovalPolicy {
+  if (a?.mode === 'list') return { mode: 'none', rules: { ...Object.fromEntries((a.tools ?? []).map((t: string) => [t, 'ask'])), ...a.rules } };
+  return { mode: a?.mode === 'writes' || a?.mode === 'all' ? a.mode : 'none', rules: a?.rules ?? {} };
+}
 
 const bool = (v: any) => !!v;
 const rowToServer = (r: Row): ServerRecord => ({ ...r, enabled: bool(r.enabled) } as ServerRecord);
-const rowToInstance = (r: Row): PluginInstanceRecord => ({ ...r, enabled: bool(r.enabled), config: JSON.parse(r.config), approval: JSON.parse(r.approval || '{"mode":"none"}') } as PluginInstanceRecord);
+const rowToInstance = (r: Row): PluginInstanceRecord => ({ ...r, enabled: bool(r.enabled), config: JSON.parse(r.config), approval: normalizeApproval(JSON.parse(r.approval || '{}')) } as PluginInstanceRecord);
 
 export const servers = {
   list: (): ServerRecord[] => (getDb().prepare('SELECT * FROM servers ORDER BY port').all() as Row[]).map(rowToServer),

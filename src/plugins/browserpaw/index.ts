@@ -474,7 +474,7 @@ const plugin: MControlProgramPlugin = {
 
     const policyTool: ToolDefinition = {
       name: 'policy',
-      description: 'Show the administrator\'s browser URL policy (default allow/deny and the block/allow rules). Every profile enforces it on everything the browser loads; non-web schemes (file:, chrome:, ssh:, ...) are always refused.',
+      description: 'Show the administrator\'s browser URL policy (default allow/ask/deny and the block/ask/allow rules; ask = a human approves URLs you pass to tools). Every profile enforces it on everything the browser loads; non-web schemes (file:, chrome:, ssh:, ...) are always refused.',
       annotations: { readOnlyHint: true },
       handler: async () => text(JSON.stringify({ defaultPolicy: policy.store.policy(), rules: policy.store.rules().map(({ action, kind, value }) => ({ action, kind, value })) }, null, 2)),
     };
@@ -490,7 +490,7 @@ const plugin: MControlProgramPlugin = {
           try {
             const { profile, ...rest } = args ?? {};
             const name = pick(profile);
-            const prepared = policy.prepareCall(name, t.name, rest, call);
+            const prepared = await policy.prepareCall(name, t.name, rest, call);
             const run = async () => (await (await client(name)).callTool({ name: t.name, arguments: prepared }, undefined, { signal: call.signal, timeout: g.callTimeoutMs })) as unknown as ToolResult;
             try { return await run(); } catch (e) {
               // The browser (and so its bridge) restarted: our cached MCP session is gone. Reconnect once.
@@ -513,7 +513,7 @@ const plugin: MControlProgramPlugin = {
 - Prefer the numbered tools over CSS selectors; use {prefix}_chrome_batch_actions for 2+ predictable steps.
 - Use screenshots / {prefix}_chrome_computer only for canvas or unlabeled UIs. For CAPTCHA, 2FA or payments, call {prefix}_chrome_request_human_intervention.
 - Close tabs you opened when done.
-- The administrator's URL policy applies to everything the browser loads (see {prefix}_policy). Blocked URLs fail; don't retry them or look for workarounds.`,
+- The administrator's URL policy applies to everything the browser loads (see {prefix}_policy). Blocked URLs fail; tell the user, and don't look for workarounds.`,
       start() {
         // Learn tools from profiles that are already running; never launch browsers at gateway start.
         for (const n of names) if (cachedTools(n).length === 0) {

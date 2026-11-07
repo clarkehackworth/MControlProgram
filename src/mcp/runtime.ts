@@ -15,11 +15,11 @@ import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { MControlProgramOAuthProvider } from './oauth.js';
 import { servers as serverStore, instances as instanceStore, bearerTokens, pluginConfig, type ServerRecord, type PluginInstanceRecord } from '../core/store.js';
-import { approvals } from '../core/approvals.js';
+import { approvals, ApprovalError } from '../core/approvals.js';
 import { plugins, depResolver } from '../core/plugin-loader.js';
 import { ScopedLogger, log } from '../core/logger.js';
 import { getGlobalConfig } from '../core/global-config.js';
-import type { MControlProgramPlugin, PluginInstance, ToolDefinition } from '../core/plugin-api.js';
+import type { AskSpec, MControlProgramPlugin, PluginInstance, ToolDefinition } from '../core/plugin-api.js';
 
 interface LiveInstance { record: PluginInstanceRecord; plugin: MControlProgramPlugin; instance: PluginInstance; error?: string; log: ScopedLogger }
 interface Session {
@@ -243,11 +243,24 @@ export class RunningServer {
     session.calls++; session.lastSeen = t0;
     const lvl = this.record.log_level;
     try {
-      if (approvals.needsApproval(li.record.approval, tool)) {
-        const gate = await approvals.gate({ serverId: this.record.id, instanceId: li.record.id, instanceName: li.record.name, tool: fullName, principal: session.principal, sessionId: session.id, args: args ?? {}, signal: extra.signal });
-        if (gate) { if (lvl === 'tools' || lvl === 'full') log({ level: 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id, message: `${fullName} by ${session.principal} ${gate.status}` }); return { content: [{ type: 'text', text: gate.message }], isError: true }; }
+      const base = { serverId: this.record.id, instanceId: li.record.id, instanceName: li.record.name, pluginId: li.plugin.id, tool: fullName, principal: session.principal, sessionId: session.id, args: args ?? {}, signal: extra.signal };
+      const refuse = (status: string, message: string) => {
+        if (lvl === 'tools' || lvl === 'full') log({ level: 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id, message: `${fullName} by ${session.principal} ${status}` });
+        return { content: [{ type: 'text' as const, text: message }], isError: true };
+      };
+      // read live: tool rules change from the Approvals page without reloading the instance (shells, cookie jars)
+      const rule = approvals.toolRule(instanceStore.get(li.record.id)?.approval ?? li.record.approval, tool);
+      if (rule === 'deny') return refuse('denied', `${fullName} is disabled by the administrator. Tell the user if you need it.`);
+      if (rule === 'ask') {
+        const gate = await approvals.gate({ ...base, feature: 'tool', summary: fullName, reason: 'tool rule', subject: { tool: tool.name, args: args ?? {} } });
+        if (!gate.ok) return refuse(gate.status, gate.message);
       }
-      const result = await tool.handler(args ?? {}, { sessionId: session.id, principal: session.principal, signal: extra.signal, log: li.log });
+      const ask = async (spec: AskSpec) => {
+        const gate = await approvals.gate({ ...base, ...spec });
+        if (!gate.ok) throw new ApprovalError(gate.status, gate.message);
+        return gate.by;
+      };
+      const result = await tool.handler(args ?? {}, { sessionId: session.id, principal: session.principal, signal: extra.signal, log: li.log, ask });
       if (lvl === 'tools' || lvl === 'full') {
         log({ level: result.isError ? 'warn' : 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id,
           message: `${fullName}${urlOf(args)} by ${session.principal} ${result.isError ? 'ERROR' : 'ok'} ${Date.now() - t0}ms`,

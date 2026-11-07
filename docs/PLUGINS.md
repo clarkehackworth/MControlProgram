@@ -219,7 +219,27 @@ tools whose schema you receive at runtime (see `src/plugins/mcp`).
 
 ## Approval gating
 
-MControlProgram can require a human to approve a tool call before it runs; this happens in the gateway, not
-in your plugin. The only thing a plugin controls is `annotations.readOnlyHint` on each tool: set it on
-tools that cannot change anything, so the "tools that are not read-only" policy gates the right ones.
-A gated handler is simply not invoked until approved, so there is nothing else to do.
+**Whole tools.** Each instance has tool rules (allow / ask / deny per tool, plus a default) applied by
+the gateway. A plugin controls only `annotations.readOnlyHint`: set it on tools that cannot change
+anything, so "ask for tools that are not read-only" asks about the right ones. A handler is not invoked
+until its ask is approved, and never for a denied tool.
+
+**What a call does.** When your plugin has its own rules (commands, URLs, …), give them an `ask` action
+next to allow/block and ask from the handler:
+
+```js
+if (!call.ask) throw new Error('needs approval'); // no approval channel (tests, admin actions): fail closed
+const approvedBy = await call.ask({
+  feature: 'command',             // groups asks on your plugin page
+  summary: `${host}: ${command}`, // one line for the admin
+  reason: 'program: systemctl',   // the rule that asked, or 'default: ask'
+  subject: { host, command },     // identity: same subject = same request (a check-back)
+});
+```
+
+It resolves with `"approved by <admin>"` (log it). If the call may not run yet, it throws an
+`ApprovalError` whose message tells the agent to check back, pause, or stop; let it propagate as the
+tool error. Built-in plugins use the `ask(call, spec)` helper from `src/core/plugin-api.ts`, which does
+the fail-closed check. Ask
+last, after your other checks, so nobody approves something that would be refused anyway. Pending asks
+appear on the Approvals page and, filtered with `GET /api/approvals?plugin=<id>`, on your plugin page.

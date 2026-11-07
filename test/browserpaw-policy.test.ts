@@ -59,10 +59,10 @@ test('browser URL policy: separate list, RE2 check, push/fail closed, pre-check,
 
   // tool-arg pre-check + caller stamp (agent-supplied _meta discarded)
   const who = { principal: 'alice', sessionId: 's1' };
-  assert.throws(() => policy.prepareCall('p1', 'chrome_navigate', { url: 'https://evil.com/' }, who), /blocked by administrator \(domain: evil.com\)/);
-  assert.throws(() => policy.prepareCall('p1', 'chrome_navigate', { url: 'file:///etc/passwd' }, who), /scheme: file:/);
-  assert.throws(() => policy.prepareCall('p1', 'chrome_batch_actions', { steps: [{ action: 'navigate', url: 'ssh://x' }] }, who), /scheme: ssh:/);
-  const ok = policy.prepareCall('p1', 'chrome_navigate', { url: 'back', _meta: { mcp: { principal: 'mallory' } } }, who);
+  await assert.rejects(() => policy.prepareCall('p1', 'chrome_navigate', { url: 'https://evil.com/' }, who), /blocked by administrator \(domain: evil.com\)/);
+  await assert.rejects(() => policy.prepareCall('p1', 'chrome_navigate', { url: 'file:///etc/passwd' }, who), /scheme: file:/);
+  await assert.rejects(() => policy.prepareCall('p1', 'chrome_batch_actions', { steps: [{ action: 'navigate', url: 'ssh://x' }] }, who), /scheme: ssh:/);
+  const ok = await policy.prepareCall('p1', 'chrome_navigate', { url: 'back', _meta: { mcp: { principal: 'mallory' } } }, who);
   assert.deepEqual(ok, { url: 'back', _meta: { mcp: { principal: 'alice', sessionId: 's1' } } });
 
   // events pulled into the log with attribution; extension rev reset (restart w/o storage) triggers re-push

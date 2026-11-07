@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api, useApi, type Server } from '../api'
 import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
+import { PendingAsks } from '../components/Asks'
 
 type Kind = 'program' | 'prefix' | 'regex' | 'write'
-type Action = 'block' | 'allow'
-type Policy = 'allow' | 'deny'
+type Action = 'block' | 'ask' | 'allow'
+type Policy = 'allow' | 'ask' | 'deny'
 interface Rule { id: number; action: Action; kind: Kind; value: string; host: string; note: string; created_at: number }
-interface Cmd { id: number; ts: number; server_id: string; instance: string; principal: string | null; host: string; tool: string; command: string; exit_code: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now_blocked?: boolean; programs?: string[]; single?: string; writes?: string[]; unknown?: string[] }
+interface Cmd { id: number; ts: number; server_id: string; instance: string; principal: string | null; host: string; tool: string; command: string; exit_code: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now_blocked?: boolean; now_ask?: boolean; programs?: string[]; single?: string; writes?: string[]; unknown?: string[] }
 interface Target { action: Action; kind: Kind; value: string; host?: string; command?: string }
 interface Preview { total: number; hits: number; example?: string; conflicts: Rule[] }
 
@@ -19,17 +20,19 @@ const KINDS: { kind: Kind; title: string; label: string; help: string; placehold
   { kind: 'write', title: 'Written files', label: 'Write to (path)', help: 'Output redirects (>, >>, &>) into this file or directory. "/tmp" covers /tmp/x but not /tmpfoo. /dev/null is always allowed. Only redirects: programs that write files themselves (cp, tee, sed -i…) are controlled by program rules.', placeholder: '/tmp' },
 ]
 const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour', 3600e3], ['Last 24 hours', 86400e3], ['Last 7 days', 7 * 86400e3], ['Last 30 days', 30 * 86400e3]]
-const ruleText = (s: string | null) => s === 'default: deny' ? 'not on allow list' : s === 'default: allow' ? 'allowed by default' : s ?? ''
+const ruleText = (s: string | null) => s === 'default: deny' ? 'not on allow list' : s === 'default: allow' ? 'allowed by default' : s?.replace(/^awaiting approval: /, '') ?? ''
+const asked = (blocked: string | null) => !!blocked?.startsWith('awaiting approval')
+const POLICIES = [['allow', 'Allow by default', 'Agents can run any command except blocked (or ask) ones.'], ['ask', 'Ask by default', 'Commands not on the allow list wait for your approval.'], ['deny', 'Deny by default', 'Agents can run only allowed commands. Blocked ones stay blocked.']] as const
 const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
 const toLocalInput = (ts: number) => new Date(ts - new Date().getTimezoneOffset() * 60e3).toISOString().slice(0, 16)
 const isCmd = (t: string) => t === 'exec' || t === 'shell'
 const dirOf = (f: string) => f.includes('/') ? f.replace(/\/[^/]*$/, '') || '/' : f
 
-/** SSH plugin: admin command rules (default policy + block/allow by program, command prefix, regex; optionally per host) and the log of what agents ran. */
+/** SSH plugin: admin command rules (default policy + block/ask/allow by program, command prefix, regex; optionally per host), pending asks, and the log of what agents ran. */
 export default function SshCommands({ hosts }: { hosts: string[] }) {
   const [state, setState] = useState<{ policy: Policy; rules: Rule[] }>({ policy: 'allow', rules: [] })
   const [dialog, setDialog] = useState<Target>()
-  const [switching, setSwitching] = useState(false)
+  const [switching, setSwitching] = useState<Policy>()
   const { run, error } = useAction()
   const load = useCallback(() => run(async () => setState(await act('rules'))), []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load() }, [load])
@@ -37,7 +40,7 @@ export default function SshCommands({ hosts }: { hosts: string[] }) {
   const allowCount = rules.filter((r) => r.action === 'allow').length
 
   const del = (r: Rule) => {
-    const what = r.action === 'block' ? 'Agents will be able to run it again' + (policy === 'deny' ? ' if it is on the allow list.' : '.') : 'Agents will no longer be able to run it unless the default is allow.'
+    const what = r.action === 'block' ? 'Agents will be able to run it again' + (policy !== 'allow' ? ' if it is on the allow list.' : '.') : r.action === 'ask' ? 'Matching commands will no longer wait for approval.' : `Agents will no longer be able to run it unless the default is allow${policy === 'ask' ? ' (it will ask)' : ''}.`
     if (window.confirm(`Remove ${r.action} rule for ${r.kind} "${r.value}"${r.host ? ` on ${r.host}` : ''}? ${what}`)) void run(async () => { await act('delete_rule', { id: r.id }); await load() })
   }
   const toAllow = () => {
@@ -47,43 +50,48 @@ export default function SshCommands({ hosts }: { hosts: string[] }) {
 
   return (
     <>
+      <PendingAsks plugin="ssh" title="Commands waiting for approval" hideEmpty />
       <div className="card">
         <div className="row between">
           <h2 style={{ margin: 0 }}>Command rules</h2>
           <div className="row">
             <button className="sm" onClick={() => setDialog({ action: 'block', kind: 'program', value: '' })}>+ Block…</button>
-            {policy === 'deny' && <button className="sm" onClick={() => setDialog({ action: 'allow', kind: 'program', value: '' })}>+ Allow…</button>}
+            <button className="sm" onClick={() => setDialog({ action: 'ask', kind: 'program', value: '' })}>+ Ask…</button>
+            {policy !== 'allow' && <button className="sm" onClick={() => setDialog({ action: 'allow', kind: 'program', value: '' })}>+ Allow…</button>}
           </div>
         </div>
         {error && <Alert kind="err">{error}</Alert>}
 
         <div className="row" style={{ margin: '12px 0', gap: 8, alignItems: 'stretch' }} role="radiogroup" aria-label="Default policy">
-          {([['allow', 'Allow by default', 'Agents can run any command except blocked ones.'], ['deny', 'Deny by default', 'Agents can run only allowed commands. Blocked ones stay blocked.']] as const).map(([p, t, d]) =>
+          {POLICIES.map(([p, t, d]) =>
             <button key={p} role="radio" aria-checked={policy === p} className={policy === p ? 'primary' : ''} style={{ flex: 1, textAlign: 'left', padding: '8px 12px' }}
-              onClick={() => policy !== p && (p === 'deny' ? setSwitching(true) : toAllow())}>
+              onClick={() => policy !== p && (p === 'allow' ? toAllow() : setSwitching(p))}>
               <strong>{policy === p ? '● ' : '○ '}{t}</strong><div className="small" style={{ opacity: 0.8 }}>{d}</div>
             </button>)}
         </div>
 
         <RuleGroup title="Blocked" kind="err" rules={rules.filter((r) => r.action === 'block')} onDelete={del}
-          desc="Always refused, even if an allow rule also matches." />
-        {(policy === 'deny' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} onDelete={del}
-          desc={policy === 'deny' ? 'Every command in a line must match one.' : 'Not in use while the default is allow; kept for when you switch to deny.'} dim={policy !== 'deny'} />}
+          desc="Always refused, even if an ask or allow rule also matches." />
+        <RuleGroup title="Ask" kind="warn" rules={rules.filter((r) => r.action === 'ask')} onDelete={del}
+          desc="A line with any matching command waits for your approval, even if an allow rule also matches." />
+        {(policy !== 'allow' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} onDelete={del}
+          desc={policy !== 'allow' ? 'Every command in a line must match one.' : 'Not in use while the default is allow; kept for when you switch to ask or deny.'} dim={policy === 'allow'} />}
         <p className="muted small" style={{ marginBottom: 0 }}>
           Applies to <code>exec</code> and <code>shell_send</code> on every SSH instance and host, immediately (open shells are kept). Each host's own command patterns are checked after these.
           Commands are found everywhere in the line: pipes, <code>&&</code>, <code>$( )</code>, <code>sudo</code>/<code>xargs</code>/<code>find -exec</code>, and inside <code>sh -c "…"</code> and <code>ssh host "…"</code>.
-          Under deny by default a line that can't be fully checked (a program or script built from <code>$VARs</code>, a shell reading stdin or a script file, syntax errors) is refused.
+          Under deny by default a line that can't be fully checked (a program or script built from <code>$VARs</code>, a shell reading stdin or a script file, syntax errors) is refused; under ask by default it waits for your approval.
+          Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
           Still a guardrail, not a sandbox: interpreters (<code>python -c</code>, <code>perl -e</code>, <code>node</code>…) and scripts on disk run code that isn't checked, so don't allow them unless you trust what agents run.
         </p>
       </div>
       <CommandLog state={state} hosts={hosts} onRule={setDialog} />
       {dialog && <RuleDialog init={dialog} policy={policy} hosts={hosts} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
-      {switching && <DenyDialog onClose={() => setSwitching(false)} onDone={async () => { setSwitching(false); await load() }} />}
+      {switching && <DenyDialog to={switching} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
   )
 }
 
-function RuleGroup({ title, kind, rules, desc, dim, onDelete }: { title: string; kind: 'ok' | 'err'; rules: Rule[]; desc: string; dim?: boolean; onDelete: (r: Rule) => void }) {
+function RuleGroup({ title, kind, rules, desc, dim, onDelete }: { title: string; kind: 'ok' | 'err' | 'warn'; rules: Rule[]; desc: string; dim?: boolean; onDelete: (r: Rule) => void }) {
   return (
     <div style={{ marginTop: 12, opacity: dim ? 0.6 : 1 }}>
       <div><Badge kind={kind}>{title}</Badge> <span className="muted small">({rules.length}) — {desc}</span></div>
@@ -105,8 +113,8 @@ function RuleGroup({ title, kind, rules, desc, dim, onDelete }: { title: string;
   )
 }
 
-/** Switching to deny: offer to allow every program run recently, so nothing that works today silently breaks. */
-function DenyDialog({ onClose, onDone }: { onClose: () => void; onDone: () => Promise<void> }) {
+/** Switching to ask/deny: offer to allow every program run recently, so nothing that works today silently breaks (or starts asking). */
+function DenyDialog({ to, onClose, onDone }: { to: Policy; onClose: () => void; onDone: () => Promise<void> }) {
   const [progs, setProgs] = useState<[string, number][]>()
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const { run, busy, error } = useAction()
@@ -115,8 +123,10 @@ function DenyDialog({ onClose, onDone }: { onClose: () => void; onDone: () => Pr
   }, [])
   const toggle = (p: string) => { const s = new Set(picked); if (s.has(p)) s.delete(p); else s.add(p); setPicked(s) }
   return (
-    <Modal title="Switch to deny by default" onClose={onClose}>
-      <p>Agents will only be able to run commands on the allow list. Everything else is refused, and shows as <Badge kind="err">Blocked</Badge> in the command log with an <em>Allow</em> button.</p>
+    <Modal title={`Switch to ${to} by default`} onClose={onClose}>
+      {to === 'deny'
+        ? <p>Agents will only be able to run commands on the allow list. Everything else is refused, and shows as <Badge kind="err">Blocked</Badge> in the command log with an <em>Allow</em> button.</p>
+        : <p>Commands on the allow list run; everything else waits for your approval (here and on the Approvals page). Agents are told to check back, then to pause.</p>}
       {error && <Alert kind="err">{error}</Alert>}
       {!progs ? <p className="muted">Checking recent commands…</p> : progs.length === 0 ? <p className="muted small">No recent commands would be affected.</p> : <>
         <p className="small"><strong>Keep these working?</strong> They were run in the last 7 days and aren't on the allow list yet. Ticked programs are added to it, on all hosts. Untick interpreters (python, perl, node…): what they run isn't checked. Allowing a shell (sh, bash) is safer, since the commands inside sh -c are checked too.</p>
@@ -127,15 +137,22 @@ function DenyDialog({ onClose, onDone }: { onClose: () => void; onDone: () => Pr
       </>}
       <div className="row between" style={{ marginTop: 12 }}>
         <button onClick={onClose}>Cancel</button>
-        <button className="primary" disabled={busy || !progs} onClick={() => run(async () => { await act('set_policy', { policy: 'deny', allow: [...picked] }); await onDone() })}>
-          Deny by default{picked.size ? ` & allow ${picked.size}` : ''}
+        <button className="primary" disabled={busy || !progs} onClick={() => run(async () => { await act('set_policy', { policy: to, allow: [...picked] }); await onDone() })}>
+          {to === 'deny' ? 'Deny' : 'Ask'} by default{picked.size ? ` & allow ${picked.size}` : ''}
         </button>
       </div>
     </Modal>
   )
 }
 
-function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; policy: Policy; hosts: string[]; onClose: () => void; onDone: () => Promise<void> }) {
+/** The rule dialog on its own (Approvals page): loads the default policy itself. `onDone` gets the action saved. */
+export function SshRuleDialog({ init, onClose, onDone }: { init: Target; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
+  const [policy, setPolicy] = useState<Policy>()
+  useEffect(() => { void act<{ policy: Policy }>('rules').then((r) => setPolicy(r.policy)) }, [])
+  return policy ? <RuleDialog init={init} policy={policy} hosts={[]} onClose={onClose} onDone={onDone} /> : null
+}
+
+function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; policy: Policy; hosts: string[]; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
   const [action, setAction] = useState(init.action)
   const [kind, setKind] = useState(init.kind)
   const [value, setValue] = useState(init.value)
@@ -165,16 +182,17 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
 
   const save = () => run(async () => {
     for (const [i, value] of values.entries()) await act('rule', { action, kind, value, host, note, remove: i === 0 ? remove.map((r) => r.id) : [] })
-    await onDone()
+    await onDone(action)
   })
-  const verb = action === 'block' ? 'Block' : 'Allow'
+  const verb = action === 'block' ? 'Block' : action === 'ask' ? 'Ask' : 'Allow'
 
   return (
-    <Modal title={action === 'block' ? 'Block commands' : 'Allow commands'} onClose={onClose}>
+    <Modal title={`${verb} commands`} onClose={onClose}>
       {error && <Alert kind="err">{error}</Alert>}
       <Field label="Action">
         <div className="row">
           <label className="toggle"><input type="radio" name="action" checked={action === 'block'} onChange={() => setAction('block')} /> Block</label>
+          <label className="toggle"><input type="radio" name="action" checked={action === 'ask'} onChange={() => setAction('ask')} /> Ask</label>
           <label className="toggle"><input type="radio" name="action" checked={action === 'allow'} onChange={() => setAction('allow')} /> Allow</label>
         </div>
       </Field>
@@ -193,21 +211,22 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
       </Field>
 
       {conflicts.length > 0 && <div style={{ margin: '8px 0' }}>
-        <p className="small" style={{ margin: '0 0 4px' }}><strong>Block rules that cover this</strong> <span className="muted">— block rules win over allow rules. Ticked ones are removed:</span></p>
+        <p className="small" style={{ margin: '0 0 4px' }}><strong>Rules that override this</strong> <span className="muted">— block wins over ask, ask over allow. Ticked ones are removed:</span></p>
         {conflicts.map((r) => <label key={r.id} style={{ display: 'block' }} className="small">
-          <input type="checkbox" checked={!keep.has(r.id)} onChange={() => { const s = new Set(keep); if (s.has(r.id)) s.delete(r.id); else s.add(r.id); setKeep(s) }} /> {r.kind}: <span className="mono">{r.value}</span>{r.host && ` @${r.host}`}
+          <input type="checkbox" checked={!keep.has(r.id)} onChange={() => { const s = new Set(keep); if (s.has(r.id)) s.delete(r.id); else s.add(r.id); setKeep(s) }} /> {r.action} {r.kind}: <span className="mono">{r.value}</span>{r.host && ` @${r.host}`}
         </label>)}
       </div>}
 
-      {action === 'block' || policy === 'deny' ? <Field label="Note (optional)"><input type="text" placeholder={`Why is this ${action === 'block' ? 'blocked' : 'allowed'}?`} value={note} onChange={(e) => setNote(e.target.value)} style={{ width: '100%' }} /></Field> : null}
+      {action !== 'allow' || policy !== 'allow' ? <Field label="Note (optional)"><input type="text" placeholder={`Why is this ${action === 'block' ? 'blocked' : action === 'ask' ? 'asked' : 'allowed'}?`} value={note} onChange={(e) => setNote(e.target.value)} style={{ width: '100%' }} /></Field> : null}
 
       {pv && !pv.error && <div className="small" style={{ margin: '8px 0' }}>
         <div>{pv.hits ? <>Matches <strong>{pv.hits}</strong> of {pv.total} commands in the last 7 days, e.g. <span className="mono">{pv.example}</span></> : <span className="muted">Matches none of the {pv.total} commands in the last 7 days.</span>}</div>
         <div style={{ marginTop: 4 }}>
           {action === 'block' && `Adds ${values.length > 1 ? `${values.length} block rules` : 'a block rule'}. Matching commands are refused whatever the default policy is.`}
-          {action === 'allow' && policy === 'deny' && `Adds ${values.length > 1 ? `${values.length} allow rules` : 'an allow rule'}. A command line runs only if every command in it is allowed.`}
+          {action === 'ask' && `Adds ${values.length > 1 ? `${values.length} ask rules` : 'an ask rule'}. A line with a matching command waits for your approval.`}
+          {action === 'allow' && policy !== 'allow' && `Adds ${values.length > 1 ? `${values.length} allow rules` : 'an allow rule'}. A command line runs only if every command in it is allowed.`}
           {action === 'allow' && policy === 'allow' && (remove.length ? `Removes ${remove.length} block rule${remove.length === 1 ? '' : 's'}. No allow rule is needed while the default is allow.` : <span className="muted">Already allowed: the default is allow and no selected block rule covers it.</span>)}
-          {kept.length > 0 && <div className="err">Still blocked by {kept.map((r) => `${r.kind}: ${r.value}`).join(', ')}.</div>}
+          {kept.length > 0 && <div className="err">Still overridden by {kept.map((r) => `${r.action} ${r.kind}: ${r.value}`).join(', ')}.</div>}
         </div>
       </div>}
 
@@ -269,9 +288,10 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
         <tbody>
           {rows.map((r) => {
             const cmd = isCmd(r.tool)
-            const changed = cmd && r.now_blocked !== !!r.blocked
-            const next: Action = r.now_blocked ? 'allow' : 'block'
-            const Verb = r.now_blocked ? 'Allow' : 'Block'
+            const stopped = r.now_blocked || r.now_ask
+            const changed = cmd && (r.now_blocked !== (!!r.blocked && !asked(r.blocked)) || !!r.now_ask !== asked(r.blocked))
+            const next: Action = stopped ? 'allow' : 'block'
+            const Verb = stopped ? 'Allow' : 'Block'
             const progs = r.programs ?? []
             return <tr key={r.id} className="log-row">
               <td className="ts">{fmt(r.ts)}</td>
@@ -280,9 +300,9 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
               <td><Badge kind={r.tool === 'sftp_write' ? 'warn' : r.tool.startsWith('sftp') ? 'info' : undefined}>{r.tool}</Badge></td>
               <td className="mono" style={{ width: '100%', minWidth: 360 }} title={r.command}><div style={{ overflowWrap: 'anywhere', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{r.command}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
-                {r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
+                {asked(r.blocked) ? <Badge kind="warn">Asked</Badge> : r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
-                {changed && <div className="small" style={{ fontStyle: 'italic' }}>now {r.now_blocked ? 'blocked' : 'allowed'}</div>}
+                {changed && <div className="small" style={{ fontStyle: 'italic' }}>now {r.now_blocked ? 'blocked' : r.now_ask ? 'asks' : 'allowed'}</div>}
                 {!!r.writes?.length && <div className="muted small" title={r.writes.join('\n')}>writes {r.writes.join(', ').slice(0, 40)}</div>}
                 {!!r.unknown?.length && <div className="small" style={{ color: "var(--warn)" }} title={r.unknown.join('\n')}>can't fully check</div>}
               </td>
@@ -292,9 +312,9 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
                   : <><Badge kind={r.exit_code ? 'err' : undefined}>exit {r.exit_code}</Badge>{r.ms != null && <span className="muted small"> {r.ms} ms</span>}</>}
               </td>
               <td>{cmd && <div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
-                {progs.length > 0 && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} ${progs.join(', ')}`} onClick={() => onRule({ action: next, kind: 'program', value: progs.join(' '), host: r.host, command: r.command })}>{Verb} program{progs.length > 1 ? 's' : ''}</button>}
-                {r.single && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} this exact command`} onClick={() => onRule({ action: next, kind: 'prefix', value: r.single!, host: r.host, command: r.command })}>{Verb} command</button>}
-                {!!r.writes?.length && <button className={`sm${r.now_blocked ? '' : ' danger'}`} title={`${Verb} writing into ${dirOf(r.writes[0]!)}`} onClick={() => onRule({ action: next, kind: 'write', value: dirOf(r.writes![0]!), host: r.host, command: r.command })}>{Verb} writes</button>}
+                {progs.length > 0 && <button className={`sm${stopped ? '' : ' danger'}`} title={`${Verb} ${progs.join(', ')}`} onClick={() => onRule({ action: next, kind: 'program', value: progs.join(' '), host: r.host, command: r.command })}>{Verb} program{progs.length > 1 ? 's' : ''}</button>}
+                {r.single && <button className={`sm${stopped ? '' : ' danger'}`} title={`${Verb} this exact command`} onClick={() => onRule({ action: next, kind: 'prefix', value: r.single!, host: r.host, command: r.command })}>{Verb} command</button>}
+                {!!r.writes?.length && <button className={`sm${stopped ? '' : ' danger'}`} title={`${Verb} writing into ${dirOf(r.writes[0]!)}`} onClick={() => onRule({ action: next, kind: 'write', value: dirOf(r.writes![0]!), host: r.host, command: r.command })}>{Verb} writes</button>}
               </div>}</td>
             </tr>
           })}

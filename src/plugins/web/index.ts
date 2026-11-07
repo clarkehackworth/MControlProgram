@@ -3,8 +3,8 @@
  * injected server-side so agents never see them.
  */
 import { z } from 'zod';
-import type { MControlProgramPlugin, PluginContext, PluginInstance } from '../../core/plugin-api.js';
-import { text, errorResult } from '../../core/plugin-api.js';
+import type { MControlProgramPlugin, PluginContext, PluginInstance, ToolCallContext } from '../../core/plugin-api.js';
+import { text, errorResult, ask } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
 import { getDb } from '../../core/db.js';
 import { ruleStore, ruleMatches, verdict, label } from '../../core/url-policy.js';
@@ -174,7 +174,7 @@ const plugin: MControlProgramPlugin = {
     let inflight = 0; let total = 0; let failed = 0;
     const waiters: Array<() => void> = []; // ponytail: FIFO wait for a free slot instead of failing parallel tool calls
     const re = (p: string) => safeRegex(p, 'i');
-    type Caller = { sessionId?: string; principal?: string };
+    type Caller = Pick<ToolCallContext, 'sessionId' | 'principal' | 'ask'>;
     const jars = new Map<string, CookieJar>();
     let reaper: NodeJS.Timeout | undefined;
     const scopeKey = (c: Caller) => cfg.cookieScope === 'shared' ? 'shared' : cfg.cookieScope === 'session' ? `session:${c.sessionId ?? 'none'}` : `principal:${c.principal ?? 'anonymous'}`;
@@ -186,9 +186,9 @@ const plugin: MControlProgramPlugin = {
       return j;
     };
 
-    const record = (method: string, u: URL, r: { status?: number; error?: string; blocked?: string; ms?: number }, c: Caller) => {
+    const record = (method: string, u: URL, r: { status?: number; error?: string; blocked?: string; ms?: number; allowedBy?: string }, c: Caller) => {
       try {
-        const allowedBy = r.blocked ? null : verdict(u, rules(), policy()).allowedBy ?? null;
+        const allowedBy = r.blocked ? null : r.allowedBy ?? verdict(u, rules(), policy()).allowedBy ?? null;
         db().prepare('INSERT INTO web_requests(ts,server_id,instance,principal,method,url,host,status,error,blocked,allowed_by,ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
           .run(Date.now(), ctx.serverId, ctx.instanceName, c.principal ?? null, method, u.href, u.hostname, r.status ?? null, r.error ?? null, r.blocked ?? null, allowedBy, r.ms ?? null);
       } catch (e) { ctx.log.warn(`request log write failed: ${(e as Error).message}`); }
@@ -211,7 +211,8 @@ const plugin: MControlProgramPlugin = {
     });
     const dispatcher = new Agent({ connect: { lookup: guardedLookup } });
 
-    function checkUrl(raw: string): URL {
+    /** Policy checks; an ask verdict waits for a human (approvals). Returns who approved, if anyone did. */
+    async function checkUrl(raw: string, method: string, caller: Caller): Promise<{ u: URL; approvedBy?: string }> {
       const u = new URL(raw);
       if (!/^https?:$/.test(u.protocol)) throw new Blocked(`scheme: ${u.protocol}`, `only http/https allowed (got ${u.protocol})`); // logged like any block
       // Trailing dots name the same host ("evil.com." = evil.com, "localhost." = localhost); canonicalize so rules, prefixes and private checks all see one form.
@@ -221,7 +222,11 @@ const plugin: MControlProgramPlugin = {
       for (const p of cfg.denyUrls ?? []) if (p && re(p).test(u.href)) throw new Error(`url denied by policy (${p})`);
       const allow = (cfg.allowUrls ?? []).filter(Boolean);
       if (allow.length && !allow.some((p) => re(p).test(u.href))) throw new Error('url not in allow list');
-      return u;
+      if (!v.ask) return { u };
+      // ask last: never bother a human about a URL the instance would refuse anyway
+      const shown = new URL(u); shown.search = ''; // query strings may carry tokens; the full URL is still the subject
+      try { return { u, approvedBy: await ask(caller, { feature: 'url', summary: `${method} ${shown.href}`, reason: v.ask, subject: { method, url: u.href, host: u.hostname } }) }; }
+      catch (e) { throw new Blocked(`awaiting approval: ${v.ask}`, (e as Error).message); }
     }
 
     function applyCreds(u: URL, headers: Headers) {
@@ -239,8 +244,8 @@ const plugin: MControlProgramPlugin = {
 
     async function doFetch(method: string, url: string, hdrs: Record<string, string> | undefined, body: string | undefined, caller: Caller) {
       if (!(cfg.allowMethods ?? []).includes(method)) throw new Error(`method ${method} not allowed`);
-      let u: URL;
-      try { u = checkUrl(url); } catch (e) {
+      let u: URL; let approvedBy: string | undefined;
+      try { ({ u, approvedBy } = await checkUrl(url, method, caller)); } catch (e) {
         if (e instanceof Blocked) record(method, new URL(url), { blocked: e.rule }, caller);
         throw e;
       }
@@ -265,13 +270,14 @@ const plugin: MControlProgramPlugin = {
             else record(method, logged, { error: cause instanceof Error ? cause.message : (e as Error).message, ms: Date.now() - th }, caller);
             throw cause instanceof Error ? cause : e;
           }
-          record(method, logged, { status: res.status, ms: Date.now() - th }, caller);
+          record(method, logged, { status: res.status, ms: Date.now() - th, allowedBy: approvedBy }, caller); approvedBy = undefined;
           jar?.store(u, res.headers.getSetCookie());
           const loc = res.headers.get('location');
           if (!cfg.followRedirects || !loc || ![301, 302, 303, 307, 308].includes(res.status) || hops++ >= 10) break;
           await res.body?.cancel();
           const next = new URL(loc, u).href;
-          try { u = checkUrl(next); } catch (e) {
+          // ponytail: an ask on a redirect hop that isn't decided in time makes the agent retry the whole call, re-sending the first request
+          try { ({ u, approvedBy } = await checkUrl(next, method, caller)); } catch (e) {
             if (e instanceof Blocked) record(method, new URL(next), { blocked: e.rule }, caller);
             throw e;
           }

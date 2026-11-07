@@ -132,17 +132,28 @@ read-only" works on proxied tools too. For OAuth upstreams, run **Authorize (OAu
 config and open the link; set `MCONTROLPROGRAM_PUBLIC_URL` if the authorization server must redirect to a
 public address.
 
-## Human approval for risky tools
+## Human approval: allow, ask, deny
 
-Each plugin instance has an approval policy: **never**, **tools that are not read-only** (anything
-without `readOnlyHint`), **every tool**, or an explicit list. A gated call is queued on the
-**Approvals** page, where you see the tool, caller, and full arguments and can approve or deny.
+Every rule in MControlProgram is **allow**, **ask** or **deny** (shown as *block* in the rule lists):
+
+- **Tool rules** (server → Plugins → *Tool rules*): a default for the instance (allow; ask for tools
+  without `readOnlyHint`; ask for everything) plus per-tool allow/ask/deny. Deny refuses the tool.
+- **Plugin rules**: SSH command rules, Web and BrowserPaw URL rules each take block / ask / allow
+  rules and an *allow*, *ask* or *deny* default. Block beats ask, ask beats allow.
+
+An ask queues the call on the **Approvals** page (every ask) and on the plugin's own page (its asks),
+with the caller, what it wants (`web01: systemctl restart nginx`, `GET https://…`), and why it asked.
+Each ask offers **Allow once**, **Add allow rule…**, **Add block rule…** and **Deny once**; the rule
+buttons open the plugin's rule editor prefilled from the request, save the rule, then decide the call.
 
 The agent is never left hanging: the call blocks for *approval wait* seconds (default 30), then
 returns an error telling it to wait and call again with the same arguments. Identical retries attach
 to the same request rather than creating duplicates. After *max attempts* (default 3) the error tells
 the agent to pause and ask the user. An approval is consumed by exactly one execution; a denial sticks
 for the request's lifetime (default 1 day). All three knobs live in Settings.
+
+BrowserPaw can only ask about URLs agents pass to browser tools: the browser can't pause a page load,
+so in the browser ask rules act as allow rules and *ask by default* acts as allow.
 
 ## Writing your own plugin
 
@@ -182,7 +193,7 @@ export default {
         description: 'Greet someone by name.',
         inputSchema: { name: z.string() },          // zod raw shape
         annotations: { readOnlyHint: true },        // lets the approval policy skip it
-        async handler({ name }, call) {             // call: { sessionId, principal, signal, log }
+        async handler({ name }, call) {             // call: { sessionId, principal, signal, log, ask }
           return { content: [{ type: 'text', text: `${ctx.config.greeting}, ${name}!` }] };
         },
       }],
@@ -210,7 +221,10 @@ Things worth knowing before you write a real one:
 - **Clean up.** Reap idle state from a timer started in `start()` and cleared in `stop()`, and drop
   per-session state in `onSessionClosed`. Use `ctx.global()` for the gateway-wide idle timeouts.
 - **Errors.** Throwing from a handler becomes an `isError` result and is logged.
-- **Approvals.** Set `readOnlyHint` on tools that change nothing; the gateway handles the rest.
+- **Approvals.** Set `readOnlyHint` on tools that change nothing; the gateway's tool rules handle the
+  rest. For finer asks (one command, one URL), give your rules an `ask` action and call
+  `await call.ask({ feature, summary, reason, subject })`: it resolves with who approved, or throws a
+  message for the agent. Refuse when `call.ask` is missing. See docs/PLUGINS.md.
 
 ## Layout
 

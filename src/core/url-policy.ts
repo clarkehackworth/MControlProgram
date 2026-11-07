@@ -6,8 +6,10 @@ import { safeRegex } from './safe-regex.js';
 import { getDb } from './db.js';
 
 export type BlockKind = 'domain' | 'url' | 'regex';
-export type RuleAction = 'block' | 'allow';
-export type Policy = 'allow' | 'deny';
+export type RuleAction = 'block' | 'ask' | 'allow';
+export type Policy = 'allow' | 'ask' | 'deny';
+export type Verdict = { blocked?: string; ask?: string; allowedBy?: string };
+const ACTIONS = ['block', 'ask', 'allow'], POLICIES = ['allow', 'ask', 'deny'];
 export interface Rule { id: number; action: RuleAction; kind: BlockKind; value: string; note: string; created_at: number }
 
 /** "evil.com." names the same host as evil.com. */
@@ -21,13 +23,15 @@ export function ruleMatches(r: Pick<Rule, 'kind' | 'value'>, u: URL): boolean {
   if (r.kind === 'url') return u.href.startsWith(r.value);
   try { return safeRegex(r.value, 'i').test(u.href); } catch { return false; }
 }
-/** Block rules always win; otherwise an allow rule, otherwise the default policy. */
-export function verdict(u: URL, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy): { blocked?: string; allowedBy?: string } {
+/** Block rules always win, then ask rules, then allow rules, then the default policy. `ask` = needs a human (approvals). */
+export function verdict(u: URL, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy): Verdict {
   const b = list.find((r) => r.action === 'block' && ruleMatches(r, u));
   if (b) return { blocked: label(b) };
+  const q = list.find((r) => r.action === 'ask' && ruleMatches(r, u));
+  if (q) return { ask: label(q) };
   const a = list.find((r) => r.action === 'allow' && ruleMatches(r, u));
   if (a) return { allowedBy: label(a) };
-  return def === 'deny' ? { blocked: 'default: deny' } : { allowedBy: 'default: allow' };
+  return def === 'deny' ? { blocked: 'default: deny' } : def === 'ask' ? { ask: 'default: ask' } : { allowedBy: 'default: allow' };
 }
 
 /** Features JS RegExp has and Chrome's RE2 (declarativeNetRequest regexFilter) does not. */
@@ -76,7 +80,7 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
   let policyCache: Policy | undefined;
   const listeners = new Set<() => void>();
   const rules = () => (ruleCache ??= db().prepare(`SELECT * FROM ${T} ORDER BY action, kind, value`).all() as Rule[]);
-  const policy = (): Policy => (policyCache ??= ((db().prepare(`SELECT v FROM ${P} WHERE k='default'`).get() as any)?.v === 'deny' ? 'deny' : 'allow'));
+  const policy = (): Policy => (policyCache ??= (((v) => POLICIES.includes(v) ? v : 'allow')((db().prepare(`SELECT v FROM ${P} WHERE k='default'`).get() as any)?.v) as Policy));
   const rev = (): number => Number((db().prepare(`SELECT v FROM ${P} WHERE k='rev'`).get() as any)?.v ?? 0);
   const changed = () => {
     db().prepare(`INSERT INTO ${P}(k,v) VALUES('rev','1') ON CONFLICT(k) DO UPDATE SET v=CAST(v AS INTEGER)+1`).run();
@@ -86,13 +90,13 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
 
   const actions = {
     rules: { title: 'Access rules', run: async () => ({ policy: policy(), rules: rules(), rev: rev() }) },
-    /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks that conflict with a new allow).
+    /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks/asks that would override a new allow).
      *  With the default policy at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
     rule: { title: 'Add rule', run: async ({ action, kind, value, note, remove }: Record<string, any>) => {
-      if (action !== 'block' && action !== 'allow') throw new Error('action must be block or allow');
+      if (!ACTIONS.includes(action)) throw new Error('action must be block, ask or allow');
       const r = normalizeBlock(kind, value, opts);
       const d = db();
-      const store = action === 'block' || policy() === 'deny';
+      const store = action !== 'allow' || policy() !== 'allow';
       d.transaction(() => {
         for (const id of (Array.isArray(remove) ? remove : [])) d.prepare(`DELETE FROM ${T} WHERE id=?`).run(Number(id));
         if (store) d.prepare(`INSERT INTO ${T}(action,kind,value,note,created_at) VALUES(?,?,?,?,?) ON CONFLICT(kind,value) DO UPDATE SET action=excluded.action, note=excluded.note, created_at=excluded.created_at`)
@@ -101,13 +105,13 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
       changed(); return { ...r, action, stored: store };
     } },
     delete_rule: { title: 'Delete rule', run: async ({ id }: Record<string, any>) => { db().prepare(`DELETE FROM ${T} WHERE id=?`).run(Number(id)); changed(); } },
-    /** Switch the default policy; `allow` = domains to add as allow rules in the same step (so switching to deny doesn't break current traffic). */
+    /** Switch the default policy; `allow` = domains to add as allow rules in the same step (so switching to ask/deny doesn't break current traffic). */
     set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }: Record<string, any>) => {
-      if (p !== 'allow' && p !== 'deny') throw new Error('policy must be allow or deny');
+      if (!POLICIES.includes(p)) throw new Error('policy must be allow, ask or deny');
       const d = db();
       const doms = (Array.isArray(allow) ? allow : []).map((x: string) => normalizeBlock('domain', x).value);
       d.transaction(() => {
-        for (const v of doms) d.prepare(`INSERT INTO ${T}(action,kind,value,note,created_at) VALUES('allow','domain',?,'added when switching to deny',?) ON CONFLICT(kind,value) DO NOTHING`).run(v, Date.now());
+        for (const v of doms) d.prepare(`INSERT INTO ${T}(action,kind,value,note,created_at) VALUES('allow','domain',?,'added when switching default',?) ON CONFLICT(kind,value) DO NOTHING`).run(v, Date.now());
         d.prepare(`INSERT INTO ${P}(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`).run(p);
       })();
       changed(); return { policy: p };
@@ -121,7 +125,7 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
  * (app/chrome-extension/entrypoints/background/url-policy.ts); keep the two in step.
  * `top` = top-level navigation; `selfId` = the BrowserPaw extension id (its own pages are allowed).
  */
-export function browserVerdict(raw: string, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy, top: boolean, selfId?: string, depth = 0): { blocked?: string; allowedBy?: string } {
+export function browserVerdict(raw: string, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy, top: boolean, selfId?: string, depth = 0): Verdict {
   let u: URL;
   try { u = new URL(raw); } catch { return { blocked: 'invalid url' }; }
   const p = u.protocol;

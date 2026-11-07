@@ -47,9 +47,10 @@ export const copy = async (s: string) => {
 
 // ---- shared types (mirror backend) ----
 export interface PluginMeta { id: string; name: string; version: string; description: string; configSchema: any; defaultConfig: Record<string, any>; source: string; globalConfigSchema?: any; globalConfig?: Record<string, any>; globalActions: { key: string; title: string; inventory?: string }[]; dependencies?: Record<string, string> }
-export interface ApprovalPolicy { mode: 'none' | 'writes' | 'all' | 'list'; tools?: string[] }
+export type ToolRule = 'allow' | 'ask' | 'deny'
+export interface ApprovalPolicy { mode: 'none' | 'writes' | 'all'; rules?: Record<string, ToolRule> }
 export interface Instance { id: string; server_id: string; plugin_id: string; name: string; enabled: boolean; config: Record<string, any>; position: number; approval: ApprovalPolicy }
-export interface Approval { id: string; server_id: string; instance_id: string; instance_name: string; tool: string; principal: string; session_id?: string; args: any; status: string; attempts: number; decided_by?: string; created_at: number; decided_at?: number; expires_at: number }
+export interface Approval { id: string; server_id: string; instance_id: string; instance_name: string; tool: string; principal: string; session_id?: string; plugin_id: string; feature: string; summary: string; reason: string; subject: any; args: any; status: string; attempts: number; decided_by?: string; created_at: number; decided_at?: number; expires_at: number }
 export interface InstanceStatus { id: string; name: string; plugin: string; error?: string; tools: string[]; toolInfo?: { name: string; description: string }[]; status?: any; actions?: { key: string; title: string }[] }
 export interface Session { id: string; principal: string; client?: string; startedAt: number; lastSeen: number; calls: number }
 export interface Server {

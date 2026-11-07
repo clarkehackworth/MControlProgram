@@ -23,6 +23,9 @@ function migrate(db: Database.Database) {
   // ponytail: additive column migrations; ALTER fails harmlessly when the column exists
   const addCol = (sql: string) => { try { db.exec(sql); } catch { /* exists */ } };
   defer.push(() => addCol("ALTER TABLE plugin_instances ADD COLUMN approval TEXT NOT NULL DEFAULT '{\"mode\":\"none\"}'"));
+  // approvals asked by plugins (feature-level asks), not just the core tool gate
+  for (const c of ["plugin_id TEXT NOT NULL DEFAULT ''", "feature TEXT NOT NULL DEFAULT 'tool'", "summary TEXT NOT NULL DEFAULT ''", "reason TEXT NOT NULL DEFAULT ''", 'subject TEXT'])
+    defer.push(() => addCol(`ALTER TABLE approvals ADD COLUMN ${c}`));
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS admins (

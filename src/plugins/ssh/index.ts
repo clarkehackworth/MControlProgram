@@ -11,9 +11,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolResult } from '../../core/plugin-api.js';
+import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolResult, ToolCallContext } from '../../core/plugin-api.js';
 import { effective } from '../../core/global-config.js';
-import { text, errorResult } from '../../core/plugin-api.js';
+import { text, errorResult, ask } from '../../core/plugin-api.js';
 import { pluginConfig } from '../../core/store.js';
 import { safeRegex } from '../../core/safe-regex.js';
 import { localClient } from './local.js';
@@ -434,14 +434,17 @@ const plugin: MControlProgramPlugin = {
     const log = (e: Omit<cmdRules.LogEntry, 'serverId' | 'instance' | 'principal'>, c: { principal?: string }) => {
       try { cmdRules.record({ ...who(c), ...e }); } catch (err) { ctx.log.warn(`command log write failed: ${(err as Error).message}`); }
     };
-    const admit = (h: HostCfg, tool: string, cmd: string, c: { principal?: string }) => {
+    const admit = async (h: HostCfg, tool: string, cmd: string, c: Pick<ToolCallContext, 'principal' | 'ask'>) => {
       const v = cmdRules.verdict(cmd, h.name, cmdRules.rules(), cmdRules.policy());
       if (v.blocked) {
         log({ host: h.name, tool, command: cmd, blocked: v.blocked }, c);
         throw new Error(v.blocked === 'default: deny' ? 'command not on the administrator\'s allow list' : `command blocked by administrator (${v.blocked})`);
       }
       try { checkCommand(h, cmd); } catch (e) { log({ host: h.name, tool, command: cmd, blocked: `host policy: ${(e as Error).message}` }, c); throw e; }
-      return v.allowedBy;
+      if (!v.ask) return v.allowedBy;
+      // ask last: never bother a human about a line the host policy refuses anyway
+      try { return await ask(c, { feature: 'command', summary: `${h.name}: ${cmd}`, reason: v.ask, subject: { host: h.name, tool, command: cmd, ...cmdRules.describe(cmd) } }); }
+      catch (e) { log({ host: h.name, tool, command: cmd, blocked: `awaiting approval: ${v.ask}` }, c); throw e; }
     };
     const hostArg = z.string().describe('Host name from list_hosts');
     const shellName = z.string().regex(/^[a-zA-Z0-9_-]+$/).optional().describe('Shell name (default "default"); use different names for parallel shells on one host');
@@ -536,7 +539,7 @@ const plugin: MControlProgramPlugin = {
           inputSchema: { host: hostArg, command: z.string().describe('Shell command line'), timeoutMs: z.number().int().positive().optional().describe('Override exec timeout') },
           handler: async ({ host, command, timeoutMs }, c) => {
             try {
-              const h = hostByName(host); const allowedBy = admit(h, 'exec', command, c);
+              const h = hostByName(host); const allowedBy = await admit(h, 'exec', command, c);
               const conn = await getConn(host);
               c.log.connection(`exec on ${host}: ${command.slice(0, 200)}`, undefined, c.sessionId);
               const t0 = Date.now();
@@ -570,7 +573,7 @@ const plugin: MControlProgramPlugin = {
           handler: async ({ host, name, input, waitMs, raw }, c) => {
             try {
               const h = hostByName(host);
-              const allowedBy = admit(h, 'shell', input, c);
+              const allowedBy = await admit(h, 'shell', input, c);
               const { conn, sh, id, opened } = await getShell(host, name ?? 'default', c);
               log({ host, tool: 'shell', command: input, allowedBy }, c);
               sh.buf = '';

@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { api, fmtTime, useApi, type ApprovalPolicy, type Instance, type InstanceStatus, type PluginMeta, type Server } from '../api'
+import { api, fmtTime, useApi, type ApprovalPolicy, type ToolRule, type Instance, type InstanceStatus, type PluginMeta, type Server } from '../api'
 import { Alert, Badge, CopyButton, Field, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import { AuthSelect, LogSelect } from './Servers'
@@ -106,7 +106,7 @@ function PluginsTab({ server, reload }: { server: Server; reload: () => Promise<
                 <td>{!inst.enabled ? <Badge>disabled</Badge> : st?.error ? <Badge kind="err">error</Badge> : st ? <Badge kind="ok">active</Badge> : <Badge kind="warn">not running</Badge>}</td>
                 <td>{st && <InstanceItems inst={st} />}</td>
                 <td><input type="checkbox" checked={inst.enabled} onChange={(e) => run(async () => { await api(`/instances/${inst.id}`, { method: 'PUT', body: { enabled: e.target.checked } }); await reload() })} /></td>
-                <td><div className="row">{st && <ToolsButton inst={st} />}{Object.keys(meta?.configSchema?.properties ?? {}).length > 0 && <button className="sm" onClick={() => setEditing({ ...inst, config: { ...defaultsFor(meta!.configSchema), ...meta!.defaultConfig, ...inst.config } })}>Settings</button>}<button className="sm" onClick={() => setGating(inst)}>Approval</button></div></td>
+                <td><div className="row">{st && <ToolsButton inst={st} />}{Object.keys(meta?.configSchema?.properties ?? {}).length > 0 && <button className="sm" onClick={() => setEditing({ ...inst, config: { ...defaultsFor(meta!.configSchema), ...meta!.defaultConfig, ...inst.config } })}>Settings</button>}<button className="sm" onClick={() => setGating(inst)}>Tool rules</button></div></td>
               </tr>
             )
           })}
@@ -121,7 +121,7 @@ function PluginsTab({ server, reload }: { server: Server; reload: () => Promise<
           <button className="primary" onClick={() => run(async () => { await api(`/instances/${editing.id}`, { method: 'PUT', body: { config: editing.config } }); setEditing(undefined); await reload() })}>Save & restart</button>
         </div>
       </Modal>}
-      {gating && <Modal title={`Approval — ${gating.name}`} onClose={() => setGating(undefined)}>
+      {gating && <Modal title={`Tool rules — ${gating.name}`} onClose={() => setGating(undefined)}>
         <ApprovalEditor value={gating.approval} onChange={(a) => setGating({ ...gating, approval: a })} tools={statusOf(gating)?.tools} />
         <div className="row between" style={{ marginTop: 12 }}>
           <button onClick={() => setGating(undefined)}>Cancel</button>
@@ -148,18 +148,23 @@ export function ConfigEditor({ schema, value, onChange, options }: { schema: any
   )
 }
 
-const APPROVAL_MODES: [ApprovalPolicy['mode'], string][] = [['none', 'Never'], ['writes', 'Tools that are not read-only'], ['all', 'Every tool'], ['list', 'Only these tools…']]
+const APPROVAL_MODES: [ApprovalPolicy['mode'], string][] = [['none', 'Allow'], ['writes', 'Ask for tools that are not read-only, allow the rest'], ['all', 'Ask']]
+const RULES: [ToolRule | '', string][] = [['', 'Default'], ['allow', 'Allow'], ['ask', 'Ask'], ['deny', 'Deny']]
+/** Per-tool allow/ask/deny for one instance. Commands and URLs have their own rules on the plugin's page. */
 function ApprovalEditor({ value, onChange, tools }: { value: ApprovalPolicy; onChange: (p: ApprovalPolicy) => void; tools?: string[] }) {
-  const sel = value.tools ?? []
+  const rules = value.rules ?? {}
+  const setRule = (t: string, r: ToolRule | '') => { const next = { ...rules }; if (r) next[t] = r; else delete next[t]; onChange({ ...value, rules: next }) }
+  const names = [...new Set([...(tools ?? []), ...Object.keys(rules)])]
   return (
     <div className="card" style={{ marginTop: 12 }}>
-      <h3 style={{ marginTop: 0 }}>Human approval</h3>
-      <Field label="Require admin approval for" desc="Gated calls wait in the Approvals page; the agent is told to check back until you decide.">
+      <h3 style={{ marginTop: 0 }}>Tool rules</h3>
+      <Field label="Default for tools without a rule" desc="Ask = the call waits on the Approvals page; the agent is told to check back until you decide. Deny = the tool refuses every call. Applied immediately, without restarting the instance.">
         <select value={value.mode} onChange={(e) => onChange({ ...value, mode: e.target.value as ApprovalPolicy['mode'] })}>{APPROVAL_MODES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
       </Field>
-      {value.mode === 'list' && (tools?.length ? <div className="row" style={{ flexWrap: 'wrap', gap: 10 }}>
-        {tools.map((t) => <label key={t} className="row small"><input type="checkbox" checked={sel.includes(t)} onChange={(e) => onChange({ ...value, tools: e.target.checked ? [...sel, t] : sel.filter((x) => x !== t) })} /> {t}</label>)}
-      </div> : <p className="muted small">Tool names are known once the instance has started; save, then edit again to pick them.</p>)}
+      {names.length ? <table><tbody>
+        {names.map((t) => <tr key={t}><td className="mono">{t}{tools && !tools.includes(t) && <span className="muted small"> (not currently exposed)</span>}</td>
+          <td><select value={rules[t] ?? ''} onChange={(e) => setRule(t, e.target.value as ToolRule | '')}>{RULES.map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select></td></tr>)}
+      </tbody></table> : <p className="muted small">Tool names are known once the instance has started; save, then edit again to set per-tool rules.</p>}
     </div>
   )
 }

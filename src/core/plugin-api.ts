@@ -17,6 +17,30 @@ export interface ToolCallContext {
   principal?: string;
   signal: AbortSignal;
   log: ScopedLogger;
+  /**
+   * Ask a human to approve something this call wants to do (the plugin's own "ask" rules). Shows on the
+   * Approvals page and the plugin's page. Resolves with who approved ("approved by …"); throws an
+   * `ApprovalError` whose message tells the agent to check back, pause, or not retry. Undefined outside a
+   * tool call (tests, admin actions): plugins must then refuse, not proceed.
+   */
+  ask?(req: AskSpec): Promise<string>;
+}
+
+export interface AskSpec {
+  /** Which feature of the plugin asks (e.g. 'command', 'url'); the plugin page groups and renders by it. */
+  feature: string;
+  /** One line for the admin, e.g. `web01: rm -rf /tmp/x`. */
+  summary: string;
+  /** Why it asks, e.g. the matching ask rule's label or 'default: ask'. */
+  reason?: string;
+  /** What is being asked about. Identical subjects (per instance, tool, principal) are the same request; the UI uses it to prefill rules. */
+  subject: unknown;
+}
+
+/** `ctx.ask` or fail closed: no approval system available means no. */
+export async function ask(ctx: Pick<ToolCallContext, 'ask'>, spec: AskSpec): Promise<string> {
+  if (!ctx.ask) throw new Error(`needs human approval (${spec.reason ?? spec.summary}), but this call has no approval channel`);
+  return ctx.ask(spec);
 }
 
 export interface ToolResult {

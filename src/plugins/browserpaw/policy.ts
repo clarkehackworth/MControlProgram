@@ -5,7 +5,7 @@
  */
 import { getDb } from '../../core/db.js';
 import { ruleStore, browserVerdict } from '../../core/url-policy.js';
-import type { ToolCallContext } from '../../core/plugin-api.js';
+import { ask, type ToolCallContext } from '../../core/plugin-api.js';
 
 export const store = ruleStore('browserpaw', { re2: true });
 
@@ -49,7 +49,7 @@ export function push(profile: string, call: BridgeCall): Promise<void> {
     const s = syncOf(profile);
     const rev = store.rev();
     try {
-      const r = await call('PUT', '/url-policy', { rev, policy: store.policy(), rules: store.rules().map(({ id, action, kind, value }) => ({ id, action, kind, value })), logAllowed: 'navigation' });
+      const r = await call('PUT', '/url-policy', { rev, ...forBrowser(), logAllowed: 'navigation' });
       if (r?.status !== 'success' || r.rev !== rev) throw new Error(r?.error ?? 'extension did not acknowledge the policy');
       Object.assign(s, { ackRev: rev, lastPush: Date.now(), error: undefined, rejected: r.rejected ?? [] });
     } catch (e) {
@@ -98,6 +98,15 @@ export async function pull(profile: string, call: BridgeCall) {
 
 export const syncStatus = () => Object.fromEntries([...syncs].map(([k, s]) => [k, { inSync: s.ackRev === store.rev(), ackRev: s.ackRev ?? null, rev: store.rev(), lastPush: s.lastPush ?? null, lastPull: s.lastPull ?? null, error: s.error ?? null, rejected: s.rejected }]));
 
+/**
+ * What the extension enforces. It can't pause a page load for a human, so `ask` only gates URLs agents pass
+ * in tool calls (prepareCall); inside the browser ask rules act as allow rules (so an approved page loads) and
+ * default ask acts as allow.
+ * ponytail: fail-open for pages the agent reaches by clicking; real in-browser asks need an extension 'ask' action.
+ */
+const forBrowser = () => ({ policy: store.policy() === 'ask' ? 'allow' : store.policy(),
+  rules: store.rules().map(({ id, action, kind, value }) => ({ id, action: action === 'ask' ? 'allow' : action, kind, value })) });
+
 // ---------- tool calls ----------
 
 /** Tools whose `url` / `fileUrl` argument makes the browser load something. (chrome_close_tabs' url is a filter; bookmarks don't load.) */
@@ -121,13 +130,19 @@ function urlArgs(tool: string, args: any): string[] {
  * identity the extension uses to attribute tabs. Agent-supplied `_meta` is discarded: the native server
  * prefers arguments._meta over params._meta, so this overwrite is what makes the identity trustworthy.
  */
-export function prepareCall(profile: string, tool: string, args: Record<string, any>, call: Pick<ToolCallContext, 'principal' | 'sessionId'>): Record<string, any> {
+export async function prepareCall(profile: string, tool: string, args: Record<string, any>, call: Pick<ToolCallContext, 'principal' | 'sessionId' | 'ask'>): Promise<Record<string, any>> {
   const { _meta: _ignored, ...rest } = args;
   for (const url of urlArgs(tool, rest)) {
     const v = browserVerdict(url, store.rules(), store.policy(), true);
-    if (v.blocked) {
-      record({ profile, principal: call.principal, sessionId: call.sessionId, agentVia: 'tool', type: 'main_frame', url, blocked: v.blocked, via: 'tool-arg' });
-      throw new Error(v.blocked === 'default: deny' ? `url not on the administrator's browser allow list: ${url}` : `url blocked by administrator (${v.blocked}): ${url}`);
+    const refuse = (blocked: string, msg: string) => {
+      record({ profile, principal: call.principal, sessionId: call.sessionId, agentVia: 'tool', type: 'main_frame', url, blocked, via: 'tool-arg' });
+      throw new Error(msg);
+    };
+    if (v.blocked) refuse(v.blocked, v.blocked === 'default: deny' ? `url not on the administrator's browser allow list: ${url}` : `url blocked by administrator (${v.blocked}): ${url}`);
+    if (v.ask) {
+      let host = ''; try { host = new URL(url).hostname; } catch { /* browserVerdict already refused bad URLs */ }
+      try { await ask(call, { feature: 'url', summary: `${profile}: ${tool.replace(/^chrome_/, '')} ${url}`, reason: v.ask, subject: { profile, url, host } }); }
+      catch (e) { refuse(`awaiting approval: ${v.ask}`, (e as Error).message); }
     }
   }
   return { ...rest, _meta: { mcp: { principal: call.principal ?? null, sessionId: call.sessionId ?? null } } };
