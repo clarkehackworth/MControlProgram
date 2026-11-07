@@ -104,13 +104,13 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
       {schema.description && <p className="muted small">{schema.description}</p>}
       {error && <Alert kind="err">{error}</Alert>}
       <table>
-        <thead><tr><th>Name</th>{kind && <th>{kind.title}</th>}{cols.map(([c, s]) => <th key={c}>{s.title ?? c}</th>)}{fk.field ? <th>Used by</th> : ref ? <th>{ref.title ?? ref.inventory}</th> : null}<th></th></tr></thead>
+        <thead><tr><th>Name</th>{kind && <th>{kind.title}</th>}{cols.map(([c, s]) => <th key={c}>{s['x-column-title'] ?? s.title ?? c}</th>)}{fk.field ? <th>Used by</th> : ref ? <th>{ref.title ?? ref.inventory}</th> : null}<th></th></tr></thead>
         <tbody>
           {items.map((it, i) => (
             <tr key={it.name ?? i}>
               <td className="mono"><strong>{it.name}</strong></td>
               {kind && <td>{kindOf(it)}</td>}
-              {cols.map(([c]) => <td key={c}>{String(it[c] ?? '')}</td>)}
+              {cols.map(([c, s]) => <td key={c}>{String(it[c] || (s['x-column-fallback'] && it[s['x-column-fallback']]) || '')}</td>)}
               {fk.field ? <td><ServerToggles item={it.name} users={users} reload={reload} /></td> : ref ? <td>{refs(it.name).length ? <div className="chips">{refs(it.name).map((n) => <span key={n} className="chip small">{n}</span>)}</div> : <span className="muted small">—</span>}</td> : null}
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 {actions.filter((a) => !a.when || Object.entries(a.when).every(([f, v]) => it[f] === v)).map((a) => <button key={a.key} className="sm" disabled={busy}
