@@ -54,7 +54,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
               <td style={{ whiteSpace: 'nowrap' }}>
                 <div className="row" style={{ gap: 4 }} role="radiogroup" aria-label={`${t.tool} access`}>
                   {ACTIONS.map((a) => <button key={a} role="radio" aria-checked={t.rule === a} disabled={busy}
-                    className={`sm${t.rule === a ? ' primary' : ''}`} title={t.rule === a ? 'Click again to follow the default' : undefined}
+                    className={`sm${t.rule === a ? (a === 'deny' ? ' danger' : ' primary') : ''}`} title={t.rule === a ? 'Click again to follow the default' : undefined}
                     onClick={() => void setRule(t, t.rule === a ? '' : a)}>{a}</button>)}
                 </div>
               </td>
