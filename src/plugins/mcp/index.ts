@@ -41,7 +41,7 @@ const serverSchema = {
     command: { type: 'string', title: 'Command', 'x-no-column': true, description: 'Executable to spawn, e.g. npx', 'x-show-if': { transport: 'stdio' } },
     args: { type: 'string', title: 'Arguments', description: 'One per line', format: 'multiline', 'x-show-if': { transport: 'stdio' } },
     env: { type: 'string', title: 'Environment', description: 'KEY=VALUE per line; secrets go here, the agent never sees them', format: 'multiline', 'x-secret': true, 'x-show-if': { transport: 'stdio' } },
-    cwd: { type: 'string', title: 'Working directory', 'x-show-if': { transport: 'stdio' } },
+    cwd: { type: 'string', title: 'Working directory', 'x-no-column': true, 'x-show-if': { transport: 'stdio' } },
   },
 };
 
