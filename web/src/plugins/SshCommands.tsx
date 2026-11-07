@@ -165,7 +165,15 @@ function RuleDialog({ init, policy, rules, hosts, onClose, onDone }: { init: Tar
   // every program already has this rule but the line still asks: show what else is in the way
   const [why, setWhy] = useState<Why>()
   const allCovered = kind === 'program' && typed.length > 0 && typed.every(has)
-  useEffect(() => { setWhy(undefined); if (allCovered && action === 'allow' && init.command) void act<Why>('explain', { command: init.command, host: init.host }).then(setWhy).catch(() => {}) }, [allCovered, action]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (action !== 'allow') return setWhy(undefined)
+    if (!allCovered || !init.command) return // keep the explanation after switching to a write rule
+    void act<Why>('explain', { command: init.command, host: init.host }).then((w) => {
+      setWhy(w)
+      // only unallowed writes in the way: switch straight to a write rule for the first one (ponytail: others show up on the next ask)
+      if (!w.overriding.length && !w.unknown.length && w.writes.length) { setKind('write'); setValue(dirOf(w.writes[0]!)) }
+    }).catch(() => {})
+  }, [allCovered, action]) // eslint-disable-line react-hooks/exhaustive-deps
   const delRule = (r: Rule) => run(async () => { await act('delete_rule', { id: r.id }); setWhy(await act<Why>('explain', { command: init.command, host: init.host })) })
   useEffect(() => {
     if (!values.length) return setPv(undefined)
@@ -212,7 +220,7 @@ function RuleDialog({ init, policy, rules, hosts, onClose, onDone }: { init: Tar
             </label>)}
         </div>}
         {why && <div className="small" style={{ marginTop: 6 }}>
-          <strong>Every program here is already allowed.</strong>{' '}
+          <strong>Every program in this line is already allowed.</strong>{' '}
           {!why.verdict.ask && !why.verdict.blocked ? <span className="muted">The line is allowed now; allow this request once.</span> : <>It still {why.verdict.blocked ? 'is blocked' : 'asks'} because:
           <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
             {why.overriding.map((r) => <li key={r.id}>{r.action} rule {r.kind}: <span className="mono">{r.value}</span>{r.host && ` @${r.host}`} <button className="sm" disabled={busy} onClick={() => void delRule(r)}>Remove</button></li>)}

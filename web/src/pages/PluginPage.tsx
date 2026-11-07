@@ -16,7 +16,7 @@ export function inventoryKeys(p: PluginMeta): string[] {
 }
 
 // ponytail: wizard-driven / internal actions, and remove_host (rows use the generic Delete instead)
-const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key', 'requests', 'rules', 'rule', 'delete_rule', 'set_policy', 'clear_requests', 'sync_status', 'commands', 'clear_commands', 'preview', 'deny_candidates']
+const HIDDEN_ACTIONS = ['add_host', 'copy_id', 'callback', 'remove_host', 'remove_key', 'public_key', 'requests', 'rules', 'rule', 'delete_rule', 'set_policy', 'clear_requests', 'sync_status', 'commands', 'clear_commands', 'preview', 'explain', 'deny_candidates']
 
 /** Full-width management page for one plugin's inventories. */
 export default function PluginPage() {
