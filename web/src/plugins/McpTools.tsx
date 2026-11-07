@@ -25,6 +25,9 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
   const setPolicy = (p: Action) => { if (window.confirm(`${POLICIES.find((x) => x[0] === p)![1]}?\n\nTools without their own rule will ${p === 'allow' ? 'run without asking' : p === 'ask' ? 'wait for your approval' : 'be refused'}.`)) void run(async () => { await act('set_policy', { policy: p }); await load() }) }
   const refresh = (name: string) => run(async () => { await act('test_server', { name }); await load() })
   const unseen = upstreams.filter((u) => !tools.some((t) => t.upstream === u))
+  const groups = [...new Set(tools.map((t) => t.upstream))]
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
+  const toggle = (u: string) => setCollapsed((c) => { const n = new Set(c); if (n.has(u)) n.delete(u); else n.add(u); return n })
 
   return (
     <>
@@ -40,29 +43,31 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
             </button>)}
         </div>
         <table>
-          <thead><tr><th>Server</th><th>Tool</th><th>Description</th><th>Access</th></tr></thead>
-          <tbody>
-            {tools.map((t) => <tr key={`${t.upstream}/${t.tool}`}>
-              <td className="small">{t.upstream}</td>
-              <td className="mono">{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
+          <thead><tr><th>Tool</th><th>Description</th><th>Access</th></tr></thead>
+          {groups.map((u) => <tbody key={u}>
+            <tr style={{ cursor: 'pointer' }} onClick={() => toggle(u)} aria-expanded={!collapsed.has(u)}>
+              <td colSpan={3}><strong>{collapsed.has(u) ? '▸' : '▾'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span></td>
+            </tr>
+            {!collapsed.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
+              <td className="mono" style={{ paddingLeft: 24 }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
               <td className="muted small" style={{ width: '100%' }} title={t.description}><div style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.description}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 <div className="row" style={{ gap: 4 }} role="radiogroup" aria-label={`${t.tool} access`}>
-                  {ACTIONS.map((a) => <button key={a} role="radio" aria-checked={t.rule === a} disabled={busy}
-                    className={`sm${t.rule === a ? (a === 'deny' ? ' danger' : ' primary') : ''}`}
-                    title={t.rule === a ? 'Click again to follow the default' : undefined}
-                    onClick={() => void setRule(t, t.rule === a ? '' : a)}>{a}</button>)}
-                  {!t.rule && <span className="muted small">default ({policy})</span>}
+                  {ACTIONS.map((a) => { const cur = (t.rule ?? policy) === a
+                    // ponytail: the current rule (own, else default) is just disabled; no "back to default" once a tool has its own rule
+                    return <button key={a} role="radio" aria-checked={cur} disabled={busy || cur} className="sm" onClick={() => void setRule(t, a)}>{a}</button> })}
                 </div>
               </td>
             </tr>)}
-            {unseen.map((u) => <tr key={u}><td className="small">{u}</td><td colSpan={3} className="muted small">Tools not listed yet. <button className="sm" disabled={busy} onClick={() => void refresh(u)}>Fetch tools</button></td></tr>)}
-            {tools.length === 0 && unseen.length === 0 && <tr><td colSpan={4} className="muted">No upstream servers configured.</td></tr>}
+          </tbody>)}
+          <tbody>
+            {unseen.map((u) => <tr key={u}><td colSpan={3} className="muted small"><strong>{u}</strong>: tools not listed yet. <button className="sm" disabled={busy} onClick={() => void refresh(u)}>Fetch tools</button></td></tr>)}
+            {tools.length === 0 && unseen.length === 0 && <tr><td colSpan={3} className="muted">No upstream servers configured.</td></tr>}
           </tbody>
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>
           Applies to every MCP pass-through instance on every server, immediately (connections are kept). Tools hidden by an instance's expose/hide lists aren't offered to agents at all.
-          A tool's own rule wins over the default; click its active button again to go back to the default. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
+          A tool's own rule wins over the default; the greyed-out button is the tool's current rule. Click a server to collapse its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
           The list updates whenever an instance connects or you run <em>Test server</em>.
         </p>
       </div>
