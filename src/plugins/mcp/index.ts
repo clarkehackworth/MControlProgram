@@ -253,7 +253,7 @@ const plugin: MControlProgramPlugin = {
                   const entry = { serverId: ctx.serverId, instance: ctx.instanceName, principal: call.principal, upstream: s.name, tool: t.name, args };
                   const rec = (e: Partial<toolRules.LogEntry>) => { try { toolRules.record({ ...entry, ...e }); } catch (err) { ctx.log.warn(`call log write failed: ${(err as Error).message}`); } };
                   // read live per call: rule changes apply without reconnecting
-                  const v = toolRules.verdict(s.name, t.name);
+                  const v = toolRules.verdict(s.name, t.name, !!t.annotations?.readOnlyHint);
                   if (v.action === 'deny') { rec({ blocked: v.by }); throw new Error(`${s.name}/${t.name} is disabled by the administrator. Tell the user if you need it.`); }
                   let allowedBy = v.by;
                   if (v.action === 'ask') {

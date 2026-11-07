@@ -8,7 +8,8 @@ interface Tool { upstream: string; tool: string; description: string; read_only:
 interface Call { id: number; ts: number; server_id: string; instance: string; principal: string | null; upstream: string; tool: string; args: string | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now: Action }
 
 const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/mcp/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
-const POLICIES = [['allow', 'Allow by default', 'Agents can call any tool not set to ask or deny.'], ['ask', 'Ask by default', 'Tools without their own rule wait for your approval.'], ['deny', 'Deny by default', 'Agents can call only tools set to allow.']] as const
+type Policy = Action | 'readonly'
+const POLICIES = [['allow', 'Allow by default', 'Agents can call any tool not set to ask or deny.'], ['readonly', 'Allow read-only, ask by default', 'Tools the server marks read-only run; the rest wait for your approval.'], ['ask', 'Ask by default', 'Tools without their own rule wait for your approval.'], ['deny', 'Deny by default', 'Agents can call only tools set to allow.']] as const
 const ACTIONS: Action[] = ['allow', 'ask', 'deny']
 const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour', 3600e3], ['Last 24 hours', 86400e3], ['Last 7 days', 7 * 86400e3], ['Last 30 days', 30 * 86400e3]]
 const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
@@ -16,13 +17,13 @@ const asked = (b: string | null) => !!b?.startsWith('awaiting approval')
 
 /** MCP pass-through: per-tool allow/ask/deny across upstream servers, default policy, pending asks and the call log. */
 export default function McpTools({ upstreams }: { upstreams: string[] }) {
-  const [state, setState] = useState<{ policy?: Action; tools: Tool[] }>({ tools: [] }) // no policy until loaded: no radio lit
+  const [state, setState] = useState<{ policy?: Policy; tools: Tool[] }>({ tools: [] }) // no policy until loaded: no radio lit
   const { run, error, busy } = useAction()
   const load = useCallback(() => run(async () => setState(await act('tool_rules'))), []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load() }, [load])
   const { policy, tools } = state
   const setRule = (t: Tool, action: Action | '') => run(async () => { await act('set_tool_rule', { upstream: t.upstream, tool: t.tool, action }); await load() })
-  const setPolicy = (p: Action) => { if (window.confirm(`${POLICIES.find((x) => x[0] === p)![1]}?\n\nTools without their own rule will ${p === 'allow' ? 'run without asking' : p === 'ask' ? 'wait for your approval' : 'be refused'}.`)) void run(async () => { await act('set_policy', { policy: p }); await load() }) }
+  const setPolicy = (p: Policy) => { if (window.confirm(`${POLICIES.find((x) => x[0] === p)![1]}?\n\nTools without their own rule will ${p === 'allow' ? 'run without asking' : p === 'readonly' ? 'run if read-only, otherwise wait for your approval' : p === 'ask' ? 'wait for your approval' : 'be refused'}.`)) void run(async () => { await act('set_policy', { policy: p }); await load() }) }
   const refresh = (name: string) => run(async () => { await act('test_server', { name }); await load() })
   const unseen = upstreams.filter((u) => !tools.some((t) => t.upstream === u))
   const groups = [...new Set(tools.map((t) => t.upstream))]
@@ -49,7 +50,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
               <td colSpan={3}><strong>{expanded.has(u) ? '▾' : '▸'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span>
                 {' '}{([['allow', 'allowed', 'ok'], ['ask', 'asked', 'warn'], ['deny', 'denied', 'err']] as const).map(([r, l, k]) => { const n = tools.filter((t) => t.upstream === u && t.rule === r).length
                   return n ? <Badge key={r} kind={k}>{n} {l}</Badge> : null })}
-                <span className="muted small"> {tools.filter((t) => t.upstream === u && !t.rule).length} default ({policy})</span></td>
+                <span className="muted small"> {tools.filter((t) => t.upstream === u && !t.rule).length} default ({POLICIES.find((x) => x[0] === policy)?.[1].replace(/ by default$/, '').toLowerCase()})</span></td>
             </tr>
             {expanded.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
               <td className="mono" style={{ paddingLeft: 24 }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>

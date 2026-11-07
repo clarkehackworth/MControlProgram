@@ -5,7 +5,9 @@
 import { getDb } from '../../core/db.js';
 
 export type Action = 'allow' | 'ask' | 'deny';
-const ACTIONS = ['allow', 'ask', 'deny'];
+/** Default policy: an action, or `readonly` = allow tools with readOnlyHint, ask for the rest. */
+export type Policy = Action | 'readonly';
+const ACTIONS = ['allow', 'ask', 'deny'], POLICIES = [...ACTIONS, 'readonly'];
 
 let ready = false;
 const db = () => {
@@ -26,16 +28,19 @@ const db = () => {
 };
 
 let ruleCache: Map<string, Action> | undefined;
-let policyCache: Action | undefined;
+let policyCache: Policy | undefined;
 const key = (upstream: string, tool: string) => `${upstream}\0${tool}`;
 const rules = () => (ruleCache ??= new Map((db().prepare('SELECT * FROM mcp_rules').all() as any[]).map((r) => [key(r.upstream, r.tool), r.action])));
-export const policy = (): Action => (policyCache ??= (((v) => ACTIONS.includes(v) ? v : 'allow')((db().prepare("SELECT v FROM mcp_policy WHERE k='default'").get() as any)?.v) as Action));
+export const policy = (): Policy => (policyCache ??= (((v) => POLICIES.includes(v) ? v : 'allow')((db().prepare("SELECT v FROM mcp_policy WHERE k='default'").get() as any)?.v) as Policy));
 const changed = () => { ruleCache = undefined; policyCache = undefined; };
 
-/** The tool's own rule, else the default policy. */
-export function verdict(upstream: string, tool: string): { action: Action; by: string } {
+/** The tool's own rule, else the default policy (`readOnly` = the tool's readOnlyHint, for the readonly policy). */
+export function verdict(upstream: string, tool: string, readOnly: boolean): { action: Action; by: string } {
   const r = rules().get(key(upstream, tool));
-  return r ? { action: r, by: `tool rule: ${r}` } : { action: policy(), by: `default: ${policy()}` };
+  if (r) return { action: r, by: `tool rule: ${r}` };
+  const p = policy();
+  if (p === 'readonly') return readOnly ? { action: 'allow', by: 'default: read-only allowed' } : { action: 'ask', by: 'default: ask (not read-only)' };
+  return { action: p, by: `default: ${p}` };
 }
 
 /** Replace what is known about an upstream's tools (called whenever its tool list is fetched). */
@@ -75,7 +80,7 @@ export const actions = {
     changed();
   } },
   set_policy: { title: 'Set default policy', run: async ({ policy: p }: any) => {
-    if (!ACTIONS.includes(p)) throw new Error('policy must be allow, ask or deny');
+    if (!POLICIES.includes(p)) throw new Error('policy must be allow, readonly, ask or deny');
     db().prepare("INSERT INTO mcp_policy(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(p);
     changed(); return { policy: p };
   } },
@@ -89,7 +94,8 @@ export const actions = {
     if (q.outcome === 'error') where.push('blocked IS NULL AND error IS NOT NULL');
     const limit = Math.min(Number(q.limit) || 500, 5000);
     const rows = db().prepare(`SELECT * FROM mcp_calls WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1) as any[];
-    for (const r of rows) r.now = verdict(r.upstream, r.tool).action;
+    const ro = new Set((db().prepare('SELECT upstream, tool FROM mcp_tools WHERE read_only=1').all() as any[]).map((t) => key(t.upstream, t.tool)));
+    for (const r of rows) r.now = verdict(r.upstream, r.tool, ro.has(key(r.upstream, r.tool))).action;
     return { rows: rows.slice(0, limit), more: rows.length > limit };
   } },
   clear_calls: { title: 'Clear call log', run: async () => { db().prepare('DELETE FROM mcp_calls').run(); } },
