@@ -181,6 +181,7 @@ const plugin: MControlProgramPlugin = {
     },
     oauth_reset: {
       title: 'Forget OAuth tokens',
+      when: { auth: 'oauth' },
       async run({ name }) { setting.set(oauthKey(String(name)), encrypt('{}')); return { ok: true }; },
     },
   },
