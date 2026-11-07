@@ -19,7 +19,7 @@ function Shell({ user, onLogout, children }: { user: string; onLogout: () => voi
   // Browser notifications for new approvals. Needs HTTPS or localhost; ponytail: only while a tab is open, add Web Push if needed without one.
   const canNotify = typeof Notification !== 'undefined'
   const [perm, setPerm] = useState(canNotify ? Notification.permission : 'denied')
-  const seen = useRef<Set<string>>()
+  const seen = useRef<Set<string>>(undefined)
   useEffect(() => {
     if (!appr) return
     const ids = new Set(appr.pending.map((a) => a.id))
