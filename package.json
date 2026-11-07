@@ -1,6 +1,6 @@
 {
   "name": "mcontrolprogram",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "MControlProgram - MCP gateway with plugin architecture",
   "main": "index.js",
   "scripts": {
