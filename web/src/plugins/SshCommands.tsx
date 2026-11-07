@@ -98,7 +98,7 @@ export default function SshCommands({ hosts }: { hosts: string[] }) {
         </p>
       </div>
       <CommandLog state={state} hosts={hosts} onRule={setDialog} />
-      {dialog && <RuleDialog init={dialog} policy={policy} hosts={hosts} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
+      {dialog && <RuleDialog init={dialog} policy={policy} rules={rules} hosts={hosts} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
       {switching && <DenyDialog to={switching} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
   )
@@ -138,12 +138,12 @@ function DenyDialog({ to, onClose, onDone }: { to: Policy; onClose: () => void; 
 
 /** The rule dialog on its own (Approvals page): loads the default policy itself. `onDone` gets the action saved. */
 export function SshRuleDialog({ init, onClose, onDone }: { init: Target; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
-  const [policy, setPolicy] = useState<Policy>()
-  useEffect(() => { void act<{ policy: Policy }>('rules').then((r) => setPolicy(r.policy)) }, [])
-  return policy ? <RuleDialog init={init} policy={policy} hosts={[]} onClose={onClose} onDone={onDone} /> : null
+  const [st, setSt] = useState<{ policy: Policy; rules: Rule[] }>()
+  useEffect(() => { void act<{ policy: Policy; rules: Rule[] }>('rules').then(setSt) }, [])
+  return st ? <RuleDialog init={init} policy={st.policy} rules={st.rules} hosts={[]} onClose={onClose} onDone={onDone} /> : null
 }
 
-function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; policy: Policy; hosts: string[]; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
+function RuleDialog({ init, policy, rules, hosts, onClose, onDone }: { init: Target; policy: Policy; rules: Rule[]; hosts: string[]; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
   const [action, setAction] = useState(init.action)
   const [kind, setKind] = useState(init.kind)
   const [value, setValue] = useState(init.value)
@@ -154,10 +154,13 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
   const { run, busy, error } = useAction()
 
   const k = KINDS.find((x) => x.kind === kind)!
+  const verb = action === 'block' ? 'Block' : action === 'ask' ? 'Ask' : 'Allow'
   const v = value.trim()
-  const [skip, setSkip] = useState<Set<string>>(new Set()) // programs the admin unticked
+  // Several programs: ticked = has this action. Ones a same-action rule already covers are ticked and locked; the rest start unticked, tick the ones to add.
+  const [picked, setPicked] = useState<Set<string>>(new Set())
   const typed = kind === 'program' ? [...new Set(v.split(/[\s,]+/).filter(Boolean))] : v ? [v] : []
-  const values = typed.filter((x) => !skip.has(x))
+  const has = (x: string) => rules.some((r) => r.action === action && r.kind === 'program' && r.value === x && (!r.host || r.host === host))
+  const values = typed.length > 1 ? typed.filter((x) => picked.has(x) && !has(x)) : typed
   useEffect(() => {
     if (!values.length) return setPv(undefined)
     const t = setTimeout(() => {
@@ -166,7 +169,7 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
         .catch((e) => setPv({ total: 0, hits: 0, conflicts: [], error: (e as Error).message }))
     }, 250)
     return () => clearTimeout(t)
-  }, [action, kind, v, host, skip]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [action, kind, v, host, picked]) // eslint-disable-line react-hooks/exhaustive-deps
   const conflicts = pv?.conflicts ?? []
   const remove = conflicts.filter((r) => !keep.has(r.id))
   const kept = conflicts.filter((r) => keep.has(r.id))
@@ -177,7 +180,6 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
     for (const [i, value] of values.entries()) await act('rule', { action, kind, value, host, note, remove: i === 0 ? remove.map((r) => r.id) : [] })
     await onDone(action)
   })
-  const verb = action === 'block' ? 'Block' : action === 'ask' ? 'Ask' : 'Allow'
 
   return (
     <Modal title={`${verb} commands`} onClose={onClose}>
@@ -196,10 +198,12 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
         <input type="text" className="mono" autoFocus placeholder={k.placeholder} value={value} onChange={(e) => setValue(e.target.value)} style={{ width: '100%' }}
           onKeyDown={(e) => { if (e.key === 'Enter' && canSave) void save() }} />
         {kind === 'program' && typed.length > 1 && <div className="small" style={{ marginTop: 4 }}>
-          <span className="muted">One rule per program:</span>{' '}
-          {typed.map((x) => <label key={x} className="toggle mono" style={{ marginRight: 8 }}>
-            <input type="checkbox" checked={!skip.has(x)} onChange={() => { const s = new Set(skip); if (s.has(x)) s.delete(x); else s.add(x); setSkip(s) }} /> {x}
-          </label>)}
+          <span className="muted">One rule per program, tick the ones to {verb.toLowerCase()}:</span>{' '}
+          {typed.map((x) => has(x)
+            ? <label key={x} className="toggle mono muted" style={{ marginRight: 8 }} title={`Already a ${action} rule`}><input type="checkbox" checked disabled /> {x}</label>
+            : <label key={x} className="toggle mono" style={{ marginRight: 8 }}>
+              <input type="checkbox" checked={picked.has(x)} onChange={() => { const s = new Set(picked); if (s.has(x)) s.delete(x); else s.add(x); setPicked(s) }} /> {x}
+            </label>)}
         </div>}
         {pv?.error && <div className="err small" style={{ marginTop: 4 }}>{pv.error}</div>}
       </Field>

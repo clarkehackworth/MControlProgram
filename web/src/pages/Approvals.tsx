@@ -20,7 +20,7 @@ export default function Approvals() {
         <h2>Recent decisions</h2>
         <table><thead><tr><th>Time</th><th>What</th><th>Principal</th><th>Instance</th><th>Status</th><th>By</th><th></th></tr></thead><tbody>
           {recent.map((a) => <tr key={a.id}><td className="mono small">{fmtTime(a.decided_at ?? a.created_at)}</td>
-            <td><Badge>{a.plugin_id || 'tool'}{a.feature !== 'tool' ? ` · ${a.feature}` : ''}</Badge> <span className="mono small" title={JSON.stringify(a.args)}>{a.summary || a.tool}</span></td>
+            <td><Badge>{a.plugin_id || 'tool'}{a.feature !== 'tool' ? ` · ${a.feature}` : ''}</Badge> <span className="mono small" style={{ overflowWrap: 'anywhere' }} title={JSON.stringify(a.args)}>{a.summary || a.tool}</span></td>
             <td>{a.principal}</td><td>{a.instance_name}</td><td><Badge kind={KIND[a.status]}>{a.status}</Badge></td><td>{a.decided_by ?? ''}</td>
             <td>{a.status === 'denied' && a.expires_at > Date.now() && <button className="sm" disabled={busy} onClick={() => undo(a)}
               title="Put this request back in the queue so you can decide again. The agent's next identical call checks back instead of being refused. A block rule you added stays: remove it on the plugin's page.">Undo</button>}</td></tr>)}
