@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import { api, useApi, type Server } from '../api'
 import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
 import { PendingAsks } from '../components/Asks'
+import { RuleGroup, type RuleOps } from '../components/RuleGroup'
 
 type Kind = 'domain' | 'url' | 'regex'
 type Action = 'block' | 'ask' | 'allow'
@@ -90,6 +91,18 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
     const what = r.action === 'block' ? 'Agents will be able to reach it again' + (policy !== 'allow' ? ' if it is on the allow list.' : '.') : r.action === 'ask' ? 'Matching URLs will no longer wait for approval.' : `Agents will no longer be able to reach it unless the default is allow${policy === 'ask' ? ' (it will ask)' : ''}.`
     if (window.confirm(`Remove ${r.action} rule for ${r.kind} "${r.value}"? ${what}`)) void run(async () => { await act('delete_rule', { id: r.id }); await load() })
   }
+  /** Rule operations for the chips and the Manage dialog of one action's group. */
+  const opsFor = (group: Action): RuleOps<Rule> => ({
+    onDelete: del,
+    remove: async (ids) => { for (const id of ids) await act('delete_rule', { id }); await load() },
+    // the action is part of the upsert; under default allow an allow rule isn't stored, so moving to allow = removing
+    move: async (r, action) => {
+      if (action === 'allow' && policy === 'allow') await act('delete_rule', { id: r.id })
+      else await act('rule', { action, kind: r.kind, value: r.value, note: r.note, ...('host' in r ? { host: r.host } : {}) })
+      await load()
+    },
+    add: (kind) => setDialog({ action: group, kind: kind as Rule['kind'], value: '' }),
+  })
   const toAllow = () => {
     if (window.confirm(`Allow by default?\n\nAgents will be able to reach any URL that isn't blocked.${allowCount ? ` Your ${allowCount} allow rule(s) are kept for when you switch back.` : ''}`))
       void run(async () => { await act('set_policy', { policy: 'allow' }); await load() })
@@ -116,11 +129,11 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
             </button>)}
         </div>
 
-        <RuleGroup title="Blocked" kind="err" rules={rules.filter((r) => r.action === 'block')} onDelete={del}
+        <RuleGroup title="Blocked" kind="err" rules={rules.filter((r) => r.action === 'block')} kinds={KINDS} ops={opsFor('block')}
           desc="Always refused, even if an ask or allow rule also matches." />
-        <RuleGroup title="Ask" kind="warn" rules={rules.filter((r) => r.action === 'ask')} onDelete={del}
+        <RuleGroup title="Ask" kind="warn" rules={rules.filter((r) => r.action === 'ask')} kinds={KINDS} ops={opsFor('ask')}
           desc={browser ? 'URLs agents pass to browser tools wait for your approval, even if an allow rule also matches.' : 'Wait for your approval, even if an allow rule also matches.'} />
-        {(policy !== 'allow' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} onDelete={del}
+        {(policy !== 'allow' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} kinds={KINDS} ops={opsFor('allow')}
           desc={policy === 'deny' ? 'The only URLs agents can reach.' : policy === 'ask' ? 'Reached without asking.' : 'Not in use while the default is allow; kept for when you switch to ask or deny.'} dim={policy === 'allow'} />}
         {browser
           ? <p className="muted small" style={{ marginBottom: 0 }}>Separate from the Web plugin's list. Applies to every BrowserPaw profile and everything the browser loads (pages, frames, scripts, fetch/XHR, websockets), pushed to running browsers immediately. A browser that hasn't confirmed the current list gets no tool calls and blocks all traffic. <code>file:</code>, <code>chrome:</code>, <code>ftp:</code>, <code>ssh:</code> and other non-web schemes are always refused. Patterns use the browser's regex engine (no lookahead or backreferences). <strong>Ask</strong> applies to URLs agents pass to browser tools (navigate, fetch, upload…); the browser can't pause a page load, so inside the browser ask rules act as allow rules and ask by default acts as allow (links an agent clicks are not asked about).</p>
@@ -136,28 +149,6 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
       {dialog && <RuleDialog init={dialog} state={state} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
       {switching && <DenyDialog to={switching} rules={rules} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
-  )
-}
-
-function RuleGroup({ title, kind, rules, desc, dim, onDelete }: { title: string; kind: 'ok' | 'err' | 'warn'; rules: Rule[]; desc: string; dim?: boolean; onDelete: (r: Rule) => void }) {
-  return (
-    <div style={{ marginTop: 12, opacity: dim ? 0.6 : 1 }}>
-      <div><Badge kind={kind}>{title}</Badge> <span className="muted small">({rules.length}) — {desc}</span></div>
-      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 16, marginTop: 6 }}>
-        {KINDS.map((k) => {
-          const list = rules.filter((r) => r.kind === k.kind)
-          return <div key={k.kind}>
-            <strong className="small">{k.title}</strong>
-            <div className="chips" style={{ marginTop: 4 }}>
-              {list.map((r) => <span key={r.id} className="chip mono" title={`${r.note ? r.note + ' — ' : ''}added ${new Date(r.created_at).toLocaleString()}`}>
-                {r.value}<button title="Remove" aria-label={`Remove ${title.toLowerCase()} ${r.value}`} onClick={() => onDelete(r)}>✕</button>
-              </span>)}
-              {list.length === 0 && <span className="muted small">None</span>}
-            </div>
-          </div>
-        })}
-      </div>
-    </div>
   )
 }
 
