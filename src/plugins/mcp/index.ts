@@ -257,7 +257,7 @@ const plugin: MControlProgramPlugin = {
                   if (v.action === 'deny') { rec({ blocked: v.by }); throw new Error(`${s.name}/${t.name} is disabled by the administrator. Tell the user if you need it.`); }
                   let allowedBy = v.by;
                   if (v.action === 'ask') {
-                    try { allowedBy = `approved by ${await ask(call, { feature: 'mcp_tool', summary: `${s.name}/${t.name}`, reason: v.by, subject: { upstream: s.name, tool: t.name, args } })}`; }
+                    try { allowedBy = await ask(call, { feature: 'mcp_tool', summary: `${s.name}/${t.name}`, reason: v.by, subject: { upstream: s.name, tool: t.name, args } }); }
                     catch (e) { rec({ blocked: `awaiting approval: ${v.by}` }); throw e; }
                   }
                   try {
