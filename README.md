@@ -5,6 +5,17 @@ API tokens, internal networks. Agents connect to MControlProgram over the standa
 [Model Context Protocol](https://modelcontextprotocol.io) (Streamable HTTP) and get **tools**;
 MControlProgram's plugins own the credentials, make the real connections, and enforce policy.
 
+It is meant to be used in conjunction with an AI agent that is itself segmented by containerized
+security controls, such as Docker Sandbox, so the gateway is the agent's only path to credentials
+and the outside world.
+
+Access is meant to be **granted per task, not permanently**. From the web UI you can switch individual
+SSH hosts, browser hosts and profiles, and plugin instances on or off, and change web/browser URL
+rules (allow or block a domain, URL or regex) at any time, with no agent restart and no change inside
+the sandbox. Enable only what the current job needs (one host, one browser profile, one site), then
+turn it off again afterwards. Risky tool calls can additionally be held for human approval, so the
+agent's exposure at any moment is limited to what you have deliberately opened up.
+
 **SSH** — hosts agents may use, with per-server toggles, global command allow/deny rules (parsed with a real shell grammar, so pipes, `sudo`, `sh -c` and `$( )` are all checked) and a command log.
 
 ![SSH plugin: host inventory, per-server toggles and command rules](docs/images/ssh.png)
