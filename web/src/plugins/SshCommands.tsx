@@ -278,7 +278,7 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
               <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'ssh' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
               <td className="small">{r.host}</td>
               <td><Badge kind={r.tool === 'sftp_write' ? 'warn' : r.tool.startsWith('sftp') ? 'info' : undefined}>{r.tool}</Badge></td>
-              <td className="mono" style={{ width: '100%', maxWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.command}>{r.command}</td>
+              <td className="mono" style={{ width: '100%', minWidth: 360 }} title={r.command}><div style={{ overflowWrap: 'anywhere', display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{r.command}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 {r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
