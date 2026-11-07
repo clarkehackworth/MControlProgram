@@ -46,7 +46,10 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
           <thead><tr><th>Tool</th><th>Description</th><th>Access</th></tr></thead>
           {groups.map((u) => <tbody key={u}>
             <tr style={{ cursor: 'pointer' }} onClick={() => toggle(u)} aria-expanded={expanded.has(u)}>
-              <td colSpan={3}><strong>{expanded.has(u) ? '▾' : '▸'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span></td>
+              <td colSpan={3}><strong>{expanded.has(u) ? '▾' : '▸'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span>
+                {' '}{([['allow', 'allowed', 'ok'], ['ask', 'asked', 'warn'], ['deny', 'denied', 'err']] as const).map(([r, l, k]) => { const n = tools.filter((t) => t.upstream === u && t.rule === r).length
+                  return n ? <Badge key={r} kind={k}>{n} {l}</Badge> : null })}
+                <span className="muted small"> {tools.filter((t) => t.upstream === u && !t.rule).length} default ({policy})</span></td>
             </tr>
             {expanded.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
               <td className="mono" style={{ paddingLeft: 24 }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
