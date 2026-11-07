@@ -155,7 +155,9 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
 
   const k = KINDS.find((x) => x.kind === kind)!
   const v = value.trim()
-  const values = kind === 'program' ? [...new Set(v.split(/[\s,]+/).filter(Boolean))] : v ? [v] : []
+  const [skip, setSkip] = useState<Set<string>>(new Set()) // programs the admin unticked
+  const typed = kind === 'program' ? [...new Set(v.split(/[\s,]+/).filter(Boolean))] : v ? [v] : []
+  const values = typed.filter((x) => !skip.has(x))
   useEffect(() => {
     if (!values.length) return setPv(undefined)
     const t = setTimeout(() => {
@@ -164,7 +166,7 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
         .catch((e) => setPv({ total: 0, hits: 0, conflicts: [], error: (e as Error).message }))
     }, 250)
     return () => clearTimeout(t)
-  }, [action, kind, v, host]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [action, kind, v, host, skip]) // eslint-disable-line react-hooks/exhaustive-deps
   const conflicts = pv?.conflicts ?? []
   const remove = conflicts.filter((r) => !keep.has(r.id))
   const kept = conflicts.filter((r) => keep.has(r.id))
@@ -193,6 +195,12 @@ function RuleDialog({ init, policy, hosts, onClose, onDone }: { init: Target; po
       <Field label={k.label} desc={k.help}>
         <input type="text" className="mono" autoFocus placeholder={k.placeholder} value={value} onChange={(e) => setValue(e.target.value)} style={{ width: '100%' }}
           onKeyDown={(e) => { if (e.key === 'Enter' && canSave) void save() }} />
+        {kind === 'program' && typed.length > 1 && <div className="small" style={{ marginTop: 4 }}>
+          <span className="muted">One rule per program:</span>{' '}
+          {typed.map((x) => <label key={x} className="toggle mono" style={{ marginRight: 8 }}>
+            <input type="checkbox" checked={!skip.has(x)} onChange={() => { const s = new Set(skip); if (s.has(x)) s.delete(x); else s.add(x); setSkip(s) }} /> {x}
+          </label>)}
+        </div>}
         {pv?.error && <div className="err small" style={{ marginTop: 4 }}>{pv.error}</div>}
       </Field>
       <Field label="Hosts">

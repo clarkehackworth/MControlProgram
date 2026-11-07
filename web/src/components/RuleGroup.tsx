@@ -22,7 +22,7 @@ const fmt = (ts: number) => new Date(ts).toLocaleString()
 /** One action's rules (e.g. Blocked) as chips by kind, newest first, capped, with a Manage dialog for all of them. */
 export function RuleGroup<R extends GroupRule>({ title, kind, rules, desc, dim, kinds, ops }:
   { title: string; kind: 'ok' | 'err' | 'warn'; rules: R[]; desc: string; dim?: boolean; kinds: { kind: string; title: string }[]; ops: RuleOps<R> }) {
-  const [manage, setManage] = useState<string | null>() // kind filter, '' = all; undefined = closed
+  const [manage, setManage] = useState<string>() // kind filter; undefined = closed
   const newest = useMemo(() => [...rules].sort((a, b) => b.created_at - a.created_at), [rules])
   return (
     <div style={{ marginTop: 12 }}>
@@ -38,15 +38,14 @@ export function RuleGroup<R extends GroupRule>({ title, kind, rules, desc, dim, 
               {list.slice(0, CHIPS).map((r) => <span key={r.id} className="chip mono" title={`${r.note ? r.note + ' — ' : ''}added ${fmt(r.created_at)}`}>
                 {r.value}{r.host && <span className="muted"> @{r.host}</span>}<button title="Remove" aria-label={`Remove ${title.toLowerCase()} ${r.value}`} onClick={() => ops.onDelete(r)}>✕</button>
               </span>)}
-              {list.length > CHIPS && <button className="sm" onClick={() => setManage(k.kind)} title="Show all in Manage">+{list.length - CHIPS} more…</button>}
+              {list.length > CHIPS && <button className="sm" onClick={() => setManage(k.kind)} title={`Manage all ${title.toLowerCase()} ${k.title.toLowerCase()}`}>+{list.length - CHIPS} more…</button>}
               {list.length === 0 && <span className="muted small">None</span>}
             </div>
           </div>
         })}
       </div>
       </div>
-      <button className="sm" style={{ marginTop: 8 }} onClick={() => setManage('')}>Manage {title.toLowerCase()} ({rules.length})…</button>
-      {manage !== undefined && manage !== null && <ManageRules title={title} rules={newest} kinds={kinds} ops={ops} initialKind={manage} onClose={() => setManage(undefined)} />}
+      {manage !== undefined && <ManageRules title={title} rules={newest} kinds={kinds} ops={ops} initialKind={manage} onClose={() => setManage(undefined)} />}
     </div>
   )
 }

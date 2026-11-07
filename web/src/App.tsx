@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Navigate, NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { api, useApi } from './api'
 import Login from './pages/Login'
@@ -10,11 +10,27 @@ import Logs from './pages/Logs'
 import Settings from './pages/Settings'
 import Approvals from './pages/Approvals'
 import PluginPage, { inventoryKeys } from './pages/PluginPage'
-import type { PluginMeta } from './api'
+import type { Approval, PluginMeta } from './api'
 
 function Shell({ user, onLogout, children }: { user: string; onLogout: () => void; children: React.ReactNode }) {
-  const [appr] = useApi<{ pending: unknown[] }>('/approvals', 5000)
+  const [appr] = useApi<{ pending: Approval[] }>('/approvals', 5000)
   const n = appr?.pending.length ?? 0
+  const nav = useNavigate()
+  // Browser notifications for new approvals. Needs HTTPS or localhost; ponytail: only while a tab is open, add Web Push if needed without one.
+  const canNotify = typeof Notification !== 'undefined'
+  const [perm, setPerm] = useState(canNotify ? Notification.permission : 'denied')
+  const seen = useRef<Set<string>>()
+  useEffect(() => {
+    if (!appr) return
+    const ids = new Set(appr.pending.map((a) => a.id))
+    const fresh = seen.current ? appr.pending.filter((a) => !seen.current!.has(a.id)) : [] // first load: don't notify for the backlog
+    seen.current = ids
+    if (perm !== 'granted' || (!document.hidden && document.hasFocus())) return
+    for (const a of fresh) {
+      const note = new Notification('Approval needed', { body: `${a.summary || a.tool}\n${a.tool} by ${a.principal} · ${a.instance_name}`, tag: a.id })
+      note.onclick = () => { window.focus(); nav('/approvals'); note.close() }
+    }
+  }, [appr]) // eslint-disable-line react-hooks/exhaustive-deps
   const [sys] = useApi<{ version: string }>('/system')
   const [plugins] = useApi<PluginMeta[]>('/plugins')
   return (
@@ -29,7 +45,7 @@ function Shell({ user, onLogout, children }: { user: string; onLogout: () => voi
         <NavLink to="/settings">Settings</NavLink>
       </nav>
       <div className="main">
-        <div className="topbar"><span>{user}</span><button className="sm" onClick={onLogout}>Logout</button></div>
+        <div className="topbar">{canNotify && perm === 'default' && <button className="sm" title="Get a browser notification when an approval is waiting" onClick={() => void Notification.requestPermission().then(setPerm)}>Enable notifications</button>}<span>{user}</span><button className="sm" onClick={onLogout}>Logout</button></div>
         <div className="content">{children}</div>
       </div>
     </div>
