@@ -10,6 +10,7 @@ type Policy = 'allow' | 'ask' | 'deny'
 interface Rule { id: number; action: Action; kind: Kind; value: string; host: string; note: string; created_at: number }
 interface Cmd { id: number; ts: number; server_id: string; instance: string; principal: string | null; host: string; tool: string; command: string; exit_code: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now_blocked?: boolean; now_ask?: boolean; programs?: string[]; single?: string; writes?: string[]; unknown?: string[] }
 interface Target { action: Action; kind: Kind; value: string; host?: string; command?: string }
+interface Why { verdict: { ask?: string; blocked?: string }; overriding: Rule[]; writes: string[]; unknown: string[] }
 interface Preview { total: number; hits: number; example?: string; conflicts: Rule[] }
 
 const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/ssh/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
@@ -31,7 +32,7 @@ const dirOf = (f: string) => f.includes('/') ? f.replace(/\/[^/]*$/, '') || '/' 
 
 /** SSH plugin: admin command rules (default policy + block/ask/allow by program, command prefix, regex; optionally per host), pending asks, and the log of what agents ran. */
 export default function SshCommands({ hosts }: { hosts: string[] }) {
-  const [state, setState] = useState<{ policy: Policy; rules: Rule[] }>({ policy: 'allow', rules: [] })
+  const [state, setState] = useState<{ policy?: Policy; rules: Rule[] }>({ rules: [] }) // no policy until loaded: no radio lit
   const [dialog, setDialog] = useState<Target>()
   const [switching, setSwitching] = useState<Policy>()
   const { run, error } = useAction()
@@ -97,8 +98,8 @@ export default function SshCommands({ hosts }: { hosts: string[] }) {
           Still a guardrail, not a sandbox: interpreters (<code>python -c</code>, <code>perl -e</code>, <code>node</code>…) and scripts on disk run code that isn't checked, so don't allow them unless you trust what agents run.
         </p>
       </div>
-      <CommandLog state={state} hosts={hosts} onRule={setDialog} />
-      {dialog && <RuleDialog init={dialog} policy={policy} rules={rules} hosts={hosts} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
+      {policy && <CommandLog state={{ policy, rules }} hosts={hosts} onRule={setDialog} />}
+      {dialog && policy && <RuleDialog init={dialog} policy={policy} rules={rules} hosts={hosts} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
       {switching && <DenyDialog to={switching} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
   )
@@ -161,6 +162,11 @@ function RuleDialog({ init, policy, rules, hosts, onClose, onDone }: { init: Tar
   const typed = kind === 'program' ? [...new Set(v.split(/[\s,]+/).filter(Boolean))] : v ? [v] : []
   const has = (x: string) => rules.some((r) => r.action === action && r.kind === 'program' && r.value === x && (!r.host || r.host === host))
   const values = typed.length > 1 ? typed.filter((x) => picked.has(x) && !has(x)) : typed
+  // every program already has this rule but the line still asks: show what else is in the way
+  const [why, setWhy] = useState<Why>()
+  const allCovered = kind === 'program' && typed.length > 0 && typed.every(has)
+  useEffect(() => { setWhy(undefined); if (allCovered && action === 'allow' && init.command) void act<Why>('explain', { command: init.command, host: init.host }).then(setWhy).catch(() => {}) }, [allCovered, action]) // eslint-disable-line react-hooks/exhaustive-deps
+  const delRule = (r: Rule) => run(async () => { await act('delete_rule', { id: r.id }); setWhy(await act<Why>('explain', { command: init.command, host: init.host })) })
   useEffect(() => {
     if (!values.length) return setPv(undefined)
     const t = setTimeout(() => {
@@ -204,6 +210,15 @@ function RuleDialog({ init, policy, rules, hosts, onClose, onDone }: { init: Tar
             : <label key={x} className="toggle mono" style={{ marginRight: 8 }}>
               <input type="checkbox" checked={picked.has(x)} onChange={() => { const s = new Set(picked); if (s.has(x)) s.delete(x); else s.add(x); setPicked(s) }} /> {x}
             </label>)}
+        </div>}
+        {why && <div className="small" style={{ marginTop: 6 }}>
+          <strong>Every program here is already allowed.</strong>{' '}
+          {!why.verdict.ask && !why.verdict.blocked ? <span className="muted">The line is allowed now; allow this request once.</span> : <>It still {why.verdict.blocked ? 'is blocked' : 'asks'} because:
+          <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+            {why.overriding.map((r) => <li key={r.id}>{r.action} rule {r.kind}: <span className="mono">{r.value}</span>{r.host && ` @${r.host}`} <button className="sm" disabled={busy} onClick={() => void delRule(r)}>Remove</button></li>)}
+            {why.writes.map((f) => <li key={f}>writes <span className="mono">{f}</span> (no allow rule) <button className="sm" onClick={() => { setKind('write'); setValue(dirOf(f)) }}>Allow writes to {dirOf(f)}…</button></li>)}
+            {why.unknown.map((u) => <li key={u}>can't be checked: <span className="mono">{u}</span>; allow it once, or allow the whole command <button className="sm" onClick={() => { setKind('prefix'); setValue(init.command!) }}>as a prefix…</button></li>)}
+          </ul></>}
         </div>}
         {pv?.error && <div className="err small" style={{ marginTop: 4 }}>{pv.error}</div>}
       </Field>

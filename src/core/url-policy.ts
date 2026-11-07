@@ -69,8 +69,11 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
   const db = () => {
     const d = getDb();
     if (!ready) {
+      const fresh = !d.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(P);
       d.exec(`CREATE TABLE IF NOT EXISTS ${T} (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, value TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value));
         CREATE TABLE IF NOT EXISTS ${P} (k TEXT PRIMARY KEY, v TEXT NOT NULL);`);
+      // New installs start at ask; existing ones without a stored policy keep the old implicit allow.
+      if (fresh) d.prepare(`INSERT INTO ${P}(k,v) VALUES('default','ask')`).run();
       try { d.exec(`ALTER TABLE ${T} ADD COLUMN action TEXT NOT NULL DEFAULT 'block'`); } catch { /* exists */ }
       ready = true;
     }

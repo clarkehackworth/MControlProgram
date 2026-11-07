@@ -82,12 +82,15 @@ let ready = false;
 const db = () => {
   const d = getDb();
   if (!ready) {
+    const fresh = !d.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ssh_policy'").get();
     d.exec(`CREATE TABLE IF NOT EXISTS ssh_commands (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, server_id TEXT, instance TEXT, principal TEXT,
         host TEXT NOT NULL, tool TEXT NOT NULL, command TEXT NOT NULL, exit_code INTEGER, error TEXT, blocked TEXT, allowed_by TEXT, ms INTEGER);
       CREATE INDEX IF NOT EXISTS ssh_commands_ts ON ssh_commands(ts);
       CREATE TABLE IF NOT EXISTS ssh_rules (id INTEGER PRIMARY KEY, action TEXT NOT NULL, kind TEXT NOT NULL, value TEXT NOT NULL, host TEXT NOT NULL DEFAULT '',
         note TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, UNIQUE(kind, value, host));
       CREATE TABLE IF NOT EXISTS ssh_policy (k TEXT PRIMARY KEY, v TEXT NOT NULL);`);
+    // New installs start at ask; existing ones without a stored policy keep the old implicit allow.
+    if (fresh) d.prepare("INSERT INTO ssh_policy(k,v) VALUES('default','ask')").run();
     ready = true;
   }
   return d;
@@ -136,6 +139,18 @@ export const actions = {
     return { rows: rows.slice(0, limit), more: rows.length > limit };
   } },
   rules: { title: 'Command rules', run: async () => ({ policy: policy(), rules: rules() }) },
+  /** Why a line isn't allowed outright: overriding block/ask rules, written files no allow rule covers, parts the parser can't check. */
+  explain: { title: 'Explain verdict', run: async ({ command, host }: any) => {
+    const line = String(command ?? ''), h = String(host ?? ''), a = parse(line);
+    const rs = rules().filter((r) => !r.host || r.host === h);
+    const allows = rs.filter((r) => r.action === 'allow');
+    return {
+      verdict: verdict(line, h, rules(), policy()),
+      overriding: rs.filter((r) => r.action !== 'allow' && matchLine(r, line, a)),
+      writes: [...new Set(a.writes)].filter((f) => !allows.some((r) => matchWrite(r, f))),
+      unknown: a.unknown,
+    };
+  } },
   /** What a draft rule would match in the last 7 days, and (for allow) the block rules in its way. */
   preview: { title: 'Preview rule', run: async ({ action, kind, value, host, command }: any) => {
     const r = { action, ...normalize(kind, value), host: String(host ?? '') } as R;

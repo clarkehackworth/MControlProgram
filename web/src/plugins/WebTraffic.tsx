@@ -70,7 +70,7 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
   const act = useAct()
   const browser = plugin === 'browserpaw'
   const [sync, setSync] = useState<Record<string, Sync>>({})
-  const [state, setState] = useState<{ policy: Policy; rules: Rule[] }>({ policy: 'allow', rules: [] })
+  const [state, setState] = useState<{ policy?: Policy; rules: Rule[] }>({ rules: [] }) // no policy until loaded: no radio lit
   const [dialog, setDialog] = useState<Target>()
   const [switching, setSwitching] = useState<Policy>()
   const { run, error } = useAction()
@@ -145,8 +145,8 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
           </span>)}
         </div>}
       </div>
-      <RequestLog state={state} onRule={setDialog} browser={browser} />
-      {dialog && <RuleDialog init={dialog} state={state} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
+      {policy && <RequestLog state={{ policy, rules }} onRule={setDialog} browser={browser} />}
+      {dialog && policy && <RuleDialog init={dialog} state={{ policy, rules }} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
       {switching && <DenyDialog to={switching} rules={rules} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
   )
