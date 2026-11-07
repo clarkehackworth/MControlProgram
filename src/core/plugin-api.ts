@@ -135,7 +135,7 @@ export interface MControlProgramPlugin {
    * Plugin-level admin actions (run from the Plugins page), e.g. "add host", "generate key".
    * `inventory` limits the row button to one inventory table (a key of the global config); default all.
    */
-  globalActions?: Record<string, { title: string; inventory?: string; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
+  globalActions?: Record<string, { title: string; inventory?: string; /** only show the button on items whose fields match */ when?: Record<string, unknown>; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
   /**
    * Other plugins this one needs: plugin id → semver range (`^1.2.0`, `>=0.2.0`, `*`).
    * A plugin whose dependencies are missing or the wrong version is not loaded. Reach a dependency's

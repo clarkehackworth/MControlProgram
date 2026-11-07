@@ -31,10 +31,10 @@ const serverSchema = {
   required: ['name', 'transport'],
   properties: {
     name: { type: 'string', title: 'Name', description: 'Prefix for its tools (e.g. github → github_create_issue)', pattern: '^[a-zA-Z0-9_-]+$' },
-    description: { type: 'string', title: 'Description' },
+    description: { type: 'string', title: 'Description', 'x-no-column': true },
     transport: { type: 'string', title: 'Transport', enum: ['http', 'stdio'], default: 'http' },
     url: { type: 'string', title: 'URL', description: 'Streamable HTTP endpoint, e.g. https://mcp.example.com/mcp', 'x-show-if': { transport: 'http' } },
-    sshHost: { type: 'string', title: 'Reach via SSH host (optional)', description: 'Name of a host in the SSH plugin (must have a pinned host key). The URL is then resolved on that host, like ssh -L: e.g. http://127.0.0.1:12306/mcp is the remote machine\'s localhost. http only; not with OAuth.', 'x-show-if': { transport: 'http' } },
+    sshHost: { type: 'string', title: 'Reach via SSH host (optional)', 'x-no-column': true, description: 'Name of a host in the SSH plugin (must have a pinned host key). The URL is then resolved on that host, like ssh -L: e.g. http://127.0.0.1:12306/mcp is the remote machine\'s localhost. http only; not with OAuth.', 'x-show-if': { transport: 'http' } },
     auth: { type: 'string', title: 'Authentication', enum: ['none', 'bearer', 'header', 'oauth'], default: 'none', 'x-show-if': { transport: 'http' } },
     token: { type: 'string', title: 'Token / header value', 'x-secret': true, 'x-show-if': { auth: ['bearer', 'header'] } },
     headerName: { type: 'string', title: 'Header name', default: 'X-API-Key', 'x-show-if': { auth: 'header' } },
@@ -150,6 +150,7 @@ const plugin: MControlProgramPlugin = {
     },
     oauth_start: {
       title: 'Authorize (OAuth)',
+      when: { auth: 'oauth' },
       async run({ name }, { config, log }) {
         const s = (config.servers as ServerCfg[]).find((x) => x.name === name);
         if (!s) throw new Error('unknown server');

@@ -113,7 +113,7 @@ function Inventory({ p, k, servers, reload, options }: { p: PluginMeta; k: strin
               {cols.map(([c]) => <td key={c}>{String(it[c] ?? '')}</td>)}
               {fk.field ? <td><ServerToggles item={it.name} users={users} reload={reload} /></td> : ref ? <td>{refs(it.name).length ? <div className="chips">{refs(it.name).map((n) => <span key={n} className="chip small">{n}</span>)}</div> : <span className="muted small">—</span>}</td> : null}
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
-                {actions.map((a) => <button key={a.key} className="sm" disabled={busy}
+                {actions.filter((a) => !a.when || Object.entries(a.when).every(([f, v]) => it[f] === v)).map((a) => <button key={a.key} className="sm" disabled={busy}
                   onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
                 {fk.field && <button className="sm" onClick={() => setPairing(it.name)}>Pair server</button>}
                 <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>

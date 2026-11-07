@@ -46,7 +46,7 @@ export const copy = async (s: string) => {
 }
 
 // ---- shared types (mirror backend) ----
-export interface PluginMeta { id: string; name: string; version: string; description: string; configSchema: any; defaultConfig: Record<string, any>; source: string; globalConfigSchema?: any; globalConfig?: Record<string, any>; globalActions: { key: string; title: string; inventory?: string }[]; dependencies?: Record<string, string> }
+export interface PluginMeta { id: string; name: string; version: string; description: string; configSchema: any; defaultConfig: Record<string, any>; source: string; globalConfigSchema?: any; globalConfig?: Record<string, any>; globalActions: { key: string; title: string; inventory?: string; when?: Record<string, unknown> }[]; dependencies?: Record<string, string> }
 export type ToolRule = 'allow' | 'ask' | 'deny'
 export interface ApprovalPolicy { mode: 'none' | 'writes' | 'all'; rules?: Record<string, ToolRule> }
 export interface Instance { id: string; server_id: string; plugin_id: string; name: string; enabled: boolean; config: Record<string, any>; position: number; approval: ApprovalPolicy }

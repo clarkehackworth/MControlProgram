@@ -78,7 +78,7 @@ export function adminApi() {
     id: p.id, name: p.name, version: p.version, description: p.description, source: p.source,
     configSchema: p.configSchema, defaultConfig: p.defaultConfig ?? {},
     globalConfigSchema: p.globalConfigSchema, globalConfig: p.globalConfigSchema ? pluginConfig.redacted(p.id) : undefined,
-    globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory })),
+    globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory, when: a.when })),
     dependencies: p.dependencies ?? {},
   });
   /** First string that violates its schema `pattern` (walks objects and arrays); the UI checks the same thing live. */
