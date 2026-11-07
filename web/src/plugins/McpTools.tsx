@@ -43,7 +43,9 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
               <strong>{policy === p ? '● ' : '○ '}{t}</strong><div className="small" style={{ opacity: 0.8 }}>{d}</div>
             </button>)}
         </div>
-        <table>
+        {/* fixed layout: column widths don't depend on which groups are open */}
+        <table style={{ tableLayout: 'fixed', width: '100%' }}>
+          <colgroup><col style={{ width: '32%' }} /><col /><col style={{ width: 170 }} /></colgroup>
           <thead><tr><th>Tool</th><th>Description</th><th>Access</th></tr></thead>
           {groups.map((u) => <tbody key={u}>
             <tr style={{ cursor: 'pointer' }} onClick={() => toggle(u)} aria-expanded={expanded.has(u)}>
@@ -53,8 +55,8 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
                 <span className="muted small"> {tools.filter((t) => t.upstream === u && !t.rule).length} default ({POLICIES.find((x) => x[0] === policy)?.[1].replace(/ by default$/, '').toLowerCase()})</span></td>
             </tr>
             {expanded.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
-              <td className="mono" style={{ paddingLeft: 24 }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
-              <td className="muted small" style={{ width: '100%' }} title={t.description}><div style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.description}</div></td>
+              <td className="mono" style={{ paddingLeft: 24, overflowWrap: 'anywhere' }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
+              <td className="muted small" title={t.description}><div style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.description}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 <div className="row" style={{ gap: 4 }} role="radiogroup" aria-label={`${t.tool} access`}>
                   {ACTIONS.map((a) => <button key={a} role="radio" aria-checked={t.rule === a} disabled={busy}
