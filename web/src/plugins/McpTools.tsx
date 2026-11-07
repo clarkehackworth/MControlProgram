@@ -26,8 +26,8 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
   const refresh = (name: string) => run(async () => { await act('test_server', { name }); await load() })
   const unseen = upstreams.filter((u) => !tools.some((t) => t.upstream === u))
   const groups = [...new Set(tools.map((t) => t.upstream))]
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
-  const toggle = (u: string) => setCollapsed((c) => { const n = new Set(c); if (n.has(u)) n.delete(u); else n.add(u); return n })
+  const [expanded, setExpanded] = useState<Set<string>>(new Set()) // groups start closed
+  const toggle = (u: string) => setExpanded((c) => { const n = new Set(c); if (n.has(u)) n.delete(u); else n.add(u); return n })
 
   return (
     <>
@@ -45,10 +45,10 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
         <table>
           <thead><tr><th>Tool</th><th>Description</th><th>Access</th></tr></thead>
           {groups.map((u) => <tbody key={u}>
-            <tr style={{ cursor: 'pointer' }} onClick={() => toggle(u)} aria-expanded={!collapsed.has(u)}>
-              <td colSpan={3}><strong>{collapsed.has(u) ? '▸' : '▾'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span></td>
+            <tr style={{ cursor: 'pointer' }} onClick={() => toggle(u)} aria-expanded={expanded.has(u)}>
+              <td colSpan={3}><strong>{expanded.has(u) ? '▾' : '▸'} {u}</strong> <span className="muted small">({tools.filter((t) => t.upstream === u).length} tools)</span></td>
             </tr>
-            {!collapsed.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
+            {expanded.has(u) && tools.filter((t) => t.upstream === u).map((t) => <tr key={t.tool}>
               <td className="mono" style={{ paddingLeft: 24 }}>{t.tool}{t.read_only && <> <Badge>read-only</Badge></>}</td>
               <td className="muted small" style={{ width: '100%' }} title={t.description}><div style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.description}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
@@ -67,7 +67,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>
           Applies to every MCP pass-through instance on every server, immediately (connections are kept). Tools hidden by an instance's expose/hide lists aren't offered to agents at all.
-          A tool's own rule wins over the default; a blue button is the tool's own rule; click it again to go back to the default. Click a server to collapse its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
+          A tool's own rule wins over the default; a blue button is the tool's own rule; click it again to go back to the default. Click a server to show its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
           The list updates whenever an instance connects or you run <em>Test server</em>.
         </p>
       </div>
