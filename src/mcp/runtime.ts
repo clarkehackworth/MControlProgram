@@ -30,6 +30,12 @@ interface Session {
 
 const sanitize = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, '_');
 
+// Log the target URL incl. query (userinfo and hash dropped).
+function urlOf(args: any): string {
+  if (typeof args?.url !== 'string') return '';
+  try { const u = new URL(args.url); return ` ${u.origin}${u.pathname}${u.search}`; } catch { return ''; }
+}
+
 export class RunningServer {
   record: ServerRecord;
   private http?: HttpServer;
@@ -244,7 +250,7 @@ export class RunningServer {
       const result = await tool.handler(args ?? {}, { sessionId: session.id, principal: session.principal, signal: extra.signal, log: li.log });
       if (lvl === 'tools' || lvl === 'full') {
         log({ level: result.isError ? 'warn' : 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id,
-          message: `${fullName} by ${session.principal} ${result.isError ? 'ERROR' : 'ok'} ${Date.now() - t0}ms`,
+          message: `${fullName}${urlOf(args)} by ${session.principal} ${result.isError ? 'ERROR' : 'ok'} ${Date.now() - t0}ms`,
           data: lvl === 'full' ? { args, result: summarize(result) } : undefined });
       }
       return result as any;
