@@ -53,9 +53,9 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
               <td className="muted small" style={{ width: '100%' }} title={t.description}><div style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>{t.description}</div></td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 <div className="row" style={{ gap: 4 }} role="radiogroup" aria-label={`${t.tool} access`}>
-                  {ACTIONS.map((a) => { const cur = (t.rule ?? policy) === a
-                    // ponytail: the current rule (own, else default) is just disabled; no "back to default" once a tool has its own rule
-                    return <button key={a} role="radio" aria-checked={cur} disabled={busy || cur} className="sm" onClick={() => void setRule(t, a)}>{a}</button> })}
+                  {ACTIONS.map((a) => <button key={a} role="radio" aria-checked={t.rule === a} disabled={busy}
+                    className={`sm${t.rule === a ? ' primary' : ''}`} title={t.rule === a ? 'Click again to follow the default' : undefined}
+                    onClick={() => void setRule(t, t.rule === a ? '' : a)}>{a}</button>)}
                 </div>
               </td>
             </tr>)}
@@ -67,7 +67,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>
           Applies to every MCP pass-through instance on every server, immediately (connections are kept). Tools hidden by an instance's expose/hide lists aren't offered to agents at all.
-          A tool's own rule wins over the default; the greyed-out button is the tool's current rule. Click a server to collapse its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
+          A tool's own rule wins over the default; a blue button is the tool's own rule; click it again to go back to the default. Click a server to collapse its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
           The list updates whenever an instance connects or you run <em>Test server</em>.
         </p>
       </div>
