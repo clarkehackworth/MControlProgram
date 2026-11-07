@@ -396,8 +396,8 @@ const plugin: MControlProgramPlugin = {
     properties: {
       profiles: { type: 'array', title: 'Profiles to expose', description: 'Empty = none.', items: { type: 'string', 'x-options-from': 'profiles' }, 'x-disabled-key': 'profilesDisabled', default: [] },
       profilesDisabled: { type: 'array', items: { type: 'string' }, 'x-hidden': true, default: [] },
-      allowTools: { type: 'array', title: 'Allow only these tools', description: 'BrowserPaw tool names; empty = all', items: { type: 'string' }, default: [] },
-      denyTools: { type: 'array', title: 'Deny these tools', description: 'e.g. chrome_javascript, chrome_get_cookies, chrome_network_capture', items: { type: 'string' }, default: [] },
+      allowTools: { type: 'array', title: 'Expose only these tools', description: 'BrowserPaw tool names; empty = all. Hidden tools are not listed to agents. To allow, ask or deny calls to exposed tools, use Tool rules on the server.', items: { type: 'string' }, default: [] },
+      denyTools: { type: 'array', title: 'Hide these tools', description: 'Wins over the expose list. e.g. chrome_javascript, chrome_get_cookies, chrome_network_capture', items: { type: 'string' }, default: [] },
       idleDisconnectSec: { type: 'integer', title: 'Idle disconnect (seconds)', description: 'Close the tunnel after no calls (the browser keeps running). 0 = MControlProgram default', default: 0 },
     },
   },

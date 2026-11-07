@@ -66,5 +66,8 @@ fieldset { border: 1px solid var(--border); border-radius: 6px; padding: 12px; m
 .log-row td { padding: 4px 8px; font-size: 12.5px } .log-row .lvl { width: 56px } .log-row .ts { white-space: nowrap; color: var(--muted) }
 .chips { display: flex; flex-wrap: wrap; gap: 6px } .chip { display: inline-flex; gap: 6px; align-items: center; background: var(--bg); border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; font-size: 12.5px }
 .chip button { padding: 0 2px; border: 0; background: none; color: var(--muted) }
+/* long values (domains, URLs, commands) wrap inside the chip; without this they overflow into the next
+   grid column, which then sits on top of the chip's remove button and swallows the click */
+.chip { max-width: 100%; overflow-wrap: anywhere } .chip button { flex: none }
 .kv { display: grid; grid-template-columns: 1fr 1fr auto; gap: 6px; margin-bottom: 6px }
 .toggle { display: inline-flex; align-items: center; gap: 6px; cursor: pointer }

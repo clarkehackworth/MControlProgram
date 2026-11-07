@@ -23,6 +23,11 @@ test('ask rules: precedence block > ask > allow > default, in URL and SSH engine
   assert.equal(ssh.verdict('ls; whoami', 'h', S, 'ask').ask, 'default: ask');
   assert.match(ssh.verdict('X=ls; $X', 'h', S, 'ask').ask!, /cannot check/, 'unanalyzable lines ask a human instead of failing');
   assert.ok(ssh.verdict('X=ls; $X', 'h', S, 'deny').blocked);
+  // `\'` inside single quotes closes the quote: bash runs a chunk of python as a "program". Never offer it as a rule.
+  const broken = JSON.parse(fs.readFileSync(new URL('./fixtures/ssh-broken-quotes.json', import.meta.url), 'utf8'));
+  assert.ok(ssh.programs(broken).some((p) => p.includes('bounds=')), 'fixture still produces a junk program name');
+  const d = ssh.describe(broken);
+  assert.ok(d.programs.length > 0 && d.programs.every((p) => { try { ssh.normalize('program', p); return true; } catch { return false; } }), `offered: ${d.programs}`);
   assert.equal((await ssh.actions.rule.run({ action: 'ask', kind: 'program', value: 'curl' })).stored, true);
   assert.equal(ssh.rules().find((r) => r.value === 'curl')!.action, 'ask');
 });

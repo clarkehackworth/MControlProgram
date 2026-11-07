@@ -122,7 +122,7 @@ const plugin: MControlProgramPlugin = {
   id: 'mcp',
   name: 'MCP pass-through',
   version: '0.1.0',
-  description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with logging, per-tool allow/deny and approval gating.',
+  description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with logging, an expose/hide list, and the gateway allow/ask/deny tool rules.',
   globalConfigSchema: {
     type: 'object',
     properties: {
@@ -189,8 +189,8 @@ const plugin: MControlProgramPlugin = {
       servers: { type: 'array', title: 'Servers to expose', description: 'Empty = no servers.', items: { type: 'string', 'x-options-from': 'servers' }, 'x-disabled-key': 'serversDisabled', default: [] },
       serversDisabled: { type: 'array', items: { type: 'string' }, 'x-hidden': true, default: [] },
       flat: { type: 'boolean', title: 'Flat tool names', description: 'Do not prefix tool names with the server name (use when exposing a single server)', default: false },
-      allowTools: { type: 'array', title: 'Allow only these tools', description: 'Upstream tool names (or server/tool); empty = all', items: { type: 'string' }, default: [] },
-      denyTools: { type: 'array', title: 'Deny these tools', items: { type: 'string' }, default: [] },
+      allowTools: { type: 'array', title: 'Expose only these tools', description: 'Upstream tool names (or server/tool); empty = all. Hidden tools are not listed to agents. To allow, ask or deny calls to exposed tools, use Tool rules on the server.', items: { type: 'string' }, default: [] },
+      denyTools: { type: 'array', title: 'Hide these tools', description: 'Upstream tool names (or server/tool). Wins over the expose list.', items: { type: 'string' }, default: [] },
       idleDisconnectSec: { type: 'integer', title: 'Idle disconnect (seconds)', description: '0 = MControlProgram default', default: 0 },
     },
   },

@@ -32,6 +32,10 @@ export function parse(line: string): Analysis {
 }
 export const programs = (line: string) => [...new Set(parse(line).commands.map((c) => c.program))];
 
+/** Names a program rule can hold. A broken line (e.g. `\'` inside single quotes) can make bash run a "program" named after a chunk of code. */
+const BAD_PROGRAM = /[\s/;&|`$()'"]/;
+const ruleable = (p: string) => !!p && !BAD_PROGRAM.test(p);
+
 function matchCmd(r: Pick<Rule, 'kind' | 'value'>, c: Cmd): boolean {
   if (r.kind === 'program') return c.program === r.value;
   // whole words: prefix "ls" matches "ls -la" but not "lsblk"
@@ -65,7 +69,7 @@ export function verdict(line: string, host: string, list: R[], def: Policy): { b
 export function normalize(kind: string, raw: string): { kind: Kind; value: string } {
   const v = String(raw ?? '').trim();
   if (!v) throw new Error('value is required');
-  if (kind === 'program') { if (/[\s/;&|`$()'"]/.test(v)) throw new Error(`"${v}" is not a program name (no paths, spaces or shell characters)`); return { kind, value: v }; }
+  if (kind === 'program') { if (!ruleable(v)) throw new Error(`"${v}" is not a program name (no paths, spaces or shell characters)`); return { kind, value: v }; }
   if (kind === 'prefix') return { kind, value: v };
   if (kind === 'regex') { safeRegex(v); return { kind, value: v }; }
   if (kind === 'write') return { kind, value: v.length > 1 ? v.replace(/\/+$/, '') : v };
@@ -106,7 +110,8 @@ export const prune = (days: number) => db().prepare('DELETE FROM ssh_commands WH
 /** What the UI needs to offer rules for a line (programs, single command, written files), so it needs no copy of the parser. */
 export function describe(line: string) {
   const a = parse(line);
-  return { programs: programs(line), writes: [...new Set(a.writes)], unknown: a.unknown, single: a.commands.length === 1 ? a.commands[0]!.text : undefined };
+  // only names a program rule can hold; for the rest the UI offers the command (prefix) instead
+  return { programs: programs(line).filter(ruleable), writes: [...new Set(a.writes)], unknown: a.unknown, single: a.commands.length === 1 ? a.commands[0]!.text : undefined };
 }
 
 const isCmd = (tool: string) => tool === 'exec' || tool === 'shell';
@@ -164,7 +169,7 @@ export const actions = {
       if (x.blocked) continue;
       const mine = rs.filter((r) => !r.host || r.host === x.host);
       for (const c of parse(x.command).commands)
-        if (!mine.some((r) => matchCmd(r, c))) n.set(c.program, (n.get(c.program) ?? 0) + 1);
+        if (ruleable(c.program) && !mine.some((r) => matchCmd(r, c))) n.set(c.program, (n.get(c.program) ?? 0) + 1);
     }
     return { programs: [...n].sort((a, b) => b[1] - a[1]) };
   } },
