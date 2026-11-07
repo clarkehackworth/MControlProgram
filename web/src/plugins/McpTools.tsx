@@ -31,7 +31,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
 
   return (
     <>
-      <PendingAsks plugin="mcp" title="Tool calls waiting for approval" hideEmpty />
+      <PendingAsks plugin="mcp" title="Tool calls waiting for approval" hideEmpty onChange={load} />
       <div className="card">
         <h2 style={{ margin: 0 }}>Access rules</h2>
         {error && <Alert kind="err">{error}</Alert>}

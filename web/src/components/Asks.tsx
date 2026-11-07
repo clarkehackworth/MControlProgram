@@ -22,7 +22,7 @@ const urlTarget = (s: any, action: RuleAction) => action === 'block' ? { action,
  * Pending asks with their decisions. `plugin` limits the list to one plugin (its own page); without it, every ask (Approvals page).
  * "Add … rule" writes the rule where it lives (the plugin's rules, or the instance's tool rules), then decides the ask.
  */
-export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty }: { plugin?: string; title?: string; hideEmpty?: boolean }) {
+export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty, onChange }: { plugin?: string; title?: string; hideEmpty?: boolean; onChange?: () => void }) {
   const [data, reload, err] = useApi<{ pending: Approval[] }>(`/approvals${plugin ? `?plugin=${plugin}` : ''}`, 3000)
   const { run, error, busy } = useAction()
   const [dialog, setDialog] = useState<{ a: Approval; action: RuleAction }>()
@@ -35,7 +35,7 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty 
       // MCP pass-through: the upstream tool's rule; core tool gate: the instance's per-tool rule
       if (a.feature === 'mcp_tool') await api(`/plugins/mcp/actions/set_tool_rule`, { method: 'POST', body: { upstream: a.subject?.upstream, tool: a.subject?.tool, action: rule } })
       else await api(`/instances/${a.instance_id}/tool-rules/${encodeURIComponent(a.subject?.tool ?? a.tool)}`, { method: 'PUT', body: { rule } })
-      await decide(a, action === 'allow' ? 'approved' : 'denied'); await reload()
+      await decide(a, action === 'allow' ? 'approved' : 'denied'); await reload(); onChange?.()
     })
   }
   const ruleDone = async (action: string) => {
