@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useState } from 'react'
 import { Alert, Badge, Field, Modal, api, useAction, type PluginUi } from '@mcontrolprogram/ui'
 
 interface Port { host_ip?: string; host_port: number; sandbox_port: number; protocol?: string }
@@ -7,6 +7,9 @@ interface Rule { id: string; decision: string; resources: string[]; scope: strin
 interface Conn { sandbox_id: string; host: string; count: number; last_seen: string; rule?: string; reason?: string; allowed: boolean }
 interface HostCfg { name: string; workspaceRoots?: string[] }
 
+// open sandbox row + its expansion read as one block
+const OPEN_ROW = { background: 'var(--bg3)' }
+const OPEN_EDGE = { boxShadow: 'inset 3px 0 0 var(--accent)' }
 const AGENTS = ['shell', 'claude', 'codex', 'cursor', 'devin', 'docker-agent', 'gemini', 'opencode']
 /** Run an agent tool from the admin page (server-side `call` action). */
 const tool = <T = any,>(host: string, name: string, args: Record<string, unknown> = {}) =>
@@ -45,6 +48,7 @@ function HostView({ h }: { h: HostCfg }) {
 
   return (
     <>
+      <style>{'tr.sbx-open > td { border-bottom: 0 }'}</style>
       <div className="card">
         <div className="row between">
           <h2 style={{ margin: 0 }}>Sandboxes <span className="muted small">on {h.name}</span></h2>
@@ -57,8 +61,9 @@ function HostView({ h }: { h: HostCfg }) {
         <table style={{ marginTop: 12 }}>
           <thead><tr><th>Name</th><th>Agent</th><th>Status</th><th>Ports</th><th>Workspaces</th><th>Last used</th><th /></tr></thead>
           <tbody>
-            {list?.map((s) => <tr key={s.name} style={sel === s.name ? { background: 'var(--hover, rgba(127,127,127,.08))' } : undefined}>
-              <td className="mono"><a href="#" onClick={(e) => { e.preventDefault(); setSel(sel === s.name ? undefined : s.name) }}>{sel === s.name ? '▾' : '▸'} {s.name}</a></td>
+            {list?.map((s) => <Fragment key={s.name}>
+            <tr className={sel === s.name ? 'sbx-open' : undefined} style={sel === s.name ? OPEN_ROW : { cursor: 'pointer' }} onClick={(e) => { if (!(e.target as HTMLElement).closest('button')) setSel(sel === s.name ? undefined : s.name) }}>
+              <td className="mono" style={sel === s.name ? OPEN_EDGE : undefined}><span className="muted">{sel === s.name ? '▾' : '▸'}</span> {s.name}</td>
               <td>{s.agent}</td>
               <td><Badge kind={s.status === 'running' ? 'ok' : undefined}>{s.status}</Badge></td>
               <td className="mono small">{s.ports?.map(portStr).join(', ') || '—'}</td>
@@ -70,14 +75,17 @@ function HostView({ h }: { h: HostCfg }) {
                   : <button className="sm" disabled={busy} onClick={() => void start(s.name)} title="Starts it by running a no-op command">Start</button>}
                 {' '}<button className="sm danger" disabled={busy} onClick={() => act('remove', s.name, `Delete sandbox ${s.name} and everything inside it?\n\nMounted workspaces on the host are kept.`)}>Remove</button>
               </td>
-            </tr>)}
+            </tr>
+            {sel === s.name && <tr style={{ background: OPEN_ROW.background }}>
+              <td colSpan={7} style={{ ...OPEN_EDGE, padding: '4px 16px 16px 26px' }}><SandboxDetail host={h.name} s={s} reload={load} /></td>
+            </tr>}
+            </Fragment>)}
             {list?.length === 0 && <tr><td colSpan={7} className="muted">No sandboxes.</td></tr>}
             {!list && <tr><td colSpan={7} className="muted">{busy ? 'Loading…' : '—'}</td></tr>}
           </tbody>
         </table>
-        <p className="muted small" style={{ marginBottom: 0 }}>Click a sandbox to open its ports, a command console and its policy. Workspace roots: {h.workspaceRoots?.length ? <span className="mono">{h.workspaceRoots.join(', ')}</span> : 'none (no host file access for agents)'}.</p>
+        <p className="muted small" style={{ marginBottom: 0 }}>Click a sandbox to run commands and manage its ports; the policy and log below then show only that sandbox. Workspace roots: {h.workspaceRoots?.length ? <span className="mono">{h.workspaceRoots.join(', ')}</span> : 'none (no host file access for agents)'}.</p>
       </div>
-      {sel && list?.some((s) => s.name === sel) && <SandboxDetail key={sel} host={h.name} s={list.find((s) => s.name === sel)!} reload={load} />}
       <Policy host={h.name} sandbox={sel} />
       <NetLog host={h.name} sandbox={sel} />
       {creating && <CreateDialog h={h} onClose={() => setCreating(false)} onDone={async (name) => { setCreating(false); await load(); setSel(name) }} />}
@@ -119,42 +127,41 @@ function CreateDialog({ h, onClose, onDone }: { h: HostCfg; onClose: () => void;
   )
 }
 
+/** Expanded inside the sandbox's table row: command console and ports. */
 function SandboxDetail({ host, s, reload }: { host: string; s: Sandbox; reload: () => Promise<void> }) {
   const [cmd, setCmd] = useState('')
   const [out, setOut] = useState<string>()
   const [port, setPort] = useState('')
-  const [cp, setCp] = useState({ from: '', to: '' })
   const { run, error, busy } = useAction()
   const exec = () => run(async () => { setOut(String(await tool(host, 'exec', { sandbox: s.name, command: cmd }))) })
   const ports = (k: 'publish' | 'unpublish', spec: string) => run(async () => { await tool(host, 'ports', { sandbox: s.name, [k]: [spec] }); setPort(''); await reload() })
-  const copy = () => run(async () => { await tool(host, 'copy', cp); setOut(`Copied ${cp.from} → ${cp.to}`) })
+  const label = { width: 110, flex: 'none', paddingTop: 7 } as const
 
   return (
-    <div className="card">
-      <h2 style={{ marginTop: 0 }}>{s.name} <span className="muted small">{s.agent} · created {s.created_at ? new Date(s.created_at).toLocaleString() : '?'}</span></h2>
+    <div style={{ display: 'grid', gap: 10 }}>
+      <div className="small muted">Created {s.created_at ? new Date(s.created_at).toLocaleString() : '?'}</div>
       {error && <Alert kind="err">{error}</Alert>}
-      <Field label="Run a command" desc="sh -c inside the sandbox (starts it if stopped). No TTY, no stdin.">
-        <div className="row">
-          <input type="text" className="mono" value={cmd} onChange={(e) => setCmd(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && cmd && void exec()} placeholder="ls -la /workspace" style={{ flex: 1 }} />
-          <button className="sm primary" disabled={busy || !cmd} onClick={() => void exec()}>{busy && cmd ? "Running…" : "Run"}</button>
+      <div className="row" style={{ alignItems: 'flex-start' }}>
+        <span className="small" style={label}>Command</span>
+        <div style={{ flex: 1, display: 'grid', gap: 6 }}>
+          <div className="row">
+            <input type="text" className="mono" value={cmd} onChange={(e) => setCmd(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && cmd && void exec()} placeholder="ls -la /workspace" style={{ flex: 1 }} />
+            <button className="sm primary" disabled={busy || !cmd} onClick={() => void exec()}>{busy && cmd ? 'Running…' : 'Run'}</button>
+          </div>
+          <span className="small muted">sh -c inside the sandbox; starts it if stopped. No TTY or stdin.</span>
+          {out !== undefined && <pre style={{ maxHeight: 320 }}>{out}</pre>}
         </div>
-      </Field>
-      {out !== undefined && <pre style={{ maxHeight: 360, overflow: 'auto' }}>{out}</pre>}
-      <Field label="Copy files" desc={`Between the host and the sandbox. Write the sandbox side as ${s.name}:/path; the host side must be inside a workspace root.`}>
-        <div className="row">
-          <input type="text" className="mono" value={cp.from} onChange={(e) => setCp({ ...cp, from: e.target.value })} placeholder={`${s.name}:/workspace/out.txt`} style={{ flex: 1 }} />
-          <span>→</span>
-          <input type="text" className="mono" value={cp.to} onChange={(e) => setCp({ ...cp, to: e.target.value })} placeholder="/srv/work/out.txt" style={{ flex: 1 }} />
-          <button className="sm" disabled={busy || !cp.from || !cp.to} onClick={() => void copy()}>Copy</button>
-        </div>
-      </Field>
-      <Field label="Published ports">
-        <div className="row" style={{ flexWrap: 'wrap' }}>
-          {s.ports?.map((p) => <span key={portStr(p)} className="badge">{portStr(p)} <a href="#" title="Unpublish" onClick={(e) => { e.preventDefault(); void ports('unpublish', `${p.host_port}:${p.sandbox_port}`) }}>✕</a></span>)}
-          <input type="text" className="mono" value={port} onChange={(e) => setPort(e.target.value)} placeholder="[HOST_PORT:]SANDBOX_PORT" style={{ width: 200 }} />
+      </div>
+      <div className="row" style={{ alignItems: 'flex-start' }}>
+        <span className="small" style={label}>Ports</span>
+        <div className="row" style={{ flex: 1, flexWrap: 'wrap' }}>
+          <div className="chips">
+            {s.ports?.map((p) => <span key={portStr(p)} className="chip mono">{portStr(p)}<a href="#" title="Unpublish" onClick={(e) => { e.preventDefault(); void ports('unpublish', `${p.host_port}:${p.sandbox_port}`) }}>✕</a></span>)}
+          </div>
+          <input type="text" className="mono" value={port} onChange={(e) => setPort(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && port && void ports('publish', port)} placeholder="[HOST_PORT:]SANDBOX_PORT" style={{ width: 220 }} />
           <button className="sm" disabled={busy || !port} onClick={() => void ports('publish', port)}>Publish</button>
         </div>
-      </Field>
+      </div>
     </div>
   )
 }
