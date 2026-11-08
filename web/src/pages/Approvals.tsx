@@ -1,5 +1,5 @@
 import { api, fmtTime, useApi, type Approval } from '../api'
-import { Alert, Badge, useAction } from '../components/ui'
+import { Alert, Badge, LoadingRow, useAction } from '../components/ui'
 import { PendingAsks } from '../components/Asks'
 
 const KIND: Record<string, 'ok' | 'err' | 'warn' | 'info' | undefined> = { approved: 'ok', used: 'ok', denied: 'err', expired: 'warn', pending: 'info' }
@@ -24,7 +24,8 @@ export default function Approvals() {
             <td>{a.principal}</td><td>{a.instance_name}</td><td><Badge kind={KIND[a.status]}>{a.status}</Badge></td><td>{a.decided_by ?? ''}</td>
             <td>{a.status === 'denied' && a.expires_at > Date.now() && <button className="sm" disabled={busy} onClick={() => undo(a)}
               title="Put this request back in the queue so you can decide again. The agent's next identical call checks back instead of being refused. A block rule you added stays: remove it on the plugin's page.">Undo</button>}</td></tr>)}
-          {recent.length === 0 && <tr><td colSpan={7} className="muted">No decisions yet.</td></tr>}
+          {!data && !err && <LoadingRow cols={7} />}
+          {data && recent.length === 0 && <tr><td colSpan={7} className="muted">No decisions yet.</td></tr>}
         </tbody></table>
       </div>
     </>

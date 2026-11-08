@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 import { api, useApi, type Server } from '../api'
-import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
+import { Alert, Badge, LoadingRow, Field, Modal, useAction } from '../components/ui'
 
 export default function Servers() {
   const [servers, reload, err] = useApi<Server[]>('/servers', 5000)
@@ -33,6 +33,7 @@ export default function Servers() {
                 </td>
               </tr>
             ))}
+            {!servers && !err && <LoadingRow cols={8} />}
             {servers && servers.length === 0 && <tr><td colSpan={8} className="muted">No servers yet. Create one to expose plugins to agents.</td></tr>}
           </tbody>
         </table>

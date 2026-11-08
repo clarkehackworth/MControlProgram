@@ -28,6 +28,8 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px }
 .stack { display: flex; flex-direction: column; gap: 10px }
 .muted { color: var(--muted) } .small { font-size: 12px } .mono { font-family: ui-monospace, Menlo, monospace }
 .err { color: var(--err) } .ok { color: var(--ok) }
+.spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -2px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite }
+@keyframes spin { to { transform: rotate(360deg) } }
 
 table { width: 100%; border-collapse: collapse }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top }

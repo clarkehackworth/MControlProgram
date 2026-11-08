@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, Badge, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
+import { Alert, Badge, LoadingRow, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
 
 type Kind = 'program' | 'prefix' | 'regex' | 'write'
 type Action = 'block' | 'ask' | 'allow'
@@ -341,7 +341,7 @@ function CommandLog({ state, hosts, onRule }: { state: { policy: Policy; rules: 
               </div>}</td>
             </tr>
           })}
-          {rows.length === 0 && <tr><td colSpan={8} className="muted">{data ? 'No commands in this timeframe.' : 'Loading…'}</td></tr>}
+          {rows.length === 0 && (data ? <tr><td colSpan={8} className="muted">No commands in this timeframe.</td></tr> : <LoadingRow cols={8} />)}
         </tbody>
       </table>
       </div>

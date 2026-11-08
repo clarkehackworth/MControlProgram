@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { api, fmtTime, useApi, type ApprovalPolicy, type ToolRule, type Instance, type InstanceStatus, type PluginMeta, type Server } from '../api'
-import { Alert, Badge, CopyButton, Field, Modal, useAction } from '../components/ui'
+import { Alert, Badge, LoadingRow, CopyButton, Field, Modal, useAction } from '../components/ui'
 import SchemaForm, { defaultsFor } from '../components/SchemaForm'
 import { AuthSelect, LogSelect } from './Servers'
 import { LogTable } from './Logs'
@@ -195,6 +195,7 @@ function Access({ server }: { server: Server }) {
         <table><thead><tr><th>Name</th><th>Prefix</th><th>Created</th><th>Last used</th><th>Expires</th><th></th></tr></thead><tbody>
           {tokens?.map((t) => <tr key={t.id}><td>{t.name}</td><td className="mono">{t.prefix}…</td><td>{fmtTime(t.created_at)}</td><td>{fmtTime(t.last_used_at)}</td><td>{t.expires_at ? fmtTime(t.expires_at) : 'never'}</td>
             <td><button className="sm danger" onClick={() => { if (window.confirm(`Revoke token "${t.name}"?`)) void run(async () => { await api(`/tokens/${t.id}`, { method: 'DELETE' }); await reloadTokens() }) }}>Revoke</button></td></tr>)}
+          {!tokens && <LoadingRow cols={6} />}
           {tokens?.length === 0 && <tr><td colSpan={6} className="muted">No tokens.</td></tr>}
         </tbody></table>
       </div>
@@ -206,6 +207,7 @@ function Access({ server }: { server: Server }) {
             <td><label className="toggle"><input type="checkbox" checked={c.approved} onChange={(e) => run(async () => { await api(`/oauth/clients/${c.client_id}`, { method: 'PUT', body: { approved: e.target.checked } }); await reloadClients() })} /> {c.approved ? 'yes' : 'no'}</label></td>
             <td>{fmtTime(c.created_at)}</td>
             <td><button className="sm danger" onClick={() => { if (window.confirm('Delete client and revoke its tokens?')) void run(async () => { await api(`/oauth/clients/${c.client_id}`, { method: 'DELETE' }); await reloadClients() }) }}>Delete</button></td></tr>)}
+          {!clients && <LoadingRow cols={6} />}
           {clients?.length === 0 && <tr><td colSpan={6} className="muted">No OAuth clients registered.</td></tr>}
         </tbody></table>
         {issued && issued.length > 0 && <details style={{ marginTop: 12 }}><summary className="muted small">Issued tokens ({issued.length})</summary>

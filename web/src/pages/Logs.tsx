@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api, useApi, type LogRow, type Server } from '../api'
-import { Alert, Badge, useAction } from '../components/ui'
+import { Alert, Badge, LoadingRow, useAction } from '../components/ui'
 
 const LEVELS = ['', 'debug', 'info', 'warn', 'error']
 const CATS = ['', 'system', 'server', 'auth', 'connection', 'tool', 'approval', 'plugin']
@@ -13,6 +13,7 @@ export function LogTable({ serverId }: { serverId?: string }) {
   const [servers] = useApi<Server[]>(serverId ? null : '/servers')
   const [f, setF] = useState({ server: serverId ?? '', category: '', level: '', q: '' })
   const [rows, setRows] = useState<LogRow[]>([])
+  const [loaded, setLoaded] = useState(false)
   const [live, setLive] = useState(true)
   const [more, setMore] = useState(true)
   const { run, error, busy } = useAction()
@@ -22,7 +23,7 @@ export function LogTable({ serverId }: { serverId?: string }) {
     if (before) p.set('before', String(before)); p.set('limit', '100')
     return p.toString()
   }
-  const load = () => run(async () => { const r = await api<LogRow[]>(`/logs?${qs()}`); setRows(r); setMore(r.length === 100) })
+  const load = () => run(async () => { const r = await api<LogRow[]>(`/logs?${qs()}`); setRows(r); setMore(r.length === 100); setLoaded(true) })
   const loadMore = () => run(async () => { const r = await api<LogRow[]>(`/logs?${qs(rows[rows.length - 1]?.id)}`); setRows([...rows, ...r]); setMore(r.length === 100) })
   useEffect(() => { void load() }, [f.server, f.category, f.level, f.q]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
@@ -51,7 +52,7 @@ export function LogTable({ serverId }: { serverId?: string }) {
       </div>
       <table><thead><tr><th>Time</th><th>Level</th><th>Category</th>{!serverId && <th>Server</th>}<th>Message</th></tr></thead><tbody>
         {rows.map((r) => <Row key={r.id} r={r} server={serverId ? undefined : sname(r.server_id)} />)}
-        {rows.length === 0 && <tr><td colSpan={5} className="muted">No log entries.</td></tr>}
+        {rows.length === 0 && (loaded || error ? <tr><td colSpan={5} className="muted">No log entries.</td></tr> : <LoadingRow cols={5} />)}
       </tbody></table>
       {more && rows.length > 0 && <div style={{ marginTop: 10 }}><button className="sm" onClick={loadMore} disabled={busy}>Load older</button></div>}
     </div>

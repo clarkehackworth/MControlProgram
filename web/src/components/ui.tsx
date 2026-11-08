@@ -40,6 +40,11 @@ export function useAction() {
   return { run, error, busy, setError }
 }
 
+/** Table body row shown while a table's data hasn't arrived yet. */
+export function LoadingRow({ cols }: { cols: number }) {
+  return <tr><td colSpan={cols} className="muted"><span className="spinner" /> Loading…</td></tr>
+}
+
 export function Json({ value }: { value: unknown }) {
   return <pre>{JSON.stringify(value, null, 2)}</pre>
 }

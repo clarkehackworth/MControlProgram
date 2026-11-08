@@ -4,7 +4,7 @@
  */
 export { api, useApi, fmtTime, copy } from '../api'
 export type { Approval, Instance, PluginMeta, Server } from '../api'
-export { Alert, Badge, CopyButton, Field, Json, Modal, useAction } from '../components/ui'
+export { Alert, Badge, CopyButton, Field, Json, LoadingRow, Modal, useAction } from '../components/ui'
 export { PendingAsks } from '../components/Asks'
 export { RuleGroup } from '../components/RuleGroup'
 export type { GroupRule, RuleAction, RuleOps } from '../components/RuleGroup'

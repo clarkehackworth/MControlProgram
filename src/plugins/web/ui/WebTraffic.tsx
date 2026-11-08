@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react'
-import { Alert, Badge, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
+import { Alert, Badge, LoadingRow, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
 
 type Kind = 'domain' | 'url' | 'regex'
 type Action = 'block' | 'ask' | 'allow'
@@ -368,7 +368,7 @@ function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] 
               </div>}</td>
             </tr>
           })}
-          {rows.length === 0 && <tr><td colSpan={log.head[0].length + log.head[1].length + 4} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
+          {rows.length === 0 && (data ? <tr><td colSpan={log.head[0].length + log.head[1].length + 4} className="muted">No requests in this timeframe.</td></tr> : <LoadingRow cols={log.head[0].length + log.head[1].length + 4} />)}
         </tbody>
       </table>
       </div>

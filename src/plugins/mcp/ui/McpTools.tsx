@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, Badge, Json, PendingAsks, api, useAction, useApi, type Server } from '@mcontrolprogram/ui'
+import { Alert, Badge, LoadingRow, Json, PendingAsks, api, useAction, useApi, type Server } from '@mcontrolprogram/ui'
 
 type Action = 'allow' | 'ask' | 'deny'
 interface Tool { upstream: string; tool: string; description: string; read_only: boolean; rule: Action | null }
@@ -66,7 +66,8 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
           </tbody>)}
           <tbody>
             {unseen.map((u) => <tr key={u}><td colSpan={3} className="muted small"><strong>{u}</strong>: tools not listed yet. <button className="sm" disabled={busy} onClick={() => void refresh(u)}>Fetch tools</button></td></tr>)}
-            {tools.length === 0 && unseen.length === 0 && <tr><td colSpan={3} className="muted">No upstream servers configured.</td></tr>}
+            {!policy && <LoadingRow cols={3} />}
+            {policy && tools.length === 0 && unseen.length === 0 && <tr><td colSpan={3} className="muted">No upstream servers configured.</td></tr>}
           </tbody>
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>
@@ -139,7 +140,7 @@ function CallLog({ upstreams, reloadKey }: { upstreams: string[]; reloadKey: unk
                 {r.ms != null && <span className="muted small"> {r.ms} ms</span>}
               </td>
             </tr>)}
-            {rows.length === 0 && <tr><td colSpan={7} className="muted">{data ? 'No calls in this timeframe.' : 'Loading…'}</td></tr>}
+            {rows.length === 0 && (data ? <tr><td colSpan={7} className="muted">No calls in this timeframe.</td></tr> : <LoadingRow cols={7} />)}
           </tbody>
         </table>
       </div>

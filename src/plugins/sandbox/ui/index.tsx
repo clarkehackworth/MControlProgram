@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import { Alert, Badge, Field, Modal, api, useAction, type PluginUi } from '@mcontrolprogram/ui'
+import { Alert, Badge, Field, LoadingRow, Modal, api, useAction, type PluginUi } from '@mcontrolprogram/ui'
 
 interface Port { host_ip?: string; host_port: number; sandbox_port: number; protocol?: string }
 interface Sandbox { name: string; agent: string; status: string; ports?: Port[]; workspaces?: string[]; created_at?: string; last_used_at?: string }
@@ -71,7 +71,7 @@ function HostView({ h }: { h: HostCfg }) {
             </tr>}
             </Fragment>)}
             {list?.length === 0 && <tr><td colSpan={7} className="muted">No sandboxes.</td></tr>}
-            {!list && <tr><td colSpan={7} className="muted">{busy ? 'Loading…' : '—'}</td></tr>}
+            {!list && (busy ? <LoadingRow cols={7} /> : <tr><td colSpan={7} className="muted">—</td></tr>)}
           </tbody>
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>Click a host above to switch hosts. Click a sandbox to run commands and manage its ports; the policy and log below then show only that sandbox. Workspace roots: {h.workspaceRoots?.length ? <span className="mono">{h.workspaceRoots.join(', ')}</span> : 'none (no host file access for agents)'}.</p>
@@ -197,7 +197,7 @@ function FsRules({ host, sandbox }: { host: string; sandbox?: string }) {
             <td className="small muted">{r.layer}{r.editable === false ? ' · built-in' : ''}{r.status && r.status !== 'active' ? ` (${r.status})` : ''}</td>
           </tr>)}
           {rules?.length === 0 && <tr><td colSpan={5} className="muted">No filesystem rules.</td></tr>}
-          {!rules && <tr><td colSpan={5} className="muted">{busy ? 'Loading…' : '—'}</td></tr>}
+          {!rules && (busy ? <LoadingRow cols={5} /> : <tr><td colSpan={5} className="muted">—</td></tr>)}
         </tbody>
       </table>
     </>
@@ -241,6 +241,7 @@ function NetworkRules({ host, sandbox }: { host: string; sandbox?: string }) {
             <td>{r.editable === false ? <span className="muted small">built-in</span> : <button className="sm danger" disabled={busy} onClick={() => remove(r)}>Remove</button>}</td>
           </tr>)}
           {rules?.length === 0 && <tr><td colSpan={5} className="muted">No network rules.</td></tr>}
+          {!rules && busy && <LoadingRow cols={5} />}
         </tbody>
       </table>
       <div className="row" style={{ marginTop: 12 }}>
@@ -292,6 +293,7 @@ function NetLog({ host, sandbox }: { host: string; sandbox?: string }) {
             <td>{!r.allowed && <button className="sm" disabled={busy} onClick={() => allowHost(r)}>Allow host</button>}</td>
           </tr>)}
           {shown?.length === 0 && <tr><td colSpan={6} className="muted">No connections logged.</td></tr>}
+          {!rows && busy && <LoadingRow cols={6} />}
         </tbody>
       </table>
     </div>
