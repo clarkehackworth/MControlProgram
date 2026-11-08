@@ -10,7 +10,7 @@ import type { Approval, PluginMeta } from './api'
  */
 export interface PluginUi {
   /** Rendered on the plugin's page under its inventories (logs, rules, …). */
-  Page?: ComponentType<{ plugin: PluginMeta }>
+  Page?: ComponentType<{ plugin: PluginMeta; selected: Record<string, string | undefined> }>
   /** Per inventory (array key in the plugin's global config). */
   inventory?: Record<string, InventoryUi>
   /** Asks raised by this plugin (approval queue). */
@@ -18,6 +18,8 @@ export interface PluginUi {
 }
 
 export interface InventoryUi {
+  /** Rows are clickable; the chosen one is highlighted and passed to `Page` as `selected[<inventory key>]` (first item by default). */
+  selectable?: boolean
   /** Extra button(s) next to "+ Add", e.g. a guided wizard. Makes "+ Add" a secondary button. */
   AddButton?: ComponentType<{ reload: () => Promise<void> }>
   /** Shown in the edit dialog under the form, for an existing item. */

@@ -17,20 +17,10 @@ const tool = <T = any,>(host: string, name: string, args: Record<string, unknown
 const portStr = (p: Port) => `${p.host_ip && p.host_ip !== '0.0.0.0' ? p.host_ip + ':' : ''}${p.host_port}→${p.sandbox_port}`
 
 /** Docker Sandboxes: per host, the sandboxes (create/stop/remove, ports, run a command, files) and the network policy & log. */
-function SandboxPage({ plugin }: { plugin: { globalConfig?: Record<string, any> } }) {
-  const hosts = ((plugin.globalConfig?.hosts ?? []) as HostCfg[])
-  const [host, setHost] = useState(hosts[0]?.name ?? '')
-  const h = hosts.find((x) => x.name === host)
-  if (!hosts.length) return <div className="card muted">Add a sandbox host above to manage its sandboxes here.</div>
-  return (
-    <>
-      {hosts.length > 1 && <div className="row" style={{ marginBottom: 12 }}>
-        <label className="small">Host</label>
-        <select value={host} onChange={(e) => setHost(e.target.value)} style={{ width: 200 }}>{hosts.map((x) => <option key={x.name}>{x.name}</option>)}</select>
-      </div>}
-      {h && <HostView key={h.name} h={h} />}
-    </>
-  )
+function SandboxPage({ plugin, selected }: { plugin: { globalConfig?: Record<string, any> }; selected: Record<string, string | undefined> }) {
+  const h = ((plugin.globalConfig?.hosts ?? []) as HostCfg[]).find((x) => x.name === selected.hosts)
+  if (!h) return <div className="card muted">Add a sandbox host above to manage its sandboxes here.</div>
+  return <HostView key={h.name} h={h} />
 }
 
 function HostView({ h }: { h: HostCfg }) {
@@ -84,7 +74,7 @@ function HostView({ h }: { h: HostCfg }) {
             {!list && <tr><td colSpan={7} className="muted">{busy ? 'Loading…' : '—'}</td></tr>}
           </tbody>
         </table>
-        <p className="muted small" style={{ marginBottom: 0 }}>Click a sandbox to run commands and manage its ports; the policy and log below then show only that sandbox. Workspace roots: {h.workspaceRoots?.length ? <span className="mono">{h.workspaceRoots.join(', ')}</span> : 'none (no host file access for agents)'}.</p>
+        <p className="muted small" style={{ marginBottom: 0 }}>Click a host above to switch hosts. Click a sandbox to run commands and manage its ports; the policy and log below then show only that sandbox. Workspace roots: {h.workspaceRoots?.length ? <span className="mono">{h.workspaceRoots.join(', ')}</span> : 'none (no host file access for agents)'}.</p>
       </div>
       <Policy host={h.name} sandbox={sel} />
       <NetLog host={h.name} sandbox={sel} />
@@ -263,5 +253,5 @@ function NetLog({ host, sandbox }: { host: string; sandbox?: string }) {
   )
 }
 
-const ui: PluginUi = { Page: SandboxPage }
+const ui: PluginUi = { Page: SandboxPage, inventory: { hosts: { selectable: true } } }
 export default ui

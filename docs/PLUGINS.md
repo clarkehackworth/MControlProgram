@@ -200,8 +200,9 @@ Its default export is a `PluginUi` (`web/src/plugin-ui.ts`); every slot is optio
 
 | Slot | Where it shows |
 |---|---|
-| `Page` | The plugin's page, under its inventories (logs, rules…) |
+| `Page` | The plugin's page, under its inventories (logs, rules…). Props: `plugin`, `selected` |
 | `inventory[key].AddButton` / `EditExtra` / `Delete` | A guided add flow, extras in the edit dialog, a custom delete flow |
+| `inventory[key].selectable` | Rows are clickable; the chosen one is highlighted and passed to `Page` as `selected[key]` (first item by default) |
 | `asks.RuleDialog`, `asks.direct` + `asks.setRule` | "Add allow/block rule…" for this plugin's asks; or a one-switch rule with no dialog |
 
 Bundle it as an ES module with `react`, `react/jsx-runtime` and `@mcontrolprogram/ui` external, mapped to
@@ -315,4 +316,4 @@ When MControlProgram runs in a container on the Docker host, mount sbx into it a
 
 The container user must match the uid that owns those files (the image runs as 1000). See the commented lines in `docker-compose.yml`. Anyone with access to these mounts controls all of that user's sandboxes.
 
-The plugin page shows, per host: the sandboxes (status, ports, workspaces; create, start, stop, remove), an expandable row per sandbox (run a command, publish/unpublish ports), the network policy (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.
+The plugin page shows, for the host selected in the hosts table (click a row): the sandboxes (status, ports, workspaces; create, start, stop, remove), an expandable row per sandbox (run a command, publish/unpublish ports), the network policy (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.

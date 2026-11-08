@@ -19,14 +19,21 @@ export default function PluginPage() {
   const reload = async () => { await Promise.all([reloadPlugins(), reloadServers()]) }
   const p = plugins?.find((x) => x.id === id)
   const ui = usePluginUi(p?.id, !!p?.ui)
+  const [picked, setPicked] = useState<Record<string, string>>({})
   if (!plugins || !ui) return null
   if (!p) return <Alert kind="err">Plugin "{id}" is not loaded.</Alert>
+  // selectable inventories: the picked item if it still exists, else the first
+  const selected = Object.fromEntries(inventoryKeys(p).filter((k) => ui.inventory?.[k]?.selectable).map((k) => {
+    const names = ((p.globalConfig?.[k] ?? []) as any[]).map((x) => x.name as string)
+    return [k, names.includes(picked[k]) ? picked[k] : names[0]]
+  }))
   return (
     <>
       <h1 style={{ marginBottom: 4 }}>{p.name}</h1>
       <p className="muted" style={{ marginTop: 0 }}>{p.description}</p>
-      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} options={optionSources(p, plugins)} ui={ui.inventory?.[k] ?? {}} />)}
-      {ui.Page && <ui.Page plugin={p} />}
+      {inventoryKeys(p).map((k) => <Inventory key={k} p={p} k={k} servers={servers ?? []} reload={reload} options={optionSources(p, plugins)} ui={ui.inventory?.[k] ?? {}}
+        selected={selected[k]} onSelect={k in selected ? (name) => setPicked({ ...picked, [k]: name }) : undefined} />)}
+      {ui.Page && <ui.Page plugin={p} selected={selected} />}
     </>
   )
 }
@@ -64,7 +71,7 @@ function ServerToggles({ item, users, reload }: { item: string; users: ReturnTyp
   })}</div>
 }
 
-function Inventory({ p, k, servers, reload, options, ui }: { p: PluginMeta; k: string; servers: Server[]; reload: () => Promise<void>; options: Record<string, any>; ui: InventoryUi }) {
+function Inventory({ p, k, servers, reload, options, ui, selected, onSelect }: { p: PluginMeta; k: string; servers: Server[]; reload: () => Promise<void>; options: Record<string, any>; ui: InventoryUi; selected?: string; onSelect?: (name: string) => void }) {
   const schema = p.globalConfigSchema.properties[k]
   const items: any[] = p.globalConfig?.[k] ?? []
   const users = usersOf(p, k, servers)
@@ -98,7 +105,8 @@ function Inventory({ p, k, servers, reload, options, ui }: { p: PluginMeta; k: s
         <thead><tr><th>Name</th>{kind && <th>{kind.title}</th>}{cols.map(([c, s]) => <th key={c}>{s['x-column-title'] ?? s.title ?? c}</th>)}{fk.field ? <th>Used by</th> : ref ? <th>{ref.title ?? ref.inventory}</th> : null}<th></th></tr></thead>
         <tbody>
           {items.map((it, i) => (
-            <tr key={it.name ?? i}>
+            <tr key={it.name ?? i} className={onSelect ? (it.name === selected ? 'selectable selected' : 'selectable') : undefined} aria-selected={onSelect ? it.name === selected : undefined}
+              onClick={onSelect ? (e) => { if (!(e.target as HTMLElement).closest('button, a, input, label')) onSelect(it.name) } : undefined}>
               <td className="mono"><strong>{it.name}</strong></td>
               {kind && <td>{kindOf(it)}</td>}
               {cols.map(([c, s]) => <td key={c}>{String(it[c] || (s['x-column-fallback'] && it[s['x-column-fallback']]) || '')}</td>)}
