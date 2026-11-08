@@ -18,23 +18,21 @@ agent's exposure at any moment is limited to what you have deliberately opened u
 
 ![Approving an MCP tool call](docs/images/mcp-approval.png)
 
-**SSH** — hosts agents may use, with per-server toggles, global command allow/deny rules (parsed with a real shell grammar, so pipes, `sudo`, `sh -c` and `$( )` are all checked) and a command log.
+**SSH** — hosts agents may use, with per-server toggles, global command rules (allow, ask or deny by default, plus blocked / ask / allowed programs, commands, patterns and written files; parsed with a real shell grammar, so pipes, `sudo`, `sh -c` and `$( )` are all checked) and a filterable command log.
 
-![SSH plugin: host inventory, per-server toggles and command rules](docs/images/ssh.png)
+![SSH plugin: host inventory, per-server toggles, command rules and command log](docs/images/ssh.png)
 
-**Web** — HTTP and page fetching with server-side credential injection, global URL access rules (allow/deny by default, domains, URLs, regex) and a request log with one-click *Block domain* / *Block URL*.
+**Web** — HTTP and page fetching with server-side credential injection, global URL access rules (allow, ask or deny by default; blocked / ask / allowed domains, URLs and regex) and a request log with one-click *Block domain* / *Block URL*.
 
-![Web plugin: access rules and request log](docs/images/web.png)
+![Web plugin: credentials, access rules and request log](docs/images/web.png)
 
 **BrowserPaw** — isolated Chromium profiles on SSH, native or manual hosts, each with its own logins and bridge. Agents get browser tools and never see SSH access or the bridge token.
 
 Every BrowserPaw browser runs from its own dedicated Chromium user-data directory, so profiles are **completely separate** from each other (cookies, logins, history and extensions are never shared) and from the main user's everyday browser on that computer. An agent working in one profile cannot see another profile's sessions, or yours.
 
-![BrowserPaw plugin: browser hosts and profiles](docs/images/browserpaw-hosts.png)
+BrowserPaw has its own URL access rules (allow, ask or deny by default), pushed to every profile (fail closed if a browser is out of sync), and a per-agent log of everything the browser loads or is refused, with one-click *Allow* / *Block* per domain or URL.
 
-BrowserPaw has its own URL access rules, pushed to every profile (fail closed if a browser is out of sync), and a per-agent log of everything the browser loads or is refused.
-
-![BrowserPaw plugin: URL access rules and request log](docs/images/browserpaw-policy.png)
+![BrowserPaw plugin: browser hosts, profiles, URL access rules and request log](docs/images/browserpaw.png)
 
 ## Architecture
 
