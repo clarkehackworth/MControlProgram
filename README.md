@@ -143,6 +143,8 @@ Every rule in MControlProgram is **allow**, **ask** or **deny** (shown as *block
 - **Plugin rules**: SSH command rules, Web and BrowserPaw URL rules each take block / ask / allow
   rules and an *allow*, *ask* or *deny* default. Block beats ask, ask beats allow.
 
+![Approving an MCP tool call](docs/images/mcp-approval.png)
+
 An ask queues the call on the **Approvals** page (every ask) and on the plugin's own page (its asks),
 with the caller, what it wants (`web01: systemctl restart nginx`, `GET https://…`), and why it asked.
 Each ask offers **Allow once**, **Add allow rule…**, **Add block rule…** and **Deny once**; the rule
