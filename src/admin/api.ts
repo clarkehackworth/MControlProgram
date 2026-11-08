@@ -78,8 +78,9 @@ export function adminApi() {
     id: p.id, name: p.name, version: p.version, description: p.description, source: p.source,
     configSchema: p.configSchema, defaultConfig: p.defaultConfig ?? {},
     globalConfigSchema: p.globalConfigSchema, globalConfig: p.globalConfigSchema ? pluginConfig.redacted(p.id) : undefined,
-    globalActions: Object.entries(p.globalActions ?? {}).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory, when: a.when })),
-    dependencies: p.dependencies ?? {},
+    globalActions: Object.entries(p.globalActions ?? {}).filter(([, a]) => !a.hidden).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory, when: a.when })),
+    dependencies: p.dependencies ?? {}, optionalDependencies: p.optionalDependencies ?? {},
+    ui: !!plugins.uiFile(p.id),
   });
   /** First string that violates its schema `pattern` (walks objects and arrays); the UI checks the same thing live. */
   const patternViolation = (schema: any, value: any, where = ''): string | undefined => {
@@ -115,6 +116,12 @@ export function adminApi() {
     return { result };
   }));
   // OAuth redirect target for plugins that act as OAuth clients (e.g. mcp): runs the plugin's `callback` action with the query params.
+  // The plugin's admin UI: an ES module the web app imports at runtime (see web/src/plugin-ui.ts).
+  r.get('/plugins/:pid/ui.js', (req, res) => {
+    const f = plugins.uiFile(req.params.pid as string);
+    if (!f) { res.status(404).json({ error: 'no ui' }); return; }
+    res.set('Cache-Control', 'no-cache').type('text/javascript').sendFile(f);
+  });
   r.get('/plugins/:pid/callback', async (req, res) => {
     const pid = req.params.pid as string; const p = plugins.get(pid);
     const action = p?.globalActions?.callback;

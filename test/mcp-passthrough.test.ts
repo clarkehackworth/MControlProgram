@@ -7,9 +7,12 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 process.env.MCONTROLPROGRAM_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-mcp-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures/echo-mcp.mjs');
 const { default: plugin } = await import('../src/plugins/mcp/index.js');
 const { ScopedLogger } = await import('../src/core/logger.js');
+// new installs default to ask; these tests exercise pass-through, not the default
+await plugin.globalActions!.set_policy!.run({ policy: 'allow' }, {} as any);
 const { GLOBAL_DEFAULTS } = await import('../src/core/global-config.js');
 
 const PORT = 7899, TOKEN = 'sekrit';

@@ -11,8 +11,10 @@
  * ponytail: a guardrail, not a sandbox. Interpreters (python -c, perl -e, node…) and scripts on disk run code that
  * isn't checked, so a block list is advisory; deny-by-default with a narrow allow list is the real control.
  */
-import { safeRegex } from '../../core/safe-regex.js';
-import { getDb } from '../../core/db.js';
+import { safeRegex, type PluginHost } from '../../core/plugin-api.js';
+
+let getDb: () => PluginHost['db'];
+export const init = (h: PluginHost) => { getDb = () => h.db; ready = false; };
 
 import { analyze, type Analysis, type Cmd } from './shell-parse.js';
 
@@ -122,7 +124,7 @@ const recent = () => db().prepare("SELECT * FROM ssh_commands WHERE ts >= ? AND 
 
 /** Global actions driving the SSH plugin page's Commands panel. */
 export const actions = {
-  commands: { title: 'Command log', run: async (q: any) => {
+  commands: { hidden: true, title: 'Command log', run: async (q: any) => {
     const where = ['ts >= ?', 'ts <= ?']; const args: any[] = [Number(q.since) || 0, Number(q.until) || Date.now()];
     if (q.q) { where.push('(command LIKE ? OR principal LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`); }
     if (q.host) { where.push('host = ?'); args.push(q.host); }
@@ -138,9 +140,9 @@ export const actions = {
     for (const r of rows) if (isCmd(r.tool)) { const v = verdict(r.command, r.host, rs, p); r.now_blocked = !!v.blocked; r.now_ask = !!v.ask; Object.assign(r, describe(r.command)); }
     return { rows: rows.slice(0, limit), more: rows.length > limit };
   } },
-  rules: { title: 'Command rules', run: async () => ({ policy: policy(), rules: rules() }) },
+  rules: { hidden: true, title: 'Command rules', run: async () => ({ policy: policy(), rules: rules() }) },
   /** Why a line isn't allowed outright: overriding block/ask rules, written files no allow rule covers, parts the parser can't check. */
-  explain: { title: 'Explain verdict', run: async ({ command, host }: any) => {
+  explain: { hidden: true, title: 'Explain verdict', run: async ({ command, host }: any) => {
     const line = String(command ?? ''), h = String(host ?? ''), a = parse(line);
     const rs = rules().filter((r) => !r.host || r.host === h);
     const allows = rs.filter((r) => r.action === 'allow');
@@ -152,7 +154,7 @@ export const actions = {
     };
   } },
   /** What a draft rule would match in the last 7 days, and (for allow) the block rules in its way. */
-  preview: { title: 'Preview rule', run: async ({ action, kind, value, host, command }: any) => {
+  preview: { hidden: true, title: 'Preview rule', run: async ({ action, kind, value, host, command }: any) => {
     const r = { action, ...normalize(kind, value), host: String(host ?? '') } as R;
     const rows = recent().filter((x) => !r.host || x.host === r.host);
     const hits = rows.filter((x) => matchLine(r, x.command, parse(x.command)));
@@ -164,7 +166,7 @@ export const actions = {
   } },
   /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks in the way of a new allow).
    *  With the default at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
-  rule: { title: 'Add rule', run: async ({ action, kind, value, host, note, remove }: any) => {
+  rule: { hidden: true, title: 'Add rule', run: async ({ action, kind, value, host, note, remove }: any) => {
     if (!ACTIONS.includes(action)) throw new Error('action must be block, ask or allow');
     const r = normalize(kind, value);
     const d = db();
@@ -176,9 +178,9 @@ export const actions = {
     })();
     changed(); return { ...r, action, stored: store };
   } },
-  delete_rule: { title: 'Delete rule', run: async ({ id }: any) => { db().prepare('DELETE FROM ssh_rules WHERE id=?').run(Number(id)); changed(); } },
+  delete_rule: { hidden: true, title: 'Delete rule', run: async ({ id }: any) => { db().prepare('DELETE FROM ssh_rules WHERE id=?').run(Number(id)); changed(); } },
   /** Programs run in the last 7 days that deny-by-default would stop (and no block rule already does). */
-  deny_candidates: { title: 'Programs in use', run: async () => {
+  deny_candidates: { hidden: true, title: 'Programs in use', run: async () => {
     const rs = rules(); const n = new Map<string, number>();
     for (const x of recent()) {
       if (x.blocked) continue;
@@ -189,7 +191,7 @@ export const actions = {
     return { programs: [...n].sort((a, b) => b[1] - a[1]) };
   } },
   /** Switch the default policy; `allow` = programs to add as allow rules in the same step. */
-  set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }: any) => {
+  set_policy: { hidden: true, title: 'Set default policy', run: async ({ policy: p, allow }: any) => {
     if (!POLICIES.includes(p)) throw new Error('policy must be allow, ask or deny');
     const d = db();
     const progs = (Array.isArray(allow) ? allow : []).map((x: string) => normalize('program', x).value);
@@ -199,5 +201,5 @@ export const actions = {
     })();
     changed(); return { policy: p };
   } },
-  clear_commands: { title: 'Clear command log', run: async () => { db().prepare('DELETE FROM ssh_commands').run(); } },
+  clear_commands: { hidden: true, title: 'Clear command log', run: async () => { db().prepare('DELETE FROM ssh_commands').run(); } },
 };

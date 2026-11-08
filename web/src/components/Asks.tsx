@@ -1,22 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, fmtTime, useApi, type Approval } from '../api'
 import { Alert, Badge, Json, useAction } from './ui'
-import { SshRuleDialog } from '../plugins/SshCommands'
-import { UrlRuleDialog } from '../plugins/WebTraffic'
+import { loadPluginUi, type PluginUi } from '../plugin-ui'
 
 type RuleAction = 'allow' | 'block'
-/** Asks whose rule is a single per-tool switch: set it directly, no dialog. */
-const direct = (a: Approval) => a.feature === 'tool' || a.feature === 'mcp_tool'
-const urlNoQuery = (u: string) => { try { const x = new URL(u); return x.origin + x.pathname } catch { return u } }
-
-/** Prefill for SSH's rule dialog: block the programs; allow the narrowest thing that lets this line run (written files may still need their own rule). */
-function sshTarget(s: any, action: RuleAction) {
-  const progs: string[] = s.programs ?? []
-  if (action === 'allow' && s.single) return { action, kind: 'prefix' as const, value: s.single as string, host: s.host, command: s.command }
-  return { action, kind: progs.length ? 'program' as const : 'prefix' as const, value: progs.join(' ') || s.command, host: s.host, command: s.command }
-}
-/** Prefill for the URL rule dialog: block the domain, allow the URL without its query. */
-const urlTarget = (s: any, action: RuleAction) => action === 'block' ? { action, kind: 'domain' as const, value: s.host as string, url: s.url } : { action, kind: 'url' as const, value: urlNoQuery(s.url), url: s.url }
 
 /**
  * Pending asks with their decisions. `plugin` limits the list to one plugin (its own page); without it, every ask (Approvals page).
@@ -32,8 +19,9 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty,
     if (!direct(a)) return setDialog({ a, action })
     void run(async () => {
       const rule = action === 'allow' ? 'allow' : 'deny'
-      // MCP pass-through: the upstream tool's rule; core tool gate: the instance's per-tool rule
-      if (a.feature === 'mcp_tool') await api(`/plugins/mcp/actions/set_tool_rule`, { method: 'POST', body: { upstream: a.subject?.upstream, tool: a.subject?.tool, action: rule } })
+      // the plugin's own rule if it has one; core tool gate: the instance's per-tool rule
+      const set = asksOf(a)?.setRule
+      if (set) await set(a, rule)
       else await api(`/instances/${a.instance_id}/tool-rules/${encodeURIComponent(a.subject?.tool ?? a.tool)}`, { method: 'PUT', body: { rule } })
       await decide(a, action === 'allow' ? 'approved' : 'denied'); await reload(); onChange?.()
     })
@@ -43,8 +31,15 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty,
     await run(async () => { if (action !== 'ask') await decide(a, action === 'allow' ? 'approved' : 'denied').catch(() => {}); await reload() }) // already decided elsewhere: fine
   }
   const pending = data?.pending ?? []
+  // Rule editors come from each plugin's UI; the core tool gate (feature 'tool') is handled here.
+  const [uis, setUis] = useState<Record<string, PluginUi>>({})
+  const ids = [...new Set(pending.map((a) => a.plugin_id).filter(Boolean))].join(',')
+  useEffect(() => { for (const id of ids.split(',').filter(Boolean)) void loadPluginUi(id).then((u) => setUis((x) => (x[id] ? x : { ...x, [id]: u }))) }, [ids])
+  const asksOf = (a: Approval) => (a.feature === 'tool' ? undefined : uis[a.plugin_id]?.asks)
+  /** Asks whose rule is a single switch: set it directly, no dialog. */
+  const direct = (a: Approval) => a.feature === 'tool' || !!asksOf(a)?.direct?.(a)
   if (hideEmpty && !pending.length && !error && !err) return null
-  const kind = dialog && (dialog.a.plugin_id === 'ssh' && dialog.a.feature === 'command' ? 'ssh' : dialog.a.feature === 'url' ? 'url' : undefined)
+  const Dialog = dialog && asksOf(dialog.a)?.RuleDialog
 
   return (
     <div className="card" style={pending.length ? { borderColor: 'var(--warn)' } : undefined}>
@@ -68,9 +63,8 @@ export function PendingAsks({ plugin, title = 'Waiting for approval', hideEmpty,
           <details><summary className="small muted">Arguments</summary><Json value={a.args} /></details>
         </div>
       ))}
-      {dialog && kind === 'ssh' && <SshRuleDialog init={sshTarget(dialog.a.subject ?? {}, dialog.action)} onClose={() => setDialog(undefined)} onDone={ruleDone} />}
-      {dialog && kind === 'url' && <UrlRuleDialog plugin={dialog.a.plugin_id as 'web' | 'browserpaw'} init={urlTarget(dialog.a.subject ?? {}, dialog.action)} onClose={() => setDialog(undefined)} onDone={ruleDone} />}
-      {dialog && !kind && <Alert kind="err">No rule editor for {dialog.a.plugin_id}/{dialog.a.feature}; use Allow once / Deny once.</Alert>}
+      {dialog && Dialog && <Dialog approval={dialog.a} action={dialog.action} onClose={() => setDialog(undefined)} onDone={ruleDone} />}
+      {dialog && !Dialog && <Alert kind="err">No rule editor for {dialog.a.plugin_id}/{dialog.a.feature}; use Allow once / Deny once.</Alert>}
     </div>
   )
 }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 const site = http.createServer((req, res) => {
   if (req.url === '/hop') { res.writeHead(302, { location: '/secret/x' }); return res.end(); }
@@ -30,6 +31,8 @@ test('blocks: normalize, match, enforce live (incl. redirects), and log every at
   assert.equal(verdict(new URL('https://x.ok.com/'), L, 'deny').allowedBy, 'domain: ok.com');
 
   const act = (k: string, p: any = {}) => web.globalActions![k]!.run(p, {} as any);
+  // new installs default to ask; these tests exercise behaviour, not the default
+  await act('set_policy', { policy: 'allow' });
   const inst = (await web.create({ instanceId: 'i', instanceName: 'web', serverId: 's', global: () => ({ stateIdleSec: 1, connectionIdleSec: 1, logRetentionDays: 30 }), log: new ScopedLogger({}, () => 'off'),
     config: { ...web.defaultConfig, blockPrivateNetworks: false }, pluginConfig: { credentials: [] } })) as any;
   const req = (url: string) => inst.tools.find((t: any) => t.name === 'request').handler({ url, method: 'GET' }, { principal: 'tok', signal: new AbortController().signal });

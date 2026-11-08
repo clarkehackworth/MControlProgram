@@ -3,16 +3,13 @@
  * injected server-side so agents never see them.
  */
 import { z } from 'zod';
-import type { MControlProgramPlugin, PluginContext, PluginInstance, ToolCallContext } from '../../core/plugin-api.js';
-import { text, errorResult, ask } from '../../core/plugin-api.js';
-import { effective } from '../../core/global-config.js';
-import { getDb } from '../../core/db.js';
-import { ruleStore, ruleMatches, verdict, label } from '../../core/url-policy.js';
-export { ruleMatches, verdict, normalizeBlock, type BlockKind, type RuleAction, type Policy } from '../../core/url-policy.js';
+import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, ToolCallContext } from '../../core/plugin-api.js';
+import { text, errorResult, ask, effective, safeRegex } from '../../core/plugin-api.js';
+import { ruleStore, ruleMatches, verdict, label, normalizeBlock, canonicalHost } from './url-policy.js';
+export { ruleMatches, verdict, normalizeBlock, type BlockKind, type RuleAction, type Policy } from './url-policy.js';
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { Agent, fetch, Headers, type Response } from 'undici';
-import { safeRegex } from '../../core/safe-regex.js';
 
 interface CredCfg { name: string; urlPattern: string; type: 'header' | 'basic' | 'bearer' | 'query'; headerName?: string; username?: string; secret: string }
 interface Cfg {
@@ -125,11 +122,12 @@ function htmlToText(html: string): string {
 }
 
 // ---- request log + plugin-wide access rules (own tables: changing rules must not restart instances / drop cookie jars) ----
-const store = ruleStore('web');
+let host: PluginHost;
+const store = ruleStore(() => host.db, 'web');
 const { rules, policy } = store;
 let tablesReady = false;
 const db = () => {
-  const d = getDb();
+  const d = host.db;
   if (!tablesReady) {
     d.exec(`CREATE TABLE IF NOT EXISTS web_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, server_id TEXT, instance TEXT, principal TEXT,
         method TEXT NOT NULL, url TEXT NOT NULL, host TEXT NOT NULL, status INTEGER, error TEXT, blocked TEXT, ms INTEGER);
@@ -140,14 +138,24 @@ const db = () => {
   return d;
 };
 
+/**
+ * What the web plugin offers to plugins that declare `dependencies: { web: '^0.2.0' }`: the URL rule engine.
+ * `ruleStore(db, prefix)` keeps a separate rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables.
+ */
+export const api = { ruleStore, verdict, ruleMatches, normalizeBlock, label, canonicalHost };
+export type WebApi = typeof api;
+export type { Rule, Verdict, RuleStore } from './url-policy.js';
+
 const plugin: MControlProgramPlugin = {
-  id: 'web', name: 'Web', version: '0.1.0',
+  id: 'web', name: 'Web', version: '0.2.0',
+  api,
+  init(h) { host = h; },
   description: 'HTTP requests and page fetching with URL filtering and server-side credential injection.',
   configSchema,
   globalConfigSchema,
   globalActions: {
     // ponytail: driven by the custom Traffic panel on the plugin page; hidden from the generic inventory buttons
-    requests: { title: 'Request log', run: async (q) => {
+    requests: { hidden: true, title: 'Request log', run: async (q) => {
       const where = ['ts >= ?', 'ts <= ?']; const args: any[] = [Number(q.since) || 0, Number(q.until) || Date.now()];
       if (q.q) { where.push('(url LIKE ? OR principal LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`); }
       if (q.method) { where.push('method = ?'); args.push(q.method); }
@@ -157,10 +165,10 @@ const plugin: MControlProgramPlugin = {
       if (q.outcome === 'error') where.push('blocked IS NULL AND (error IS NOT NULL OR status >= 400)');
       const limit = Math.min(Number(q.limit) || 500, 5000);
       const rows = db().prepare(`SELECT * FROM web_requests WHERE ${where.join(' AND ')} ORDER BY ts DESC LIMIT ?`).all(...args, limit + 1);
-      return { rows: rows.slice(0, limit), more: rows.length > limit };
+      return { rows: (rows.slice(0, limit) as { url: string }[]).map((r) => ({ ...r, now: store.now(r.url) })), more: rows.length > limit };
     } },
     ...store.actions,
-    clear_requests: { title: 'Clear request log', run: async () => { db().prepare('DELETE FROM web_requests').run(); } },
+    clear_requests: { hidden: true, title: 'Clear request log', run: async () => { db().prepare('DELETE FROM web_requests').run(); } },
   },
   defaultGlobalConfig: { credentials: [] },
   defaultConfig: { allowUrls: [], denyUrls: [], allowMethods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'], blockPrivateNetworks: true, followRedirects: true,

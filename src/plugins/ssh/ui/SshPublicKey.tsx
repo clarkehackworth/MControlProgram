@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
-import { CopyButton, Field } from '../components/ui'
+import { CopyButton, Field, api } from '@mcontrolprogram/ui'
 
 /** Shows the stored key's public half for an existing SSH host (the private key itself never reaches the browser). */
 export default function SshPublicKey({ name }: { name: string }) {

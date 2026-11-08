@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 const { encrypt, decrypt, hashPassword, verifyPassword } = await import('../src/core/crypto.js');
 const { encryptSecrets, decryptSecrets, redactSecrets, mergeSecrets, REDACTED } = await import('../src/core/secrets.js');

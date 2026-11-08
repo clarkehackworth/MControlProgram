@@ -1,26 +1,73 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
-import { api, useApi, type Server } from '../api'
-import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
-import { PendingAsks } from '../components/Asks'
-import { RuleGroup, type RuleOps } from '../components/RuleGroup'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react'
+import { Alert, Badge, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
 
 type Kind = 'domain' | 'url' | 'regex'
 type Action = 'block' | 'ask' | 'allow'
 type Policy = 'allow' | 'ask' | 'deny'
 interface Rule { id: number; action: Action; kind: Kind; value: string; note: string; created_at: number }
-interface Req { id: number; ts: number; server_id: string; instance: string; principal: string | null; method: string; url: string; host: string; status: number | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null
-  // browserpaw only
-  profile?: string; session_id?: string | null; agent_via?: 'tool' | 'inherited' | 'inferred' | null; tab_id?: number | null; type?: string; via?: 'dnr' | 'nav-guard' | 'tool-arg' | 'observed' | 'dropped' }
-type PluginId = 'web' | 'browserpaw'
-interface Sync { inSync: boolean; ackRev: number | null; rev: number; lastPull: number | null; error: string | null; rejected: { id: number; error: string }[] }
-interface Target { action: Action; kind: Kind; value: string; url?: string }
+/** A request-log row. Common fields here; a flavor's own columns read the rest. `now` = the current verdict (server-side). */
+export interface Req { id: number; ts: number; principal: string | null; url: string; host: string; blocked: string | null; allowed_by: string | null
+  now: { blocked: boolean; ask: boolean; by: string }; [k: string]: any }
+export interface Target { action: Action; kind: Kind; value: string; url?: string }
 
-const Plugin = createContext<PluginId>('web')
-const actFor = (plugin: PluginId) => <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/${plugin}/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
+/**
+ * What differs between users of this panel: the web plugin (default) and plugins that reuse it for
+ * their own rule list (browserpaw, which depends on web). Rules and verdicts always come from `plugin`'s actions.
+ */
+export interface TrafficFlavor {
+  /** Under the rule groups. */
+  rulesNote: ReactNode
+  askDesc?: string
+  /** Extra status under the rules (e.g. which browsers enforce the list). */
+  RulesStatus?: ComponentType<{ rules: Rule[] }>
+  log: {
+    /** Extra filter keys sent to the `requests` action, with their initial values, and their inputs. */
+    filters: Record<string, string>
+    Filters: ComponentType<{ f: Record<string, string>; set: (k: string, v: string) => void }>
+    /** Offer an "Errors" outcome filter. */
+    errors?: boolean
+    /** Column titles before the URL and after Access. */
+    head: [string[], string[]]
+    /** Called once per render of the log (may use hooks): the cells for those columns, and notes under Access. */
+    useCells: () => { before: (r: Req) => ReactNode; after: (r: Req) => ReactNode; access?: (r: Req) => ReactNode }
+  }
+}
+
+const webFlavor: TrafficFlavor = {
+  rulesNote: <p className="muted small" style={{ marginBottom: 0 }}>Applies to every Web instance on every server, immediately (no restart, cookie jars are kept), including on redirects. Each instance's own allow/deny lists are checked after these. Only http and https are ever allowed.</p>,
+  log: {
+    filters: { server: '', method: '' },
+    Filters: function WebFilters({ f, set }) {
+      const [servers] = useApi<Server[]>('/servers')
+      return <>
+        <select value={f.server} onChange={(e) => set('server', e.target.value)} style={{ width: 160 }}><option value="">All servers</option>{servers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
+        <select value={f.method} onChange={(e) => set('method', e.target.value)} style={{ width: 120 }}><option value="">All methods</option>{['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].map((m) => <option key={m}>{m}</option>)}</select>
+      </>
+    },
+    errors: true,
+    head: [['Server / agent', 'Method'], ['Response']],
+    useCells() {
+      const [servers] = useApi<Server[]>('/servers')
+      const sname = (id: string) => servers?.find((s) => s.id === id)?.name ?? id
+      return {
+        before: (r) => <>
+          <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
+          <td><Badge kind={r.method === 'GET' || r.method === 'HEAD' ? undefined : 'warn'}>{r.method}</Badge></td>
+        </>,
+        after: (r) => <td style={{ whiteSpace: 'nowrap' }}>
+          {r.blocked ? <span className="muted small">—</span> : r.error ? <><Badge kind="err">failed</Badge> <span className="muted small" title={r.error}>{r.error.slice(0, 40)}</span></>
+            : <><Badge kind={r.status >= 400 ? 'err' : r.status >= 300 ? 'info' : undefined}>{r.status}</Badge>{r.ms != null && <span className="muted small"> {r.ms} ms</span>}</>}
+        </td>,
+      }
+    },
+  },
+}
+
+const Plugin = createContext<string>('web')
+const Flavor = createContext<TrafficFlavor>(webFlavor)
+const actFor = (plugin: string) => <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/${plugin}/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
 const useAct = () => actFor(useContext(Plugin))
 const recentRequests = (act: ReturnType<typeof actFor>) => act<{ rows: Req[] }>('requests', { since: Date.now() - 7 * 86400e3, limit: 5000 }).then((r) => r.rows)
-const VIA: Record<string, string> = { dnr: 'blocked in the browser', 'nav-guard': 'blocked in the browser (scheme)', 'tool-arg': 'refused before reaching the browser', observed: 'seen in the browser', dropped: 'log gap' }
-const AGENT_VIA: Record<string, string> = { tool: 'the agent drove this tab', inherited: 'tab opened from an agent tab', inferred: 'only agent active at the time (best guess)' }
 
 const KINDS: { kind: Kind; title: string; label: string; help: string; placeholder: string }[] = [
   { kind: 'domain', title: 'Domains', label: 'Domain', help: 'The domain and all its subdomains.', placeholder: 'example.com' },
@@ -29,61 +76,40 @@ const KINDS: { kind: Kind; title: string; label: string; help: string; placehold
 ]
 const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour', 3600e3], ['Last 24 hours', 86400e3], ['Last 7 days', 7 * 86400e3], ['Last 30 days', 30 * 86400e3]]
 
-/** Mirror of the server's ruleMatches()/verdict(): block rules win, then ask, then allow rules, then the default policy. */
-function matches(r: Pick<Rule, 'kind' | 'value'>, url: string) {
-  if (!r.value) return false
-  let host = ''; try { host = new URL(url).hostname.toLowerCase().replace(/\.+$/, '') } catch { /* not a URL */ }
-  if (r.kind === 'domain') { const d = r.value.toLowerCase().replace(/^\*?\./, '').replace(/\.+$/, ''); return host === d || host.endsWith('.' + d) }
-  if (r.kind === 'url') return url.startsWith(r.value)
-  try { return new RegExp(r.value, 'i').test(url) } catch { return false }
-}
-function verdict(url: string, rules: Rule[], policy: Policy): { blocked: boolean; ask?: boolean; by?: Rule } {
-  const b = rules.find((r) => r.action === 'block' && matches(r, url))
-  if (b) return { blocked: true, by: b }
-  const q = rules.find((r) => r.action === 'ask' && matches(r, url))
-  if (q) return { blocked: false, ask: true, by: q }
-  const a = rules.find((r) => r.action === 'allow' && matches(r, url))
-  return a ? { blocked: false, by: a } : { blocked: policy === 'deny', ask: policy === 'ask' }
-}
-/** Which rules override a draft rule: block beats ask and allow, ask beats allow. */
-const OVERRIDES: Record<Action, Action[]> = { allow: ['block', 'ask'], ask: ['block'], block: [] }
+/** The `check` action: server-side verdicts, so this UI never re-implements rule matching. */
+interface Check { now: Req['now'][]; matches?: boolean[]; conflicts?: number[]; error?: string }
 const ruleText = (s: string | null) => s === 'default: deny' ? 'not on allow list' : s === 'default: allow' ? 'allowed by default' : s?.replace(/^awaiting approval: /, '') ?? ''
 const asked = (blocked: string | null) => !!blocked?.startsWith('awaiting approval')
 const POLICIES = [['allow', 'Allow by default', 'Agents can reach any URL except blocked (or ask) ones.'], ['ask', 'Ask by default', 'URLs not on the allow list wait for your approval.'], ['deny', 'Deny by default', 'Agents can reach only allowed URLs. Blocked ones stay blocked.']] as const
-const urlNoQuery = (u: string) => { try { const x = new URL(u); return x.origin + x.pathname } catch { return u } }
-const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
+export const urlNoQuery = (u: string) => { try { const x = new URL(u); return x.origin + x.pathname } catch { return u } }
+/** Prefill for the rule dialog from an ask: block the domain, allow the URL without its query. */
+export const urlTarget = (s: any, action: 'allow' | 'block'): Target => action === 'block' ? { action, kind: 'domain', value: s.host as string, url: s.url } : { action, kind: 'url', value: urlNoQuery(s.url), url: s.url }
+export const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
 const toLocalInput = (ts: number) => new Date(ts - new Date().getTimezoneOffset() * 60e3).toISOString().slice(0, 16)
 
-/** Access rules (default policy + block/ask/allow by domain, URL prefix, regex), pending asks and the request log, for the web plugin or the browser (browserpaw). */
-export default function WebTraffic({ plugin = 'web' }: { plugin?: PluginId }) {
-  return <Plugin.Provider value={plugin}><PendingAsks plugin={plugin} title="Requests waiting for approval" hideEmpty /><AccessRules plugin={plugin} /></Plugin.Provider>
+/** Access rules (default policy + block/ask/allow by domain, URL prefix, regex), pending asks and the request log of `plugin`'s list. */
+export default function WebTraffic({ plugin = 'web', flavor = webFlavor }: { plugin?: string; flavor?: TrafficFlavor }) {
+  return <Plugin.Provider value={plugin}><Flavor.Provider value={flavor}><PendingAsks plugin={plugin} title="Requests waiting for approval" hideEmpty /><AccessRules /></Flavor.Provider></Plugin.Provider>
 }
 
 /** The rule dialog on its own (Approvals page): loads the rules itself. `onDone` gets the action saved. */
-export function UrlRuleDialog({ plugin, init, onClose, onDone }: { plugin: PluginId; init: Target; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
+export function UrlRuleDialog({ plugin, init, onClose, onDone }: { plugin: string; init: Target; onClose: () => void; onDone: (action: Action) => Promise<void> }) {
   const [state, setState] = useState<{ policy: Policy; rules: Rule[] }>()
   useEffect(() => { void actFor(plugin)<{ policy: Policy; rules: Rule[] }>('rules').then(setState) }, [plugin])
   return state ? <Plugin.Provider value={plugin}><RuleDialog init={init} state={state} onClose={onClose} onDone={onDone} /></Plugin.Provider> : null
 }
 
-function AccessRules({ plugin }: { plugin: PluginId }) {
+function AccessRules() {
   const act = useAct()
-  const browser = plugin === 'browserpaw'
-  const [sync, setSync] = useState<Record<string, Sync>>({})
+  const flavor = useContext(Flavor)
   const [state, setState] = useState<{ policy?: Policy; rules: Rule[] }>({ rules: [] }) // no policy until loaded: no radio lit
   const [dialog, setDialog] = useState<Target>()
   const [switching, setSwitching] = useState<Policy>()
   const { run, error } = useAction()
   const load = useCallback(() => run(async () => {
     setState(await act('rules'))
-    if (browser) setSync((await act<{ profiles: Record<string, Sync> }>('sync_status')).profiles)
   }), []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load() }, [load])
-  useEffect(() => {
-    if (!browser) return
-    const t = setInterval(() => void act<{ profiles: Record<string, Sync> }>('sync_status').then((r) => setSync(r.profiles)).catch(() => {}), 5000)
-    return () => clearInterval(t)
-  }, [browser]) // eslint-disable-line react-hooks/exhaustive-deps
   const { policy, rules } = state
   const allowCount = rules.filter((r) => r.action === 'allow').length
 
@@ -132,40 +158,38 @@ function AccessRules({ plugin }: { plugin: PluginId }) {
         <RuleGroup title="Blocked" kind="err" rules={rules.filter((r) => r.action === 'block')} kinds={KINDS} ops={opsFor('block')}
           desc="Always refused, even if an ask or allow rule also matches." />
         <RuleGroup title="Ask" kind="warn" rules={rules.filter((r) => r.action === 'ask')} kinds={KINDS} ops={opsFor('ask')}
-          desc={browser ? 'URLs agents pass to browser tools wait for your approval, even if an allow rule also matches.' : 'Wait for your approval, even if an allow rule also matches.'} />
+          desc={flavor.askDesc ?? 'Wait for your approval, even if an allow rule also matches.'} />
         {(policy !== 'allow' || allowCount > 0) && <RuleGroup title="Allowed" kind="ok" rules={rules.filter((r) => r.action === 'allow')} kinds={KINDS} ops={opsFor('allow')}
           desc={policy === 'deny' ? 'The only URLs agents can reach.' : policy === 'ask' ? 'Reached without asking.' : 'Not in use while the default is allow; kept for when you switch to ask or deny.'} dim={policy === 'allow'} />}
-        {browser
-          ? <p className="muted small" style={{ marginBottom: 0 }}>Separate from the Web plugin's list. Applies to every BrowserPaw profile and everything the browser loads (pages, frames, scripts, fetch/XHR, websockets), pushed to running browsers immediately. A browser that hasn't confirmed the current list gets no tool calls and blocks all traffic. <code>file:</code>, <code>chrome:</code>, <code>ftp:</code>, <code>ssh:</code> and other non-web schemes are always refused. Patterns use the browser's regex engine (no lookahead or backreferences). <strong>Ask</strong> applies to URLs agents pass to browser tools (navigate, fetch, upload…); the browser can't pause a page load, so inside the browser ask rules act as allow rules and ask by default acts as allow (links an agent clicks are not asked about).</p>
-          : <p className="muted small" style={{ marginBottom: 0 }}>Applies to every Web instance on every server, immediately (no restart, cookie jars are kept), including on redirects. Each instance's own allow/deny lists are checked after these. Only http and https are ever allowed.</p>}
-        {browser && Object.keys(sync).length > 0 && <div className="row small" style={{ marginTop: 8, flexWrap: 'wrap' }}>
-          <span className="muted">Browsers:</span>
-          {Object.entries(sync).map(([n, x]) => <span key={n} title={[x.error, ...x.rejected.map((r) => `rule ${rules.find((y) => y.id === r.id)?.value ?? r.id}: ${r.error}`), x.lastPull ? `last report ${fmt(x.lastPull)}` : ''].filter(Boolean).join('\n')}>
-            <Badge kind={x.error ? 'err' : x.inSync ? (x.rejected.length ? 'warn' : 'ok') : 'warn'}>{n}: {x.error ? 'error' : x.inSync ? (x.rejected.length ? `${x.rejected.length} rule(s) rejected` : 'in sync') : 'pending'}</Badge>
-          </span>)}
-        </div>}
+        {flavor.rulesNote}
+        {flavor.RulesStatus && <flavor.RulesStatus rules={rules} />}
       </div>
-      {policy && <RequestLog state={{ policy, rules }} onRule={setDialog} browser={browser} />}
+      {policy && <RequestLog state={{ policy, rules }} onRule={setDialog} />}
       {dialog && policy && <RuleDialog init={dialog} state={{ policy, rules }} onClose={() => setDialog(undefined)} onDone={async () => { setDialog(undefined); await load() }} />}
-      {switching && <DenyDialog to={switching} rules={rules} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
+      {switching && <DenyDialog to={switching} onClose={() => setSwitching(undefined)} onDone={async () => { setSwitching(undefined); await load() }} />}
     </>
   )
 }
 
 /** Switching to ask/deny: offer to allow every host that was reached recently, so nothing that works today silently breaks (or starts asking). */
-function DenyDialog({ to, rules, onClose, onDone }: { to: Policy; rules: Rule[]; onClose: () => void; onDone: () => Promise<void> }) {
+function DenyDialog({ to, onClose, onDone }: { to: Policy; onClose: () => void; onDone: () => Promise<void> }) {
   const act = useAct()
   const [hosts, setHosts] = useState<[string, number][]>()
   const [picked, setPicked] = useState<Set<string>>(new Set())
   const { run, busy, error } = useAction()
   useEffect(() => {
-    void recentRequests(act).then((rows) => {
+    void recentRequests(act).then(async (rows) => {
+      const ok = rows.filter((r) => !r.blocked && /^(https?|wss?):/i.test(r.url))
+      const urls = [...new Set(ok.map((r) => r.url))]
+      // would the default (not a block rule) refuse it under deny?
+      const { now } = await act<Check>('check', { urls, policy: 'deny' })
+      const refused = new Set(urls.filter((_, i) => now[i]!.by === 'default: deny'))
       const n = new Map<string, number>()
-      for (const r of rows) if (!r.blocked && /^(https?|wss?):/i.test(r.url) && verdict(r.url, rules, 'deny').blocked && !rules.some((x) => x.action === 'block' && matches(x, r.url))) n.set(r.host, (n.get(r.host) ?? 0) + 1)
+      for (const r of ok) if (refused.has(r.url)) n.set(r.host, (n.get(r.host) ?? 0) + 1)
       const list = [...n].sort((a, b) => b[1] - a[1])
       setHosts(list); setPicked(new Set(list.map(([h]) => h)))
     }).catch(() => setHosts([]))
-  }, [rules])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
   const toggle = (h: string) => { const s = new Set(picked); if (s.has(h)) s.delete(h); else s.add(h); setPicked(s) }
   return (
     <Modal title={`Switch to ${to} by default`} onClose={onClose}>
@@ -204,23 +228,22 @@ function RuleDialog({ init, state, onClose, onDone }: { init: Target; state: { p
 
   const k = KINDS.find((x) => x.kind === kind)!
   const v = value.trim()
-  const regexErr = kind === 'regex' && v ? (() => { try { new RegExp(v); return undefined } catch (e) { return (e as Error).message } })() : undefined
-  const rule = { kind, value: v }
-  const hits = useMemo(() => v && !regexErr ? recent.filter((r) => matches(rule, r.url)) : [], [recent, kind, v, regexErr]) // eslint-disable-line react-hooks/exhaustive-deps
-  // Block beats ask beats allow, so allowing (or asking) means removing the rules that override it.
-  const probes = useMemo(() => {
-    const p = hits.map((r) => r.url)
-    if (init.url) p.push(init.url)
-    if (kind === 'url' && v) p.push(v)
-    if (kind === 'domain' && v) p.push(`https://${v}/`)
-    return p
-  }, [hits, init.url, kind, v])
-  const conflicts = v && !regexErr ? rules.filter((r) => OVERRIDES[action].includes(r.action) && probes.some((u) => matches(r, u))) : []
+  // The server says which recent URLs the draft matches and which stored rules override it (block beats ask beats allow).
+  const urls = useMemo(() => [...new Set(recent.map((r) => r.url))], [recent])
+  const [chk, setChk] = useState<Check>()
+  useEffect(() => {
+    if (!v) { setChk(undefined); return }
+    const t = setTimeout(() => void act<Check>('check', { urls, rule: { kind, value: v }, action, probes: init.url ? [init.url] : [] }).then(setChk, (e: Error) => setChk({ now: [], error: e.message })), 200)
+    return () => clearTimeout(t)
+  }, [urls, kind, v, action, init.url]) // eslint-disable-line react-hooks/exhaustive-deps
+  const regexErr = v ? chk?.error : undefined
+  const hits = useMemo(() => { const m = new Set(urls.filter((_, i) => chk?.matches?.[i])); return v && !regexErr ? recent.filter((r) => m.has(r.url)) : [] }, [chk, urls, recent, v, regexErr])
+  const conflicts = v && !regexErr ? rules.filter((r) => chk?.conflicts?.includes(r.id)) : []
   const remove = conflicts.filter((r) => !keep.has(r.id))
   const kept = conflicts.filter((r) => keep.has(r.id))
   const allowNoop = action === 'allow' && policy === 'allow' && remove.length === 0
   const domainPicks = kind === 'domain' && init.kind === 'domain' && init.value ? init.value.split('.').map((_, i, a) => a.slice(i).join('.')).filter((d) => d.includes('.')) : []
-  const canSave = !busy && !!v && !regexErr && !allowNoop
+  const canSave = !busy && !!v && !!chk && !regexErr && !allowNoop
 
   const save = () => run(async () => { await act('rule', { action, kind, value: v, note, remove: remove.map((r) => r.id) }); await onDone(action) })
   const verb = action === 'block' ? 'Block' : action === 'ask' ? 'Ask' : 'Allow'
@@ -273,27 +296,27 @@ function RuleDialog({ init, state, onClose, onDone }: { init: Target; state: { p
   )
 }
 
-function RequestLog({ state, onRule, browser }: { state: { policy: Policy; rules: Rule[] }; onRule: (t: Target) => void; browser: boolean }) {
+function RequestLog({ state, onRule }: { state: { policy: Policy; rules: Rule[] }; onRule: (t: Target) => void }) {
   const act = useAct()
-  const [servers] = useApi<Server[]>(browser ? null : '/servers')
+  const { log } = useContext(Flavor)
+  const cells = log.useCells()
   const [range, setRange] = useState<number | 'custom'>(86400e3)
   const [from, setFrom] = useState(() => toLocalInput(Date.now() - 86400e3))
   const [to, setTo] = useState(() => toLocalInput(Date.now()))
-  const [f, setF] = useState({ q: '', method: '', outcome: '', server: '', profile: '', via: '' })
+  const [f, setF] = useState<Record<string, string>>(() => ({ q: '', outcome: '', ...log.filters }))
   const [live, setLive] = useState(true)
   const [data, setData] = useState<{ rows: Req[]; more: boolean }>()
   const { run, error, busy } = useAction()
   const load = useCallback(() => run(async () => {
     const [since, until] = range === 'custom' ? [new Date(from).getTime(), new Date(to).getTime()] : [Date.now() - range, Date.now()]
     setData(await act('requests', { since, until, ...f }))
-  }), [range, from, to, f]) // eslint-disable-line react-hooks/exhaustive-deps
+  }), [range, from, to, f, state.rules, state.policy]) // eslint-disable-line react-hooks/exhaustive-deps -- rules change → rows' `now` recomputed
   useEffect(() => {
     void load()
     if (!live || range === 'custom') return
     const t = setInterval(() => void load(), 5000)
     return () => clearInterval(t)
   }, [load, live, range])
-  const sname = (id: string) => servers?.find((s) => s.id === id)?.name ?? id
   const rows = data?.rows ?? []
 
   return (
@@ -311,23 +334,17 @@ function RequestLog({ state, onRule, browser }: { state: { policy: Policy; rules
           {RANGES.map(([l, ms]) => <option key={ms} value={ms}>{l}</option>)}<option value="custom">Custom range…</option>
         </select>
         {range === 'custom' && <><input type="datetime-local" value={from} onChange={(e) => setFrom(e.target.value)} /> <span className="muted">to</span> <input type="datetime-local" value={to} onChange={(e) => setTo(e.target.value)} /></>}
-        <select value={f.outcome} onChange={(e) => setF({ ...f, outcome: e.target.value })} style={{ width: 130 }}><option value="">Allowed & blocked</option><option value="allowed">Allowed</option><option value="blocked">Blocked</option>{!browser && <option value="error">Errors</option>}</select>
-        {browser
-          ? <>
-            <input type="text" placeholder="Profile" value={f.profile} onChange={(e) => setF({ ...f, profile: e.target.value })} style={{ width: 120 }} />
-            <select value={f.via} onChange={(e) => setF({ ...f, via: e.target.value })} style={{ width: 190 }}><option value="">All sources</option>{Object.entries(VIA).map(([k, l]) => <option key={k} value={k}>{l}</option>)}</select>
-          </>
-          : <select value={f.server} onChange={(e) => setF({ ...f, server: e.target.value })} style={{ width: 160 }}><option value="">All servers</option>{servers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>}
-        {!browser && <select value={f.method} onChange={(e) => setF({ ...f, method: e.target.value })} style={{ width: 120 }}><option value="">All methods</option>{['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'].map((m) => <option key={m}>{m}</option>)}</select>}
+        <select value={f.outcome} onChange={(e) => setF({ ...f, outcome: e.target.value })} style={{ width: 130 }}><option value="">Allowed & blocked</option><option value="allowed">Allowed</option><option value="blocked">Blocked</option>{log.errors && <option value="error">Errors</option>}</select>
+        <log.Filters f={f} set={(k, v) => setF({ ...f, [k]: v })} />
         <input type="text" placeholder="Search URL or agent…" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} style={{ width: 220 }} />
       </div>
       {error && <Alert kind="err">{error}</Alert>}
       <div style={{ overflowX: 'auto' }}>
       <table>
-        <thead><tr><th>Time</th><th>{browser ? 'Profile / agent' : 'Server / agent'}</th><th>{browser ? 'Type' : 'Method'}</th><th>URL</th><th>Access</th>{!browser && <th>Response</th>}<th></th></tr></thead>
+        <thead><tr><th>Time</th>{log.head[0].map((h) => <th key={h}>{h}</th>)}<th>URL</th><th>Access</th>{log.head[1].map((h) => <th key={h}>{h}</th>)}<th></th></tr></thead>
         <tbody>
           {rows.map((r) => {
-            const now = verdict(r.url, state.rules, state.policy)
+            const now = r.now
             const wasAsked = asked(r.blocked)
             const changed = now.blocked !== (!!r.blocked && !wasAsked) || !!now.ask !== wasAsked
             const base = urlNoQuery(r.url)
@@ -336,31 +353,22 @@ function RequestLog({ state, onRule, browser }: { state: { policy: Policy; rules
             const Verb = stopped ? 'Allow' : 'Block'
             return <tr key={r.id} className="log-row">
               <td className="ts">{fmt(r.ts)}</td>
-              {browser
-                ? <td className="small" style={{ whiteSpace: 'nowrap' }}>{r.profile}{r.tab_id != null && r.tab_id >= 0 && <span className="muted"> · tab {r.tab_id}</span>}
-                    <div className="muted" title={r.agent_via ? AGENT_VIA[r.agent_via] : 'no agent had used this tab (the user, or browser background traffic)'}>{r.principal ?? (r.agent_via ? '(unnamed agent)' : 'user / background')}{r.agent_via && r.agent_via !== 'tool' && <> <Badge>{r.agent_via}</Badge></>}</div></td>
-                : <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'web' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>}
-              {browser
-                ? <td className="small" style={{ whiteSpace: 'nowrap' }}>{r.type}{r.method && r.method.toUpperCase() !== 'GET' && <> <Badge kind="warn">{r.method.toUpperCase()}</Badge></>}</td>
-                : <td><Badge kind={r.method === 'GET' || r.method === 'HEAD' ? undefined : 'warn'}>{r.method}</Badge></td>}
+              {cells.before(r)}
               <td className="mono" style={{ width: '100%', maxWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={r.url}>{r.url}</td>
               <td style={{ whiteSpace: 'nowrap' }}>
                 {wasAsked ? <Badge kind="warn">Asked</Badge> : r.blocked ? <Badge kind="err">Blocked</Badge> : <Badge kind="ok">Allowed</Badge>}
                 <span className="muted small"> {ruleText(r.blocked ?? r.allowed_by)}</span>
-                {browser && r.via && <div className="muted small">{VIA[r.via] ?? r.via}</div>}
+                {cells.access?.(r)}
                 {changed && <div className="small" style={{ fontStyle: 'italic' }}>now {now.blocked ? 'blocked' : now.ask ? 'asks' : 'allowed'}</div>}
               </td>
-              {!browser && <td style={{ whiteSpace: 'nowrap' }}>
-                {r.blocked ? <span className="muted small">—</span> : r.error ? <><Badge kind="err">failed</Badge> <span className="muted small" title={r.error}>{r.error.slice(0, 40)}</span></>
-                  : <><Badge kind={r.status! >= 400 ? 'err' : r.status! >= 300 ? 'info' : undefined}>{r.status}</Badge>{r.ms != null && <span className="muted small"> {r.ms} ms</span>}</>}
-              </td>}
+              {cells.after(r)}
               <td>{/^(https?|wss?):/i.test(r.url) && <div style={{ display: 'flex', flexDirection: 'column', gap: 4, whiteSpace: 'nowrap' }}>
                 <button className={`sm${stopped ? '' : ' danger'}`} title={`${Verb} ${r.host} and its subdomains`} onClick={() => onRule({ action: next, kind: 'domain', value: r.host, url: r.url })}>{Verb} domain</button>
                 <button className={`sm${stopped ? '' : ' danger'}`} title={`${Verb} URLs starting with ${base}`} onClick={() => onRule({ action: next, kind: 'url', value: base, url: r.url })}>{Verb} URL</button>
               </div>}</td>
             </tr>
           })}
-          {rows.length === 0 && <tr><td colSpan={browser ? 6 : 7} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
+          {rows.length === 0 && <tr><td colSpan={log.head[0].length + log.head[1].length + 4} className="muted">{data ? 'No requests in this timeframe.' : 'Loading…'}</td></tr>}
         </tbody>
       </table>
       </div>

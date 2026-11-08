@@ -1,6 +1,5 @@
 import { useState } from 'react'
-import { api } from '../api'
-import { Alert, CopyButton, Field, Modal } from '../components/ui'
+import { Alert, CopyButton, Field, Modal, api } from '@mcontrolprogram/ui'
 
 /**
  * Guided "add SSH host" flow for the ssh plugin. Each step is one stateless plugin action;

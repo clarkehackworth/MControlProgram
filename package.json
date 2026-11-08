@@ -9,7 +9,7 @@
     "start": "node dist/main.js",
     "redeploy": "npm version patch --no-git-tag-version && docker compose up -d --build",
     "build": "tsc -p tsconfig.json && npm run build:web",
-    "build:web": "npm --prefix web run build",
+    "build:web": "npm --prefix web run build && npm --prefix web run build:plugins",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:ssh": "scripts/test-sshd.sh"
   },

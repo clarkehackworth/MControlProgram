@@ -9,6 +9,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 process.env.MCONTROLPROGRAM_DATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
+{ // new installs default to ask; these tests exercise ssh, not the default policy
+  const { plugins } = await import('../src/core/plugin-loader.js');
+  for (const id of ['ssh', 'mcp']) await plugins.get(id)!.globalActions!.set_policy!.run({ policy: 'allow' }, {} as any);
+}
 const port = Number(process.env.MCONTROLPROGRAM_TEST_SSH_PORT);
 const keyFile = process.env.MCONTROLPROGRAM_TEST_SSH_KEY;
 const skip = !port || !keyFile ? 'set MCONTROLPROGRAM_TEST_SSH_PORT and MCONTROLPROGRAM_TEST_SSH_KEY' : false;
@@ -141,7 +146,8 @@ test('mcp plugin: http upstream reached through an ssh host (sshHost) with a pin
   const { pluginConfig } = await import('../src/core/store.js');
   const { ScopedLogger } = await import('../src/core/logger.js');
   const { GLOBAL_DEFAULTS } = await import('../src/core/global-config.js');
-  const mcp = (await import('../src/plugins/mcp/index.js')).default;
+  const { plugins } = await import('../src/core/plugin-loader.js');
+  const mcp = plugins.get('mcp')!;
   // learn the test sshd's host key the way an admin would (first-use), then pin it
   const hostKey = await new Promise<string>((res, rej) => { const c = new ssh2.Client(); let fp = ''; c.on('ready', () => { c.end(); res(fp); }).on('error', rej)
     .connect({ host: '127.0.0.1', port, username: os.userInfo().username, privateKey: fs.readFileSync(keyFile!, 'utf8'), hostVerifier: (k: Buffer) => { fp = 'SHA256:' + createHash('sha256').update(k).digest('base64').replace(/=+$/, ''); return true; } }); });
@@ -152,7 +158,7 @@ test('mcp plugin: http upstream reached through an ssh host (sshHost) with a pin
   try {
     await new Promise<void>((r) => up.stdout.on('data', (d) => d.toString().includes('ready') && r()));
     const servers = [{ name: 'remote', transport: 'http', url: `http://127.0.0.1:${UP}/mcp`, auth: 'bearer', token: 'tok', sshHost: 'box' }];
-    const inst = await mcp.create({ instanceId: 'i', instanceName: 'mcp', serverId: 's', config: { ...mcp.defaultConfig, servers: ['remote'] }, pluginConfig: { servers, callTimeoutMs: 5000 }, global: () => GLOBAL_DEFAULTS, log: new ScopedLogger({}, () => 'off') });
+    const inst = await mcp.create({ instanceId: 'i', instanceName: 'mcp', serverId: 's', config: { ...mcp.defaultConfig, servers: ['remote'] }, pluginConfig: { servers, callTimeoutMs: 5000 }, global: () => GLOBAL_DEFAULTS, log: new ScopedLogger({}, () => 'off'), dep: () => undefined });
     await inst.start?.();
     const echo = inst.tools.find((t) => t.name === 'remote_echo')!;
     const r = await echo.handler({ text: 'via-ssh' }, { signal: new AbortController().signal, log: new ScopedLogger({}, () => 'off') } as any);
@@ -160,6 +166,6 @@ test('mcp plugin: http upstream reached through an ssh host (sshHost) with a pin
     await inst.stop?.();
     // wrong pin → refused
     pluginConfig.savePlain('ssh', { connectTimeoutMs: 5000, keepaliveSec: 30, hosts: [{ name: 'box', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key', privateKey: fs.readFileSync(keyFile!, 'utf8'), hostKey: 'SHA256:wrong' }] });
-    await assert.rejects(mcp.globalActions!.test_server!.run({ name: 'remote' }, { config: { servers }, setConfig: async () => {}, log: new ScopedLogger({}, () => 'off') }), /host key mismatch/);
+    await assert.rejects(mcp.globalActions!.test_server!.run({ name: 'remote' }, { config: { servers }, setConfig: async () => {}, log: new ScopedLogger({}, () => 'off'), dep: () => undefined }), /host key mismatch/);
   } finally { up.kill(); }
 });

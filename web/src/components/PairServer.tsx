@@ -1,5 +1,5 @@
 import { api, type PluginMeta, type Server } from '../api'
-import { Modal, useAction } from '../components/ui'
+import { Modal, useAction } from './ui'
 
 /** Pick which MCP servers use an inventory item: ticking adds it to that server's `p.id` instance (created if missing), unticking removes it. */
 export default function PairServer({ p, item, servers, field, dk, onClose, reload }: { p: PluginMeta; item: string; servers: Server[]; field: string; dk?: string; onClose: () => void; reload: () => Promise<void> }) {

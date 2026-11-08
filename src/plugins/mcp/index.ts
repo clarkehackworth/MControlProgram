@@ -10,14 +10,9 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
-import type { MControlProgramPlugin, PluginContext, PluginInstance, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
-import { effective } from '../../core/global-config.js';
-import { setting } from '../../core/db.js';
-import { encrypt, decrypt } from '../../core/crypto.js';
-import { config as mcontrolprogramConfig } from '../../core/config.js';
-import { pluginConfig } from '../../core/store.js';
-import { openTunnel, type HostCfg } from '../ssh/index.js';
-import { ask } from '../../core/plugin-api.js';
+import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
+import type { SshApi } from '../ssh/index.js';
+import { ask, effective } from '../../core/plugin-api.js';
 import * as toolRules from './rules.js';
 
 interface ServerCfg {
@@ -47,12 +42,14 @@ const serverSchema = {
   },
 };
 
+let host: PluginHost;
+
 // ---- OAuth client state, encrypted in settings (kept out of the config form) ----
-const oauthKey = (name: string) => `mcp.oauth.${name}`;
+const oauthKey = (name: string) => `oauth.${name}`;
 const loadOauth = (name: string): { client?: OAuthClientInformationMixed; tokens?: OAuthTokens; verifier?: string } => {
-  const raw = setting.get(oauthKey(name)); return raw ? JSON.parse(decrypt(raw)) : {};
+  const raw = host.kv.get(oauthKey(name)); return raw ? JSON.parse(host.secrets.decrypt(raw)) : {};
 };
-const saveOauth = (name: string, patch: Record<string, unknown>) => setting.set(oauthKey(name), encrypt(JSON.stringify({ ...loadOauth(name), ...patch })));
+const saveOauth = (name: string, patch: Record<string, unknown>) => host.kv.set(oauthKey(name), host.secrets.encrypt(JSON.stringify({ ...loadOauth(name), ...patch })));
 // state nonce → server name, one live per server, 10 min. The callback only accepts a state we issued (RFC 6749 §10.12).
 const flows = new Map<string, { name: string; exp: number }>();
 const newFlow = (name: string) => {
@@ -60,7 +57,7 @@ const newFlow = (name: string) => {
   const n = randomBytes(24).toString('base64url'); flows.set(n, { name, exp: Date.now() + 600_000 }); return n;
 };
 const pendingAuth = new Map<string, URL>(); // server name → authorization URL captured during connect
-const redirectUrl = () => `${mcontrolprogramConfig.publicUrl ?? `http://${mcontrolprogramConfig.adminHost}:${mcontrolprogramConfig.adminPort}`}/api/plugins/mcp/callback`;
+const redirectUrl = () => host.callbackUrl();
 
 function oauthProvider(name: string): OAuthClientProvider {
   return {
@@ -99,10 +96,9 @@ async function viaTunnel(s: ServerCfg, log: PluginContext['log']) {
   if (s.auth === 'oauth') throw new Error(`server ${s.name}: OAuth is not supported through an SSH host`);
   const u = new URL(s.url ?? '');
   if (u.protocol !== 'http:') throw new Error(`server ${s.name}: only http:// URLs can go through an SSH host`);
-  const g = pluginConfig.decrypted('ssh') as { hosts?: HostCfg[]; connectTimeoutMs: number; keepaliveSec: number };
-  const h = g.hosts?.find((x) => x.name === s.sshHost);
-  if (!h) throw new Error(`server ${s.name}: ssh host "${s.sshHost}" is not in the SSH plugin inventory`);
-  const t = await openTunnel(h, g, u.hostname, Number(u.port) || 80, log);
+  const ssh = host.dep<SshApi | undefined>('ssh');
+  if (!ssh) throw new Error(`server ${s.name}: reaching it via ssh host "${s.sshHost}" needs the ssh plugin, which is not loaded`);
+  const t = await ssh.openTunnel(s.sshHost, u.hostname, Number(u.port) || 80, log);
   u.host = `127.0.0.1:${t.port}`;
   return { s: { ...s, url: u.toString() }, close: t.close };
 }
@@ -124,6 +120,8 @@ const plugin: MControlProgramPlugin = {
   id: 'mcp',
   name: 'MCP pass-through',
   version: '0.1.0',
+  optionalDependencies: { ssh: '^0.2.0' },
+  init(h) { host = h; toolRules.init(h); },
   description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with a call log, an expose/hide list, and per-tool allow/ask/deny rules.',
   globalConfigSchema: {
     type: 'object',
@@ -170,7 +168,7 @@ const plugin: MControlProgramPlugin = {
         }
       },
     },
-    callback: {
+    callback: { hidden: true,
       title: 'OAuth callback (internal)',
       async run({ code, state, error, error_description }, { config }) {
         if (error) throw new Error(`${error}: ${error_description ?? ''}`);
@@ -187,7 +185,7 @@ const plugin: MControlProgramPlugin = {
     oauth_reset: {
       title: 'Forget OAuth tokens',
       when: { auth: 'oauth' },
-      async run({ name }) { setting.set(oauthKey(String(name)), encrypt('{}')); return { ok: true }; },
+      async run({ name }) { host.kv.set(oauthKey(String(name)), host.secrets.encrypt('{}')); return { ok: true }; },
     },
   },
   configSchema: {

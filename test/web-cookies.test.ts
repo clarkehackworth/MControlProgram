@@ -6,6 +6,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 // Tiny site: /login sets a cookie and redirects to /me; /me echoes the Cookie header; /other sets a path-scoped cookie.
 const site = http.createServer((req, res) => {
@@ -20,6 +21,8 @@ const base = `http://127.0.0.1:${(site.address() as any).port}`;
 
 const mk = async (over: Record<string, unknown>) => {
   const web = (await import('../src/plugins/web/index.js')).default;
+  // new installs default to ask; these tests exercise behaviour, not the default
+  await web.globalActions!.set_policy!.run({ policy: 'allow' }, {} as any);
   const { ScopedLogger } = await import('../src/core/logger.js');
   const inst = (await web.create({ instanceId: 'i', instanceName: 'web', serverId: 's', global: () => ({ stateIdleSec: 172800, connectionIdleSec: 3600, logRetentionDays: 30 }), log: new ScopedLogger({}, () => 'off'), config: { ...web.defaultConfig, blockPrivateNetworks: false, ...over }, pluginConfig: { credentials: [] } })) as any;
   inst.start?.();

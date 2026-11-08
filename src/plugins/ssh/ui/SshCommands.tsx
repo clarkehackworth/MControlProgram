@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, useApi, type Server } from '../api'
-import { Alert, Badge, Field, Modal, useAction } from '../components/ui'
-import { PendingAsks } from '../components/Asks'
-import { RuleGroup, type RuleOps } from '../components/RuleGroup'
+import { Alert, Badge, Field, Modal, PendingAsks, RuleGroup, api, useAction, useApi, type RuleOps, type Server } from '@mcontrolprogram/ui'
 
 type Kind = 'program' | 'prefix' | 'regex' | 'write'
 type Action = 'block' | 'ask' | 'allow'

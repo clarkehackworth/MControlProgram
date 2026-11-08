@@ -41,5 +41,3 @@ export function setGlobalConfig(patch: Partial<GlobalConfig>) {
   for (const [k, v] of Object.entries(patch)) if (v !== undefined) setting.set(`global.${k}`, String(v));
 }
 
-/** Plugin helper: a per-instance override wins when > 0; otherwise the global value. */
-export const effective = (override: number | undefined, globalValue: number) => (override && override > 0 ? override : globalValue);

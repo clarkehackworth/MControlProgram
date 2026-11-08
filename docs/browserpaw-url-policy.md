@@ -199,7 +199,7 @@ State lives in `chrome.storage.session` (survives service-worker restarts, clear
 
 ## As built: where it differs from the design above
 
-- Rule storage and admin actions live in `ruleStore(prefix)` in `src/core/url-policy.ts`, shared by both plugins (tables `web_blocks`/`web_policy` and `browserpaw_blocks`/`browserpaw_policy`). The web plugin's tables and behaviour are unchanged.
+- Rule storage and admin actions live in `ruleStore(db, prefix)` in `src/plugins/web/url-policy.ts`. The web plugin exposes it as `WebApi`; browserpaw declares `dependencies: { web }` and keeps its list in its own tables (`browserpaw_blocks`/`browserpaw_policy`). `browserVerdict` lives in `src/plugins/browserpaw/policy.ts`. (Originally this was a shared `src/core/url-policy.ts`; moved so plugins only share code through declared dependencies.)
 - Events are cursor-paged by `(epoch, seq)`. A new epoch means the browser restarted, so the cursor resets. The extension drops events once MControlProgram has fetched past them.
 - The startup bootstrap block-all and a policy push are serialized, so a push that arrives during service-worker startup can't be overwritten.
 - The extension's own calls to its bridge (127.0.0.1:12306-12316, initiator = this extension) are exempt from block-all, so health checks keep working while out of sync.

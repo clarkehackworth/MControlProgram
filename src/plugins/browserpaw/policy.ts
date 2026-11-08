@@ -3,15 +3,23 @@
  * profile's extension (fork routes /url-policy*), which enforces it with declarativeNetRequest and
  * reports what it blocked/allowed. Also: the tool-argument pre-check and the request log.
  */
-import { getDb } from '../../core/db.js';
-import { ruleStore, browserVerdict } from '../../core/url-policy.js';
-import { ask, type ToolCallContext } from '../../core/plugin-api.js';
+import { ask, type PluginHost, type ToolCallContext } from '../../core/plugin-api.js';
+import type { WebApi, RuleStore, Rule, Policy, Verdict } from '../web/index.js';
 
-export const store = ruleStore('browserpaw', { re2: true });
+let host: PluginHost;
+let web: WebApi;
+/** The browser list: the web plugin's rule engine, kept in browserpaw's own tables. */
+export let store: RuleStore;
+/** Called from the plugin's init; web is a declared dependency, so it is initialised first. */
+export function init(h: PluginHost) {
+  host = h; web = h.dep<WebApi>('web'); tablesReady = false;
+  store = web.ruleStore(() => host.db, 'browserpaw', { re2: true });
+  Object.assign(actions, store.actions);
+}
 
 let tablesReady = false;
 const db = () => {
-  const d = getDb();
+  const d = host.db;
   if (!tablesReady) {
     d.exec(`CREATE TABLE IF NOT EXISTS browserpaw_requests (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, profile TEXT NOT NULL,
         principal TEXT, session_id TEXT, agent_via TEXT, tab_id INTEGER, type TEXT NOT NULL, method TEXT, url TEXT NOT NULL, host TEXT NOT NULL,
@@ -133,7 +141,7 @@ function urlArgs(tool: string, args: any): string[] {
 export async function prepareCall(profile: string, tool: string, args: Record<string, any>, call: Pick<ToolCallContext, 'principal' | 'sessionId' | 'ask'>): Promise<Record<string, any>> {
   const { _meta: _ignored, ...rest } = args;
   for (const url of urlArgs(tool, rest)) {
-    const v = browserVerdict(url, store.rules(), store.policy(), true);
+    const v = browserVerdict(web, url, store.rules(), store.policy(), true);
     const refuse = (blocked: string, msg: string) => {
       record({ profile, principal: call.principal, sessionId: call.sessionId, agentVia: 'tool', type: 'main_frame', url, blocked, via: 'tool-arg' });
       throw new Error(msg);
@@ -150,9 +158,9 @@ export async function prepareCall(profile: string, tool: string, args: Record<st
 
 // ---------- admin actions ----------
 
-export const actions = {
-  ...store.actions,
-  requests: { title: 'Request log', run: async (q: Record<string, any>) => {
+/** Rule actions (rules, rule, delete_rule, set_policy) are added by init(). */
+export const actions: Record<string, { title: string; hidden?: boolean; run: (p: Record<string, any>) => Promise<unknown> }> = {
+  requests: { hidden: true, title: 'Request log', run: async (q: Record<string, any>) => {
     const where = ['ts >= ?', 'ts <= ?']; const args: unknown[] = [Number(q.since) || 0, Number(q.until) || Date.now()];
     if (q.q) { where.push('(url LIKE ? OR principal LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`); }
     if (q.profile) { where.push('profile = ?'); args.push(q.profile); }
@@ -162,8 +170,31 @@ export const actions = {
     if (q.outcome === 'allowed') where.push('blocked IS NULL');
     const limit = Math.min(Number(q.limit) || 500, 5000);
     const rows = db().prepare(`SELECT * FROM browserpaw_requests WHERE ${where.join(' AND ')} ORDER BY ts DESC, id DESC LIMIT ?`).all(...args, limit + 1);
-    return { rows: rows.slice(0, limit), more: rows.length > limit };
+    return { rows: (rows.slice(0, limit) as { url: string }[]).map((r) => ({ ...r, now: store.now(r.url) })), more: rows.length > limit };
   } },
-  clear_requests: { title: 'Clear request log', run: async () => { db().prepare('DELETE FROM browserpaw_requests').run(); } },
-  sync_status: { title: 'URL policy sync', run: async () => ({ rev: store.rev(), profiles: syncStatus() }) },
+  clear_requests: { hidden: true, title: 'Clear request log', run: async () => { db().prepare('DELETE FROM browserpaw_requests').run(); } },
+  sync_status: { hidden: true, title: 'URL policy sync', run: async () => ({ rev: store.rev(), profiles: syncStatus() }) },
 };
+
+/**
+ * Browser-side verdict: scheme table + rules. Mirror of browserVerdict() in the BrowserPaw fork
+ * (app/chrome-extension/entrypoints/background/url-policy.ts); keep the two in step.
+ * `top` = top-level navigation; `selfId` = the BrowserPaw extension id (its own pages are allowed).
+ */
+export function browserVerdict(web: Pick<WebApi, 'verdict'>, raw: string, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy, top: boolean, selfId?: string, depth = 0): Verdict {
+  let u: URL;
+  try { u = new URL(raw); } catch { return { blocked: 'invalid url' }; }
+  const p = u.protocol;
+  if (p === 'http:' || p === 'https:') return web.verdict(u, list, def);
+  if (p === 'ws:' || p === 'wss:') return web.verdict(new URL(u.href.replace(/^ws/i, 'http')), list, def);
+  if (p === 'about:') return /^about:(blank|srcdoc)$/i.test(u.href.split(/[?#]/)[0]!) ? { allowedBy: 'scheme: about:blank' } : { blocked: 'scheme: about:' };
+  if (p === 'chrome:') return /^chrome:\/\/(newtab|new-tab-page)\//i.test(u.href) ? { allowedBy: 'scheme: chrome://newtab' } : { blocked: 'scheme: chrome:' };
+  if (p === 'chrome-extension:') return selfId && u.hostname === selfId ? { allowedBy: 'scheme: this extension' } : { blocked: 'scheme: chrome-extension:' };
+  if (p === 'data:') return top ? { blocked: 'scheme: data: (top-level)' } : { allowedBy: 'scheme: data:' };
+  if ((p === 'view-source:' || p === 'blob:' || p === 'filesystem:') && depth < 3) {
+    const inner = browserVerdict(web, raw.slice(p.length), list, def, top, selfId, depth + 1);
+    if (p === 'view-source:' || inner.blocked) return inner;
+    return /^https?:/i.test(raw.slice(p.length)) ? inner : { blocked: `scheme: ${p}` };
+  }
+  return { blocked: `scheme: ${p}` }; // file:, ftp:, ssh:, javascript:, devtools:, external app handlers, …
+}

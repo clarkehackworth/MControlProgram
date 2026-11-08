@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-mcp-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 test('mcp tool rules: per-tool rule beats default, renames carry rules, calls logged with current verdict', async () => {
   const r = await import('../src/plugins/mcp/rules.js');

@@ -6,9 +6,10 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-ask-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 test('ask rules: precedence block > ask > allow > default, in URL and SSH engines', async () => {
-  const { verdict } = await import('../src/core/url-policy.js');
+  const { verdict } = await import('../src/plugins/web/url-policy.js');
   const L = [{ action: 'block' as const, kind: 'url' as const, value: 'https://a.com/x' }, { action: 'ask' as const, kind: 'domain' as const, value: 'a.com' }, { action: 'allow' as const, kind: 'domain' as const, value: 'b.a.com' }];
   assert.equal(verdict(new URL('https://a.com/x/1'), L, 'allow').blocked, 'url: https://a.com/x');
   assert.equal(verdict(new URL('https://b.a.com/'), L, 'allow').ask, 'domain: a.com', 'ask beats allow');

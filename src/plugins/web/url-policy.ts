@@ -1,9 +1,9 @@
 /**
- * URL access rules shared by the web plugin (enforced here) and the browserpaw plugin (pushed to the
- * BrowserPaw extension and enforced there with declarativeNetRequest). Each plugin has its own list.
+ * URL access rules. The web plugin enforces its own list; other plugins get the same engine through
+ * web's `api` (declare `dependencies: { web }`) and keep their own list in their own tables.
  */
-import { safeRegex } from './safe-regex.js';
-import { getDb } from './db.js';
+import type BetterSqlite3 from 'better-sqlite3';
+import { safeRegex } from '../../core/plugin-api.js';
 
 export type BlockKind = 'domain' | 'url' | 'regex';
 export type RuleAction = 'block' | 'ask' | 'allow';
@@ -63,7 +63,7 @@ export function normalizeBlock(kind: string, raw: string, opts: { re2?: boolean 
  * A persisted rule list + default policy, with the admin actions the rules UI calls.
  * Tables: `<prefix>_blocks`, `<prefix>_policy` (keys `default` and `rev`; rev bumps on every change).
  */
-export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } = {}) {
+export function ruleStore(getDb: () => BetterSqlite3.Database, prefix: string, opts: { re2?: boolean } = {}) {
   const T = `${prefix}_blocks`, P = `${prefix}_policy`;
   let ready = false;
   const db = () => {
@@ -91,11 +91,38 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
     for (const f of listeners) f();
   };
 
+  /** Current verdict for a logged URL, for "now blocked / now asks" in request logs. */
+  const now = (url: string, def: Policy = policy()) => {
+    let u: URL; try { u = new URL(url.replace(/^ws/i, 'http')); } catch { return { blocked: true, ask: false, by: 'invalid url' }; }
+    const v = verdict(u, rules(), def);
+    return { blocked: !!v.blocked, ask: !!v.ask, by: v.blocked ?? v.ask ?? v.allowedBy ?? '' };
+  };
+  const OVERRIDES: Record<string, string[]> = { allow: ['block', 'ask'], ask: ['block'], block: [] };
+
   const actions = {
-    rules: { title: 'Access rules', run: async () => ({ policy: policy(), rules: rules(), rev: rev() }) },
+    /**
+     * Verdicts for the rules UI, so it never re-implements matching. `urls` → `now` (under `policy` if given);
+     * `rule` (a draft {kind, value}) → which of `urls` it matches, and with `action`, the ids of stored rules that
+     * would override it on those URLs, the draft's own URL/domain and `probes`; `error` if the draft is invalid.
+     */
+    check: { hidden: true, title: 'Check URLs', run: async ({ urls, policy: p, rule, action, probes }: Record<string, any>) => {
+      const list: string[] = Array.isArray(urls) ? urls.map(String) : [];
+      const out: { now: ReturnType<typeof now>[]; matches?: boolean[]; conflicts?: number[]; error?: string } =
+        { now: list.map((u) => now(u, POLICIES.includes(p) ? p : policy())) };
+      if (!rule?.value) return out;
+      let draft: { kind: BlockKind; value: string };
+      try { draft = normalizeBlock(rule.kind, rule.value, opts); } catch (e) { return { ...out, error: (e as Error).message }; }
+      const parse = (u: string) => { try { return new URL(u); } catch { return undefined; } };
+      out.matches = list.map((u) => { const x = parse(u); return !!x && ruleMatches(draft, x); });
+      const own = draft.kind === 'url' ? [draft.value] : draft.kind === 'domain' ? [`https://${draft.value}/`] : [];
+      const pr = [...list.filter((_, i) => out.matches![i]), ...own, ...(Array.isArray(probes) ? probes.map(String) : [])].map(parse).filter((x): x is URL => !!x);
+      out.conflicts = rules().filter((r) => OVERRIDES[action]?.includes(r.action) && pr.some((x) => ruleMatches(r, x))).map((r) => r.id);
+      return out;
+    } },
+    rules: { hidden: true, title: 'Access rules', run: async () => ({ policy: policy(), rules: rules(), rev: rev() }) },
     /** Add a rule. `remove` = ids of rules to delete first (e.g. blocks/asks that would override a new allow).
      *  With the default policy at allow, an allow rule only removes conflicts; it isn't stored (it would do nothing). */
-    rule: { title: 'Add rule', run: async ({ action, kind, value, note, remove }: Record<string, any>) => {
+    rule: { hidden: true, title: 'Add rule', run: async ({ action, kind, value, note, remove }: Record<string, any>) => {
       if (!ACTIONS.includes(action)) throw new Error('action must be block, ask or allow');
       const r = normalizeBlock(kind, value, opts);
       const d = db();
@@ -107,9 +134,9 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
       })();
       changed(); return { ...r, action, stored: store };
     } },
-    delete_rule: { title: 'Delete rule', run: async ({ id }: Record<string, any>) => { db().prepare(`DELETE FROM ${T} WHERE id=?`).run(Number(id)); changed(); } },
+    delete_rule: { hidden: true, title: 'Delete rule', run: async ({ id }: Record<string, any>) => { db().prepare(`DELETE FROM ${T} WHERE id=?`).run(Number(id)); changed(); } },
     /** Switch the default policy; `allow` = domains to add as allow rules in the same step (so switching to ask/deny doesn't break current traffic). */
-    set_policy: { title: 'Set default policy', run: async ({ policy: p, allow }: Record<string, any>) => {
+    set_policy: { hidden: true, title: 'Set default policy', run: async ({ policy: p, allow }: Record<string, any>) => {
       if (!POLICIES.includes(p)) throw new Error('policy must be allow, ask or deny');
       const d = db();
       const doms = (Array.isArray(allow) ? allow : []).map((x: string) => normalizeBlock('domain', x).value);
@@ -120,28 +147,6 @@ export function ruleStore(prefix: 'web' | 'browserpaw', opts: { re2?: boolean } 
       changed(); return { policy: p };
     } },
   };
-  return { rules, policy, rev, actions, onChange: (f: () => void) => { listeners.add(f); return () => listeners.delete(f); } };
+  return { rules, policy, rev, now, actions, onChange: (f: () => void) => { listeners.add(f); return () => listeners.delete(f); } };
 }
-
-/**
- * Browser-side verdict: scheme table + rules. Mirror of browserVerdict() in the BrowserPaw fork
- * (app/chrome-extension/entrypoints/background/url-policy.ts); keep the two in step.
- * `top` = top-level navigation; `selfId` = the BrowserPaw extension id (its own pages are allowed).
- */
-export function browserVerdict(raw: string, list: Pick<Rule, 'action' | 'kind' | 'value'>[], def: Policy, top: boolean, selfId?: string, depth = 0): Verdict {
-  let u: URL;
-  try { u = new URL(raw); } catch { return { blocked: 'invalid url' }; }
-  const p = u.protocol;
-  if (p === 'http:' || p === 'https:') return verdict(u, list, def);
-  if (p === 'ws:' || p === 'wss:') return verdict(new URL(u.href.replace(/^ws/i, 'http')), list, def);
-  if (p === 'about:') return /^about:(blank|srcdoc)$/i.test(u.href.split(/[?#]/)[0]!) ? { allowedBy: 'scheme: about:blank' } : { blocked: 'scheme: about:' };
-  if (p === 'chrome:') return /^chrome:\/\/(newtab|new-tab-page)\//i.test(u.href) ? { allowedBy: 'scheme: chrome://newtab' } : { blocked: 'scheme: chrome:' };
-  if (p === 'chrome-extension:') return selfId && u.hostname === selfId ? { allowedBy: 'scheme: this extension' } : { blocked: 'scheme: chrome-extension:' };
-  if (p === 'data:') return top ? { blocked: 'scheme: data: (top-level)' } : { allowedBy: 'scheme: data:' };
-  if ((p === 'view-source:' || p === 'blob:' || p === 'filesystem:') && depth < 3) {
-    const inner = browserVerdict(raw.slice(p.length), list, def, top, selfId, depth + 1);
-    if (p === 'view-source:' || inner.blocked) return inner;
-    return /^https?:/i.test(raw.slice(p.length)) ? inner : { blocked: `scheme: ${p}` };
-  }
-  return { blocked: `scheme: ${p}` }; // file:, ftp:, ssh:, javascript:, devtools:, external app handlers, …
-}
+export type RuleStore = ReturnType<typeof ruleStore>;

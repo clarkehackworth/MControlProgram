@@ -5,6 +5,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 test('ssh command rules: parse, decide, enforce live on a native host, and log', async () => {
   const { programs, verdict, normalize, parse } = await import('../src/plugins/ssh/rules.js');
@@ -53,6 +54,8 @@ test('ssh command rules: parse, decide, enforce live on a native host, and log',
   assert.equal(verdict('git statusx', 'dev', L, 'deny').blocked, 'default: deny', 'prefix matches whole words');
 
   const act = (k: string, p: any = {}) => (ssh.globalActions as any)[k].run(p, {} as any);
+  // new installs default to ask; these tests exercise behaviour, not the default
+  await act('set_policy', { policy: 'allow' });
   const inst = ssh.create({ instanceId: 'i', instanceName: 'ssh', serverId: 's', global: () => ({ stateIdleSec: 60, connectionIdleSec: 60, logRetentionDays: 30 }), log: new ScopedLogger({}, () => 'off'),
     config: { ...ssh.defaultConfig, hosts: ['here'] }, pluginConfig: { hosts: [{ name: 'here', auth: 'native' }], connectTimeoutMs: 1000, keepaliveSec: 30 } } as any) as any;
   const run = (command: string) => inst.tools.find((t: any) => t.name === 'exec').handler({ host: 'here', command }, { principal: 'tok', signal: new AbortController().signal, log: new ScopedLogger({}, () => 'off') });

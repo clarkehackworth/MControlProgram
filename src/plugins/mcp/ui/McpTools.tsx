@@ -1,7 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { api, useApi, type Server } from '../api'
-import { Alert, Badge, Json, useAction } from '../components/ui'
-import { PendingAsks } from '../components/Asks'
+import { Alert, Badge, Json, PendingAsks, api, useAction, useApi, type Server } from '@mcontrolprogram/ui'
 
 type Action = 'allow' | 'ask' | 'deny'
 interface Tool { upstream: string; tool: string; description: string; read_only: boolean; rule: Action | null }

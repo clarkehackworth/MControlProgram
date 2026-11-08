@@ -18,10 +18,8 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import * as policy from './policy.js';
 import type { BridgeCall } from './policy.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
-import { text, errorResult } from '../../core/plugin-api.js';
-import { effective } from '../../core/global-config.js';
-import { setting } from '../../core/db.js';
+import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, PluginActionContext, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
+import { text, errorResult, effective } from '../../core/plugin-api.js';
 import type { SshApi } from '../ssh/index.js';
 import { PWNFOX_COLORS, type PwnfoxColor } from './pwnfox.js';
 import { HOST_NAME, platforms, kv, parseStatus, osFromUname, PROBE_UNIX, PROBE_WINDOWS, type Os, type Browser, type Platform, type Resolved, type Status } from './platform.js';
@@ -261,13 +259,14 @@ async function connectBridge(ssh: SshApi, h: HostCfg, bridge: NonNullable<Status
 }
 
 /** Tool schemas last seen per profile, so tools are listed without waking a browser. */
-const toolsKey = (profile: string) => `browserpaw.tools.${profile}`;
-const cachedTools = (profile: string): CachedTool[] => JSON.parse(setting.get(toolsKey(profile)) ?? '[]');
+let host: PluginHost;
+const toolsKey = (profile: string) => `tools.${profile}`;
+const cachedTools = (profile: string): CachedTool[] => JSON.parse(host.kv.get(toolsKey(profile)) ?? '[]');
 async function refreshToolCache(client: Client, profile: string) {
   const list: CachedTool[] = (await client.listTools()).tools.map((t) => ({ name: t.name, title: t.title, description: t.description, inputSchema: t.inputSchema as Record<string, any>, annotations: t.annotations as CachedTool['annotations'] }));
   const json = JSON.stringify(list);
-  const changed = json !== (setting.get(toolsKey(profile)) ?? '[]');
-  if (changed) setting.set(toolsKey(profile), json);
+  const changed = json !== (host.kv.get(toolsKey(profile)) ?? '[]');
+  if (changed) host.kv.set(toolsKey(profile), json);
   return changed;
 }
 
@@ -328,7 +327,8 @@ const plugin: MControlProgramPlugin = {
   name: 'BrowserPaw',
   version: '0.2.0',
   description: 'Run isolated Chromium profiles with the BrowserPaw extension on SSH hosts and give agents their browser tools. MControlProgram sets up the profiles, launches Chromium and tunnels to the bridge; agents never get SSH access or the bridge token. Hosts without ssh can be "manual": the admin runs the shown setup script and MControlProgram reaches the bridge over http.',
-  dependencies: { ssh: '^0.2.0' },
+  dependencies: { ssh: '^0.2.0', web: '^0.2.0' },
+  init(h) { host = h; policy.init(h); Object.assign(plugin.globalActions!, policy.actions); },
   globalConfigSchema: {
     type: 'object',
     properties: {

@@ -4,6 +4,30 @@ A plugin is an ES module whose **default export** implements `MControlProgramPlu
 (`src/core/plugin-api.ts`). MControlProgram instantiates it once per *plugin instance*
 (a plugin added to a specific MCP server with its own config).
 
+## The boundary
+
+- `src/core/plugin-api.ts` is the **only** core module a plugin imports (types, plus the helpers `text`,
+  `errorResult`, `ask`, `effective`, `safeRegex`). Everything stateful reaches the plugin through `init(host)`
+  and the contexts below. Built-ins follow the same rule as external plugins.
+- The core knows no plugin by id: built-ins are found by scanning `src/plugins/`, and the admin UI gets each
+  plugin's own screens from its `ui.js` (see [Admin UI](#admin-ui)).
+- Plugins don't share code, except through a **declared** dependency's `api` (and, at build time, its
+  types; in the UI, its `ui.js`).
+
+## `init(host)`
+
+```ts
+init(host) { /* keep it: */ h = host; }
+// host.db          shared SQLite database; name your tables `<plugin id>_…`
+// host.kv          get/set settings private to the plugin (stored as `<plugin id>.<key>`)
+// host.secrets     encrypt/decrypt with MControlProgram's data key (secrets kept outside the config)
+// host.config()    current decrypted plugin-wide config, defaults applied (read at use time)
+// host.callbackUrl() URL that runs the plugin's `callback` global action (OAuth redirects)
+// host.global()    MControlProgram-wide defaults;  host.log;  host.dep(id) as below
+```
+
+Called once per load, after dependency checks, dependencies first.
+
 ```ts
 export default {
   id: 'ssh',                 // [a-z][a-z0-9_-]* ; default tool prefix
@@ -52,8 +76,9 @@ a sequence of independent actions keyed by names, so a browser refresh or retry 
 The ssh plugin's wizard is `add_host` → optional `copy_id` → `test_host`; generated private keys
 are stored by the action and only the public key is returned.
 
-The UI renders generic action buttons for any plugin. A plugin that needs a richer flow ships a
-panel in `web/src/plugins/<id>*.tsx` and registers it by plugin id in `web/src/pages/Plugins.tsx`.
+The UI renders generic action buttons for every global action, except ones marked `hidden: true`
+(internal actions, or ones the plugin's own UI calls). A plugin that needs a richer flow ships an
+admin UI (below).
 
 ## `create(ctx)` → `PluginInstance`
 
@@ -108,7 +133,7 @@ the result of an earlier call (no "open → get handle → use handle" sequences
 - Reap your own state: run an idle timer from `start()` (and clear it in `stop()`) so resources
   an agent never closed are still released. Implement `onSessionClosed` for session-scoped state.
 - Use the MControlProgram-wide timeouts by default: `effective(cfg.myIdleSec, ctx.global().stateIdleSec)`
-  from `core/global-config` returns the instance override when > 0, else the global. Document the
+  from `plugin-api` returns the instance override when > 0, else the global. Document the
   override field as "0 = use the MControlProgram-wide value". Use `stateIdleSec` for per-agent state and
   `connectionIdleSec` for sockets/pools that can be reopened transparently.
 
@@ -126,7 +151,7 @@ needed, so the same call works first or hundredth, in any order.
 
 ## Loading
 
-1. Built-ins (`src/plugins/*`).
+1. Built-ins: every directory under `src/plugins/`.
 2. `data/plugins/<dir>/` — directory with `package.json` (`main`) or `index.js`.
 3. Directories in `MCONTROLPROGRAM_PLUGIN_DIRS` (colon separated).
 4. npm package names listed under **Plugins → npm packages** (must be resolvable from MControlProgram's `node_modules`).
@@ -152,13 +177,40 @@ export default {
 ```
 
 - A plugin whose dependencies are missing or out of range is **not loaded**, and neither is anything that depends on it. The reason shows on the Plugins page after a reload.
-- `ctx.dep(id)` throws for a plugin you did not declare, so dependencies stay explicit.
+- `ctx.dep(id)` (also `a.dep`, `host.dep`) throws for a plugin you did not declare, so dependencies stay explicit.
+- `optionalDependencies` (same format) are used when present: `dep(id)` returns `undefined` when that plugin is
+  missing or out of range (the Plugins page notes the version mismatch), and the plugin still loads.
+  `mcp` uses `ssh` this way to reach upstream servers through an SSH host.
+- Import a dependency's *types* only (`import type { SshApi } from '../ssh/index.js'`); values come from `dep()`.
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
-- Built-in providers: `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
+- Built-in providers: `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
+  rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables, with the admin actions the rules
+  UI uses, including `check` for server-side verdicts; plus `verdict`, `ruleMatches`, `normalizeBlock`).
+  browserpaw keeps its browser list this way. `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
 - The "Used by" column (server toggles + Pair server) appears only on inventories that an instance config selects from (`x-options-from`). An inventory that other inventory items point at by name can say so with `'x-referenced-by': { inventory, field, title }`; its table then lists those items instead (and the delete confirmation warns about them).
 - `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
 - A global action with `inventory: '<key>'` only shows as a row button on that inventory table.
+
+## Admin UI
+
+A plugin can ship `ui.js` next to its entry module (built-ins: `src/plugins/<id>/ui/index.tsx`, built to
+`dist/plugins/<id>/ui.js` by `npm run build:web`). The app imports it at runtime from `/api/plugins/<id>/ui.js`.
+Its default export is a `PluginUi` (`web/src/plugin-ui.ts`); every slot is optional:
+
+| Slot | Where it shows |
+|---|---|
+| `Page` | The plugin's page, under its inventories (logs, rules…) |
+| `inventory[key].AddButton` / `EditExtra` / `Delete` | A guided add flow, extras in the edit dialog, a custom delete flow |
+| `asks.RuleDialog`, `asks.direct` + `asks.setRule` | "Add allow/block rule…" for this plugin's asks; or a one-switch rule with no dialog |
+
+Bundle it as an ES module with `react`, `react/jsx-runtime` and `@mcontrolprogram/ui` external, mapped to
+`/sdk/react.js`, `/sdk/jsx-runtime.js` and `/sdk/ui.js`: the app's own module instances, so hooks and styles
+just work. `@mcontrolprogram/ui` (`web/src/sdk/ui.ts`) is the UI half of the plugin API: the API client
+(`api`, `useApi`), the shared components (`Modal`, `Field`, `Alert`, `RuleGroup`, `PendingAsks`, `SchemaForm`…)
+and the `PluginUi` types. A plugin may import a declared dependency's UI as `@plugin/<id>` (mapped to
+`/api/plugins/<id>/ui.js`); browserpaw reuses web's rules panel that way. `web/build-plugin-ui.mjs` builds
+each plugin separately and fails if a bundle imports anything else.
 
 ## Built-in: ssh command log and rules
 

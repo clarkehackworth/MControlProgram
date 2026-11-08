@@ -11,11 +11,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { z } from 'zod';
-import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolResult, ToolCallContext } from '../../core/plugin-api.js';
-import { effective } from '../../core/global-config.js';
-import { text, errorResult, ask } from '../../core/plugin-api.js';
-import { pluginConfig } from '../../core/store.js';
-import { safeRegex } from '../../core/safe-regex.js';
+import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, PluginActionContext, ToolResult, ToolCallContext } from '../../core/plugin-api.js';
+import { text, errorResult, ask, effective, safeRegex } from '../../core/plugin-api.js';
 import { localClient } from './local.js';
 import * as cmdRules from './rules.js';
 
@@ -257,15 +254,16 @@ export interface SshApi {
   /** `ssh -L` to remoteHost:remotePort as seen from `host`; see openTunnel. */
   openTunnel(host: string, remoteHost: string, remotePort: number, log: PluginContext['log']): Promise<{ port: number; close(): void }>;
 }
+let host: PluginHost;
 const pinnedHost = (name: string) => {
-  const g = { ...plugin.defaultGlobalConfig, ...pluginConfig.decrypted('ssh') } as GlobalCfg;
+  const g = host.config() as GlobalCfg;
   const h = g.hosts.find((x) => x.name === name);
   if (!h) throw new Error(`ssh host "${name}" is not in the SSH plugin inventory`);
   if (!h.hostKey && h.auth !== 'native') throw new Error(`ssh host "${name}" has no pinned host key; run "Test connection" on it in the SSH plugin first`);
   return { h, g };
 };
 const api: SshApi = {
-  hostNames: () => ((pluginConfig.decrypted('ssh').hosts ?? []) as HostCfg[]).map((h) => h.name),
+  hostNames: () => ((host.config().hosts ?? []) as HostCfg[]).map((h) => h.name),
   exec: (name, cmd, log) => { const { h, g } = pinnedHost(name); return execOnce(h, g, cmd, log); },
   openTunnel: (name, rh, rp, log) => { const { h, g } = pinnedHost(name); return openTunnel(h, g, rh, rp, log); },
 };
@@ -273,6 +271,7 @@ const api: SshApi = {
 const plugin: MControlProgramPlugin = {
   id: 'ssh', name: 'SSH', version: '0.2.0',
   api,
+  init(h) { host = h; cmdRules.init(h); },
   description: 'Execute commands, run persistent shells, and transfer files over SSH on admin-configured hosts.',
   configSchema,
   defaultConfig: { hosts: [], execTimeoutMs: 120000, maxOutputBytes: 200000, idleDisconnectSec: 0, shellIdleSec: 0, shellScope: 'principal' },
@@ -282,7 +281,7 @@ const plugin: MControlProgramPlugin = {
 
   globalActions: {
     ...cmdRules.actions,
-    add_host: {
+    add_host: { hidden: true,
       title: 'Add host',
       /**
        * Wizard step 1. params: { name, host, port?, username, description?, auth: 'password'|'key'|'agent',
@@ -316,7 +315,7 @@ const plugin: MControlProgramPlugin = {
         return { name, auth: h.auth, ...(publicKey ? manualInstructions(h, publicKey) : {}) };
       },
     },
-    copy_id: {
+    copy_id: { hidden: true,
       title: 'Install key with password (ssh-copy-id)',
       /** Wizard step 2 (optional). params: { name, password }. Logs in with the password once, appends the public key, then verifies key login. */
       async run(p, a: PluginActionContext) {
@@ -335,7 +334,7 @@ const plugin: MControlProgramPlugin = {
         return { installed: true, keyLogin: t.stdout.trim() === 'ok' };
       },
     },
-    remove_key: {
+    remove_key: { hidden: true,
       title: 'Remove key from host',
       /** params: { name, password? }. Deletes this host's public key from the remote ~/.ssh/authorized_keys, logging in with the key (or the password if given). */
       async run(p, a: PluginActionContext) {
@@ -362,7 +361,7 @@ const plugin: MControlProgramPlugin = {
         return { ok: r.stdout.startsWith('ok'), ms: Date.now() - t0, uname: r.stdout.split('\n')[1] ?? '', hostKey: r.hostKey, ...(pinned ? { pinned: 'host key pinned on first use; verify it matches the server' } : {}) };
       },
     },
-    public_key: {
+    public_key: { hidden: true,
       title: 'Show public key',
       async run(p, a: PluginActionContext) {
         const g = a.config as GlobalCfg;
@@ -371,7 +370,7 @@ const plugin: MControlProgramPlugin = {
         return manualInstructions(h, publicKeyOf(h.privateKey, h.passphrase, `mcontrolprogram-${h.name}`));
       },
     },
-    remove_host: {
+    remove_host: { hidden: true,
       title: 'Remove host',
       async run(p, a: PluginActionContext) {
         const g = a.config as GlobalCfg;

@@ -45,7 +45,12 @@ test('loader drops plugins with unmet dependencies (transitively), resolves api'
   assert.ok(r.errors.some((e) => /dep-chain: .*dep-bad/.test(e)));
   const dep = depResolver(plugins.get('browserpaw')!);
   assert.equal(typeof dep('ssh').openTunnel, 'function');
-  assert.throws(() => dep('web'), /did not declare/);
+  assert.equal(typeof dep('web').ruleStore, 'function', 'declared dependency');
+  assert.throws(() => dep('mcp'), /did not declare/);
+  const mcpDep = depResolver(plugins.get('mcp')!);
+  assert.equal(typeof mcpDep('ssh').openTunnel, 'function', 'optional dependency present');
+  assert.equal(depResolver({ ...plugins.get('mcp')!, optionalDependencies: { ssh: '^9.0.0' } })('ssh'), undefined, 'optional dependency out of range');
+  assert.equal(depResolver({ ...plugins.get('mcp')!, optionalDependencies: { gone: '*' } })('gone'), undefined, 'optional dependency missing');
 });
 
 test('extension id matches Chrome (unpacked, from path)', () => {

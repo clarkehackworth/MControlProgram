@@ -2,10 +2,20 @@
  * MControlProgram plugin API. A plugin is an ES module whose default export is a `MControlProgramPlugin`.
  * Plugins are instantiated once per plugin-instance on an MCP server. They own their connections
  * (ssh sessions, http clients, ...) and expose tools to agents through the MCP server.
+ *
+ * This is the only core module a plugin may import. Everything stateful (database, settings, secrets,
+ * config, other plugins) reaches the plugin through `init(host)` and the contexts below.
  */
 import type { ZodRawShape } from 'zod';
+import type BetterSqlite3 from 'better-sqlite3';
 import type { ScopedLogger } from './logger.js';
 import type { GlobalConfig } from './global-config.js';
+
+export type { ScopedLogger, GlobalConfig };
+export { safeRegex } from './safe-regex.js';
+
+/** Instance override when > 0, else the MControlProgram-wide value (for "0 = use the default" config fields). */
+export const effective = (override: number | undefined, globalValue: number) => (override && override > 0 ? override : globalValue);
 
 /** JSON Schema subset used for plugin config. Mark secrets with `"x-secret": true`. */
 export type ConfigSchema = Record<string, any>;
@@ -80,7 +90,31 @@ export interface PluginActionContext {
   /** Persist new plugin-wide config (secrets are encrypted; all instances of the plugin reload). */
   setConfig(next: Record<string, any>): Promise<void>;
   log: ScopedLogger;
-  /** The `api` of a plugin listed in this plugin's `dependencies`. Throws for undeclared or missing ones. */
+  /** See `PluginHost.dep`. */
+  dep<T = any>(id: string): T;
+}
+
+/** Services MControlProgram gives a plugin once per load, via `init(host)`. */
+export interface PluginHost {
+  /** The plugin's id. */
+  id: string;
+  /** Shared SQLite database. Name every table you create `<plugin id>_…`. */
+  db: BetterSqlite3.Database;
+  /** Key/value settings private to this plugin (stored as `<plugin id>.<key>`). */
+  kv: { get(key: string): string | undefined; set(key: string, value: string): void };
+  /** Encrypt/decrypt with MControlProgram's data key, for secrets kept outside the config. */
+  secrets: { encrypt(plain: string): string; decrypt(blob: string): string };
+  /** Current decrypted plugin-wide config, defaults applied. Read at use time: it changes when the admin saves. */
+  config(): Record<string, any>;
+  /** Absolute URL that runs this plugin's `callback` global action with the query params (OAuth redirects). */
+  callbackUrl(): string;
+  /** Live view of MControlProgram-wide defaults. */
+  global(): GlobalConfig;
+  log: ScopedLogger;
+  /**
+   * The `api` of a plugin listed in `dependencies` (throws if it is missing) or `optionalDependencies`
+   * (undefined if it is missing or the wrong version). Dependencies are initialised before this plugin.
+   */
   dep<T = any>(id: string): T;
 }
 
@@ -95,7 +129,7 @@ export interface PluginContext {
   /** Live view of MControlProgram-wide defaults (idle timeouts, …). Read it at use time, not once at create. */
   global: () => GlobalConfig;
   log: ScopedLogger;
-  /** The `api` of a plugin listed in this plugin's `dependencies`. Throws for undeclared or missing ones. */
+  /** See `PluginHost.dep`. */
   dep<T = any>(id: string): T;
 }
 
@@ -135,15 +169,19 @@ export interface MControlProgramPlugin {
    * Plugin-level admin actions (run from the Plugins page), e.g. "add host", "generate key".
    * `inventory` limits the row button to one inventory table (a key of the global config); default all.
    */
-  globalActions?: Record<string, { title: string; inventory?: string; /** only show the button on items whose fields match */ when?: Record<string, unknown>; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
+  globalActions?: Record<string, { title: string; /** no generic button: internal, or the plugin's own UI calls it */ hidden?: boolean; inventory?: string; /** only show the button on items whose fields match */ when?: Record<string, unknown>; run: (params: Record<string, any>, ctx: PluginActionContext) => Promise<unknown> }>;
   /**
    * Other plugins this one needs: plugin id → semver range (`^1.2.0`, `>=0.2.0`, `*`).
    * A plugin whose dependencies are missing or the wrong version is not loaded. Reach a dependency's
    * `api` through `ctx.dep(id)`.
    */
   dependencies?: Record<string, string>;
+  /** Plugins this one uses when present (same format). Missing or wrong-version ones: `dep(id)` returns undefined. */
+  optionalDependencies?: Record<string, string>;
   /** What this plugin offers to plugins that depend on it (see `dependencies`). */
   api?: unknown;
+  /** Called once per load, after dependencies are checked and before anything else runs. Keep the host for later. */
+  init?(host: PluginHost): void;
   /** An inventory item (global config array `key`) was renamed; references in configs are already rewritten. Update anything else keyed by the name. */
   onRenamed?(key: string, from: string, to: string): void;
   /** Default tool prefix (defaults to id). */

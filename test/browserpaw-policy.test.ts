@@ -5,9 +5,12 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 process.env.MCONTROLPROGRAM_DATA_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-test-'));
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 test('browser URL policy: scheme table matches the extension mirror', async () => {
-  const { browserVerdict } = await import('../src/core/url-policy.js');
+  const { browserVerdict: bv } = await import('../src/plugins/browserpaw/policy.js');
+  const { api: web } = await import('../src/plugins/web/index.js');
+  const browserVerdict = (...a: [string, any[], any, boolean, string?]) => bv(web, ...a);
   const rules = [{ action: 'block' as const, kind: 'domain' as const, value: 'evil.com' }, { action: 'allow' as const, kind: 'domain' as const, value: 'ok.com' }];
   const v = (u: string, top = true) => browserVerdict(u, rules, 'deny', top, 'selfid');
   assert.equal(v('https://x.ok.com/').allowedBy, 'domain: ok.com');
@@ -24,12 +27,21 @@ test('browser URL policy: scheme table matches the extension mirror', async () =
 
 test('browser URL policy: separate list, RE2 check, push/fail closed, pre-check, attribution, event pull', async () => {
   const policy = await import('../src/plugins/browserpaw/policy.js');
-  const web = await import('../src/core/url-policy.js');
+  const { plugins } = await import('../src/core/plugin-loader.js');
+  const web = plugins.get('web')!.api as import('../src/plugins/web/index.js').WebApi;
+  const { getDb } = await import('../src/core/db.js');
   const act = (k: string, p: any = {}) => (policy.actions as any)[k].run(p);
 
   await act('rule', { action: 'block', kind: 'domain', value: 'evil.com' });
-  assert.equal(web.ruleStore('web').rules().length, 0, 'browser list is separate from the web plugin list');
+  assert.equal(web.ruleStore(getDb, 'web').rules().length, 0, 'browser list is separate from the web plugin list');
   await assert.rejects(act('rule', { action: 'block', kind: 'regex', value: 'a(?=b)' }), /RE2/);
+
+  // server-side verdicts for the rules UI (it no longer mirrors the matcher)
+  const chk = await act('check', { urls: ['https://x.evil.com/a', 'https://ok.org/'], policy: 'deny', rule: { kind: 'domain', value: 'evil.com' }, action: 'allow' });
+  assert.deepEqual(chk.now.map((n: any) => n.by), ['domain: evil.com', 'default: deny']);
+  assert.deepEqual(chk.matches, [true, false]);
+  assert.equal(chk.conflicts.length, 1, 'the evil.com block overrides a draft allow');
+  assert.match((await act('check', { urls: [], rule: { kind: 'regex', value: '(a+)+' } })).error, /catastrophic/);
 
   // fake bridge
   let ext = { rev: null as number | null, rules: [] as any[], events: [] as any[], epoch: 'e1', up: true };

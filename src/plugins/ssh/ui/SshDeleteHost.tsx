@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Alert, Modal } from '../components/ui'
+import { Alert, Modal } from '@mcontrolprogram/ui'
 
 /** Delete-host flow for key-auth SSH hosts: optionally remove the public key from the remote authorized_keys first. */
 export default function SshDeleteHost({ name, onClose, onDone }: { name: string; onClose: () => void; onDone: (removeKey: boolean, password: string) => Promise<void> }) {

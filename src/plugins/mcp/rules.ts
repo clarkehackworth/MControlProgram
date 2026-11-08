@@ -2,7 +2,10 @@
  * MCP pass-through tool rules (allow / ask / deny per upstream server + tool, plus a default policy), the
  * tools last seen on each upstream, and the call log. Own tables like ssh/web: changes apply live, no restarts.
  */
-import { getDb } from '../../core/db.js';
+import type { PluginHost } from '../../core/plugin-api.js';
+
+let getDb: () => PluginHost['db'];
+export const init = (h: PluginHost) => { getDb = () => h.db; ready = false; };
 
 export type Action = 'allow' | 'ask' | 'deny';
 /** Default policy: an action, or `readonly` = allow tools with readOnlyHint, ask for the rest. */
@@ -67,24 +70,24 @@ export function record(e: LogEntry) {
 
 /** Global actions driving the MCP plugin page. */
 export const actions = {
-  tool_rules: { title: 'Tool rules', run: async () => ({
+  tool_rules: { hidden: true, title: 'Tool rules', run: async () => ({
     policy: policy(),
     tools: (db().prepare('SELECT * FROM mcp_tools ORDER BY upstream, tool').all() as any[]).map((t) => ({ ...t, read_only: !!t.read_only, rule: rules().get(key(t.upstream, t.tool)) ?? null })),
   }) },
   /** `action` null/'' = follow the default policy. */
-  set_tool_rule: { title: 'Set tool rule', run: async ({ upstream, tool, action }: any) => {
+  set_tool_rule: { hidden: true, title: 'Set tool rule', run: async ({ upstream, tool, action }: any) => {
     if (!upstream || !tool) throw new Error('upstream and tool are required');
     if (action && !ACTIONS.includes(action)) throw new Error('action must be allow, ask or deny');
     if (action) db().prepare('INSERT INTO mcp_rules(upstream,tool,action) VALUES(?,?,?) ON CONFLICT(upstream,tool) DO UPDATE SET action=excluded.action').run(String(upstream), String(tool), action);
     else db().prepare('DELETE FROM mcp_rules WHERE upstream=? AND tool=?').run(String(upstream), String(tool));
     changed();
   } },
-  set_policy: { title: 'Set default policy', run: async ({ policy: p }: any) => {
+  set_policy: { hidden: true, title: 'Set default policy', run: async ({ policy: p }: any) => {
     if (!POLICIES.includes(p)) throw new Error('policy must be allow, readonly, ask or deny');
     db().prepare("INSERT INTO mcp_policy(k,v) VALUES('default',?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").run(p);
     changed(); return { policy: p };
   } },
-  calls: { title: 'Call log', run: async (q: any) => {
+  calls: { hidden: true, title: 'Call log', run: async (q: any) => {
     const where = ['ts >= ?', 'ts <= ?']; const args: any[] = [Number(q.since) || 0, Number(q.until) || Date.now()];
     if (q.q) { where.push('(tool LIKE ? OR args LIKE ? OR principal LIKE ?)'); args.push(`%${q.q}%`, `%${q.q}%`, `%${q.q}%`); }
     if (q.upstream) { where.push('upstream = ?'); args.push(q.upstream); }
@@ -98,5 +101,5 @@ export const actions = {
     for (const r of rows) r.now = verdict(r.upstream, r.tool, ro.has(key(r.upstream, r.tool))).action;
     return { rows: rows.slice(0, limit), more: rows.length > limit };
   } },
-  clear_calls: { title: 'Clear call log', run: async () => { db().prepare('DELETE FROM mcp_calls').run(); } },
+  clear_calls: { hidden: true, title: 'Clear call log', run: async () => { db().prepare('DELETE FROM mcp_calls').run(); } },
 };
