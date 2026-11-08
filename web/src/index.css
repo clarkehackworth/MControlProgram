@@ -28,8 +28,12 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px }
 .stack { display: flex; flex-direction: column; gap: 10px }
 .muted { color: var(--muted) } .small { font-size: 12px } .mono { font-family: ui-monospace, Menlo, monospace }
 .err { color: var(--err) } .ok { color: var(--ok) }
-.spinner { display: inline-block; width: 12px; height: 12px; margin-right: 6px; vertical-align: -2px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite }
-@keyframes spin { to { transform: rotate(360deg) } }
+.skel { display: block; height: 10px; border-radius: 5px; background: linear-gradient(90deg, var(--bg3) 0%, var(--bg3) 35%, color-mix(in srgb, var(--accent) 35%, var(--bg3)) 50%, var(--bg3) 65%, var(--bg3) 100%) 0 0 / 300% 100%; animation: skel 1.4s ease-in-out infinite }
+.skel-row { animation: skel-in .4s ease-out both } .skel-row:nth-child(2) { animation-delay: .08s } .skel-row:nth-child(3) { animation-delay: .16s; opacity: .6 }
+@keyframes skel { from { background-position: 100% 0 } to { background-position: 0 0 } }
+@keyframes skel-in { from { opacity: 0; transform: translateY(4px) } }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap }
+@media (prefers-reduced-motion: reduce) { .skel, .skel-row { animation: none } }
 
 table { width: 100%; border-collapse: collapse }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top }

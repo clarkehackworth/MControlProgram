@@ -42,7 +42,12 @@ export function useAction() {
 
 /** Table body row shown while a table's data hasn't arrived yet. */
 export function LoadingRow({ cols }: { cols: number }) {
-  return <tr><td colSpan={cols} className="muted"><span className="spinner" /> Loading…</td></tr>
+  // shimmering placeholder rows; the delay staggers a diagonal wave across cells
+  return <>{[0, 1, 2].map((r) => <tr key={r} className="skel-row" aria-busy={r === 0 || undefined}>
+    {Array.from({ length: cols }, (_, c) => <td key={c}>
+      <span className="skel" style={{ width: `${45 + ((r * 7 + c * 13) % 5) * 11}%`, animationDelay: `${(r + c) * 0.08}s` }}>{r === 0 && c === 0 && <span className="sr-only">Loading…</span>}</span>
+    </td>)}
+  </tr>)}</>
 }
 
 export function Json({ value }: { value: unknown }) {
