@@ -295,3 +295,11 @@ tool error. Built-in plugins use the `ask(call, spec)` helper from `src/core/plu
 the fail-closed check. Ask
 last, after your other checks, so nobody approves something that would be refused anyway. Pending asks
 appear on the Approvals page and, filtered with `GET /api/approvals?plugin=<id>`, on your plugin page.
+
+## Built-in: sandbox (Docker Sandboxes)
+
+Drives the [`sbx`](https://docs.docker.com/reference/cli/sbx/) CLI on SSH hosts (depends on `ssh@^0.2.0`; tested against sbx v0.49.2). **Sandbox hosts** name an SSH host where `sbx` is installed and logged in; **Check host** runs `sbx version`. Each instance exposes a selection of hosts.
+
+Tools: `hosts`, `list`, `create` (agent kit, workspace mounts, ports, cpus/memory, initial deny rules), `stop`, `remove`, `exec` (`sh -c`, no TTY), `read_file`, `write_file` (≤ 90 KB, sent base64 over the ssh command line), `copy` (`sbx cp` between the host and a sandbox), `ports`, `policy`, `network_log`, `network_check`, `network_allow`, `network_deny`, `network_remove`. `create` needs the first workspace read/write (sbx refuses a read-only primary). Everything inside a sandbox is fair game; on the **host**, `create` mounts and `copy` paths must sit inside the host's **Workspace roots** (empty = no host file access). That check is lexical, so keep untrusted symlinks out of the roots. The plugin has no rules of its own: gate the mutating tools (`network_allow`, `remove`, `create`, `exec`…) with the server's Tool rules.
+
+The plugin page shows, per host: the sandboxes (status, ports, workspaces; create, start, stop, remove), a panel for the selected sandbox (run a command, copy files, publish/unpublish ports), the network policy (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.
