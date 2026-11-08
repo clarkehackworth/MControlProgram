@@ -3,7 +3,7 @@ import { Alert, Badge, Field, Modal, api, useAction, type PluginUi } from '@mcon
 
 interface Port { host_ip?: string; host_port: number; sandbox_port: number; protocol?: string }
 interface Sandbox { name: string; agent: string; status: string; ports?: Port[]; workspaces?: string[]; created_at?: string; last_used_at?: string }
-interface Rule { id: string; decision: string; resources: string[]; scope: string; layer?: string; editable?: boolean; status?: string }
+interface Rule { id: string; decision: string; resources: string[]; scope: string; resource_type?: string; layer?: string; editable?: boolean; status?: string }
 interface Conn { sandbox_id: string; host: string; count: number; last_seen: string; rule?: string; reason?: string; allowed: boolean }
 interface HostCfg { name: string; workspaceRoots?: string[] }
 
@@ -156,7 +156,55 @@ function SandboxDetail({ host, s, reload }: { host: string; s: Sandbox; reload: 
   )
 }
 
+/** Policy card: network rules (editable) and filesystem rules (read-only: sbx has no CLI to change them). */
 function Policy({ host, sandbox }: { host: string; sandbox?: string }) {
+  const [tab, setTab] = useState<'network' | 'filesystem'>('network')
+  return (
+    <div className="card">
+      <div className="row between">
+        <h2 style={{ margin: 0 }}>Policy <span className="muted small">{sandbox ? `rules that apply to ${sandbox}` : 'all rules'}</span></h2>
+      </div>
+      <div className="tabs" style={{ margin: '8px 0 12px' }}>
+        {(['network', 'filesystem'] as const).map((t) => <button key={t} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>{t === 'network' ? 'Network' : 'Filesystem'}</button>)}
+      </div>
+      {tab === 'network' ? <NetworkRules host={host} sandbox={sandbox} /> : <FsRules host={host} sandbox={sandbox} />}
+    </div>
+  )
+}
+
+function FsRules({ host, sandbox }: { host: string; sandbox?: string }) {
+  const [rules, setRules] = useState<Rule[]>()
+  const { run, error, busy } = useAction()
+  const load = useCallback(() => run(async () => {
+    setRules((await tool<{ rules: Rule[] }>(host, 'policy', { type: 'filesystem', ...(sandbox ? { sandbox } : {}) })).rules ?? [])
+  }), [host, sandbox]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load() }, [load])
+  return (
+    <>
+      <div className="row between" style={{ marginBottom: 12 }}>
+        <span className="muted small">Which host paths sandboxes may mount, read-only or read/write. Set by sbx defaults or your organisation's policy; the sbx CLI can't change them.</span>
+        <button className="sm" onClick={load} disabled={busy}>Refresh</button>
+      </div>
+      {error && <Alert kind="err">{error}</Alert>}
+      <table>
+        <thead><tr><th>Decision</th><th>Access</th><th>Paths</th><th>Scope</th><th>Layer</th></tr></thead>
+        <tbody>
+          {rules?.map((r) => <tr key={r.id}>
+            <td><Badge kind={r.decision === 'allow' ? 'ok' : 'err'}>{r.decision}</Badge></td>
+            <td className="small">{r.resource_type?.replace(/^filesystem:/, '') ?? ''}</td>
+            <td className="mono small" style={{ overflowWrap: 'anywhere' }}>{r.resources.join(', ')}</td>
+            <td className="small">{r.scope.replace(/^sandbox:/, '')}</td>
+            <td className="small muted">{r.layer}{r.editable === false ? ' · built-in' : ''}{r.status && r.status !== 'active' ? ` (${r.status})` : ''}</td>
+          </tr>)}
+          {rules?.length === 0 && <tr><td colSpan={5} className="muted">No filesystem rules.</td></tr>}
+          {!rules && <tr><td colSpan={5} className="muted">{busy ? 'Loading…' : '—'}</td></tr>}
+        </tbody>
+      </table>
+    </>
+  )
+}
+
+function NetworkRules({ host, sandbox }: { host: string; sandbox?: string }) {
   const [rules, setRules] = useState<Rule[]>()
   const [add, setAdd] = useState({ resources: '', decision: 'allow', scope: 'global' })
   const [check, setCheck] = useState({ target: '', result: undefined as any })
@@ -171,19 +219,16 @@ function Policy({ host, sandbox }: { host: string; sandbox?: string }) {
   const doCheck = () => run(async () => setCheck({ ...check, result: await tool(host, 'network_check', { target: check.target, ...(sandbox ? { sandbox } : {}) }) }))
 
   return (
-    <div className="card">
-      <div className="row between">
-        <h2 style={{ margin: 0 }}>Network policy <span className="muted small">{sandbox ? `rules that apply to ${sandbox}` : 'all rules'}</span></h2>
-        <button className="sm" onClick={load} disabled={busy}>Refresh</button>
-      </div>
+    <>
       {error && <Alert kind="err">{error}</Alert>}
-      <div className="row" style={{ margin: '12px 0' }}>
+      <div className="row" style={{ marginBottom: 12 }}>
         <select value={add.decision} onChange={(e) => setAdd({ ...add, decision: e.target.value })} style={{ width: 100 }}><option value="allow">Allow</option><option value="deny">Deny</option></select>
         <input type="text" className="mono" value={add.resources} onChange={(e) => setAdd({ ...add, resources: e.target.value })} placeholder="api.example.com, *.github.com" style={{ flex: 1 }} />
         <select value={scoped ? 'sandbox' : 'global'} onChange={(e) => setAdd({ ...add, scope: e.target.value })} style={{ width: 180 }}>
           <option value="global">All sandboxes</option>{sandbox && <option value="sandbox">Only {sandbox}</option>}
         </select>
         <button className="sm primary" disabled={busy || !add.resources} onClick={() => void addRule()}>Add rule</button>
+        <button className="sm" onClick={load} disabled={busy}>Refresh</button>
       </div>
       <table>
         <thead><tr><th>Decision</th><th>Hosts</th><th>Scope</th><th>Layer</th><th /></tr></thead>
@@ -203,7 +248,7 @@ function Policy({ host, sandbox }: { host: string; sandbox?: string }) {
         <button className="sm" disabled={busy || !check.target} onClick={() => void doCheck()}>Check</button>
         {check.result && <span>{check.result.allowed ? <Badge kind="ok">allowed</Badge> : <Badge kind="err">blocked</Badge>} <span className="muted small">{check.result.reason}</span></span>}
       </div>
-    </div>
+    </>
   )
 }
 
