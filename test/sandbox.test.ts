@@ -46,3 +46,17 @@ test('tools build the right sbx commands', async () => {
   await assert.rejects(async () => t('copy').handler({ from: '/etc/passwd', to: 'sb1:/x' }, call), /outside/);
   await assert.rejects(async () => t('copy').handler({ from: 'sb1:/a', to: 'sb2:/b' }, call), /exactly one/);
 });
+
+test('native hosts run sbx locally, without ssh', async () => {
+  const log = { connection() {}, info() {}, debug() {}, warn() {}, error() {} } as any;
+  const inst = plugin.create!({
+    config: { hosts: ['me'] }, pluginConfig: { hosts: [{ name: 'me', native: true, sbx: 'echo' }] }, log,
+    dep: () => ({ exec: async () => { throw new Error('ssh used for a native host'); } }),
+  } as any) as any;
+  const call = { log, signal: new AbortController().signal };
+  const r = await inst.tools.find((x: any) => x.name === 'exec').handler({ sandbox: 'sb1', command: "it's $HOME" }, call);
+  assert.equal(r.isError, false);
+  assert.equal(r.content[0].text, "exec sb1 sh -c it's $HOME\n");
+  const w = await inst.tools.find((x: any) => x.name === 'write_file').handler({ sandbox: 'sb1', path: '/a', content: 'x' }, call);
+  assert.match(w.content[0].text, /^exec -i sb1 sh -c/);
+});

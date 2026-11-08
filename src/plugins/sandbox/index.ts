@@ -3,12 +3,13 @@
  * them, publish ports, and read or change their network policy. Everything is one `sbx …` command over ssh.
  */
 import path from 'node:path';
+import { execFile } from 'node:child_process';
 import { z } from 'zod';
 import type { MControlProgramPlugin, PluginContext, PluginInstance, PluginActionContext, ToolDefinition, ToolCallContext } from '../../core/plugin-api.js';
 import { text } from '../../core/plugin-api.js';
 import type { SshApi } from '../ssh/index.js';
 
-interface HostCfg { name: string; sshHost: string; description?: string; workspaceRoots?: string[]; sbx?: string }
+interface HostCfg { name: string; sshHost?: string; native?: boolean; description?: string; workspaceRoots?: string[]; sbx?: string }
 interface GlobalCfg { hosts: HostCfg[]; maxOutputBytes: number }
 interface Cfg { hosts: string[]; hostsDisabled?: string[] }
 
@@ -43,14 +44,26 @@ export function hostPath(h: Pick<HostCfg, 'name' | 'workspaceRoots'>, p: unknown
   return n;
 }
 
+/** Native hosts: the same sbx command lines, run by the local shell. */
+type Exec = (h: HostCfg, cmd: string, log: PluginContext['log']) => Promise<{ stdout: string; stderr: string; code: number | null }>;
+const localExec = (cmd: string) => new Promise<{ stdout: string; stderr: string; code: number | null }>((resolve) =>
+  execFile('sh', ['-c', cmd], { timeout: 600_000, maxBuffer: 64 << 20 }, (e: any, stdout, stderr) => resolve({ stdout, stderr, code: e ? (typeof e.code === 'number' ? e.code : 1) : 0 })));
+const runner = (ssh: SshApi): Exec => (h, cmd, log) => {
+  if (h.native) return localExec(cmd);
+  if (!h.sshHost) throw new Error(`host "${h.name}" has no SSH host and is not native`);
+  return ssh.exec(h.sshHost, cmd, log);
+};
+
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max) + `\n…[truncated ${s.length - max} bytes]` : s);
 
 const hostSchema = {
   type: 'object',
-  required: ['name', 'sshHost'],
+  required: ['name'],
+  'x-kind-column': { title: 'Type', flags: { native: 'Native' }, default: 'SSH' },
   properties: {
     name: { type: 'string', title: 'Name', pattern: '^[a-zA-Z0-9_.-]+$', 'x-pattern-hint': 'letters, digits, _ . -' },
-    sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (pinned host key) where the sbx CLI is installed and logged in.', 'x-options-from': 'ssh:hosts' },
+    native: { type: 'boolean', title: 'Native (this machine)', default: false, description: 'Run sbx on the machine MControlProgram runs on, without ssh. In a container, sbx and its daemon state must be mounted in (see docs: Docker Sandboxes, native hosts); workspace roots are then paths as the container sees them.' },
+    sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (pinned host key) where the sbx CLI is installed and logged in. Not used for native hosts.', 'x-options-from': 'ssh:hosts' },
     description: { type: 'string', title: 'Description', description: 'Shown to agents' },
     workspaceRoots: { type: 'array', title: 'Workspace roots', 'x-no-column': true, description: 'Absolute directories on the host that agents may mount into new sandboxes and copy files to/from. Empty = no host file access (sandbox-internal files still work).', items: { type: 'string' }, default: [] },
     sbx: { type: 'string', title: 'sbx binary', 'x-no-column': true, description: 'Empty = sbx (on PATH)' },
@@ -60,8 +73,8 @@ const hostSchema = {
 const plugin: MControlProgramPlugin = {
   id: 'sandbox',
   name: 'Docker Sandboxes',
-  version: '0.1.0',
-  description: 'Manage Docker Sandboxes (sbx) on SSH hosts: list, create and remove sandboxes, run commands, read/write and copy files, publish ports, and inspect or change their network policy.',
+  version: '0.2.0',
+  description: 'Manage Docker Sandboxes (sbx) on SSH hosts or this machine: list, create and remove sandboxes, run commands, read/write and copy files, publish ports, and inspect or change their network policy.',
   dependencies: { ssh: '^0.2.0' },
   globalConfigSchema: {
     type: 'object',
@@ -77,7 +90,7 @@ const plugin: MControlProgramPlugin = {
       title: 'Run tool', hidden: true,
       async run({ tool, args }, a: PluginActionContext) {
         const g = { ...plugin.defaultGlobalConfig, ...a.config } as GlobalCfg;
-        const t = makeTools(a.dep<SshApi>('ssh'), g, g.hosts ?? []).find((x) => x.name === tool);
+        const t = makeTools(runner(a.dep<SshApi>('ssh')), g, g.hosts ?? []).find((x) => x.name === tool);
         if (!t) throw new Error(`unknown tool ${tool}`);
         const r = await t.handler(z.object(t.inputSchema ?? {}).parse(args ?? {}), { log: a.log, signal: AbortSignal.timeout(600_000) } as ToolCallContext);
         const out = r.content.map((c: any) => c.text ?? '').join('');
@@ -90,7 +103,7 @@ const plugin: MControlProgramPlugin = {
       async run({ name }, a: PluginActionContext) {
         const h = ((a.config as GlobalCfg).hosts ?? []).find((x) => x.name === name);
         if (!h) throw new Error('unknown host');
-        const r = await a.dep<SshApi>('ssh').exec(h.sshHost, `${h.sbx || 'sbx'} version && ${h.sbx || 'sbx'} ls -q`, a.log);
+        const r = await runner(a.dep<SshApi>('ssh'))(h, `${h.sbx || 'sbx'} version && ${h.sbx || 'sbx'} ls -q`, a.log);
         return { ok: r.code === 0, output: (r.stdout + r.stderr).trim() };
       },
     },
@@ -109,12 +122,12 @@ const plugin: MControlProgramPlugin = {
     const g = { ...plugin.defaultGlobalConfig, ...ctx.pluginConfig } as GlobalCfg;
     const active = (cfg.hosts ?? []).filter((n) => !(cfg.hostsDisabled ?? []).includes(n));
     const hosts = g.hosts.filter((h) => active.includes(h.name));
-    return { tools: makeTools(ctx.dep<SshApi>('ssh'), g, hosts), status: () => ({ hosts: hosts.map((h) => h.name) }) };
+    return { tools: makeTools(runner(ctx.dep<SshApi>('ssh')), g, hosts), status: () => ({ hosts: hosts.map((h) => h.name) }) };
   },
 };
 
 /** The agent tools over `hosts`. The admin page calls the same tools (over every host) through the `call` action. */
-function makeTools(ssh: SshApi, g: GlobalCfg, hosts: HostCfg[]): ToolDefinition[] {
+function makeTools(exec: Exec, g: GlobalCfg, hosts: HostCfg[]): ToolDefinition[] {
     const names = hosts.map((h) => h.name);
     const one = names.length === 1;
 
@@ -127,7 +140,7 @@ function makeTools(ssh: SshApi, g: GlobalCfg, hosts: HostCfg[]): ToolDefinition[
     const run = async (h: HostCfg, args: string, call: ToolCallContext, stdinB64?: string, okCodes = [0]) => {
       const cmd = (stdinB64 !== undefined ? `printf %s ${q(stdinB64)} | base64 -d | ` : '') + `${h.sbx || 'sbx'} ${args}`;
       call.log.connection(`sandbox ${h.name}: sbx ${args.slice(0, 200)}`, undefined, call.sessionId);
-      const r = await ssh.exec(h.sshHost, cmd, call.log);
+      const r = await exec(h, cmd, call.log);
       const out = clip(r.stdout + (r.stderr ? (r.stdout ? '\n' : '') + r.stderr : ''), g.maxOutputBytes);
       const ok = okCodes.includes(r.code ?? -1);
       return { content: [{ type: 'text' as const, text: ok ? out || 'ok' : `exit ${r.code}\n${out}` }], isError: !ok };

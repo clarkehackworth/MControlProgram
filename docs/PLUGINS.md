@@ -302,4 +302,17 @@ Drives the [`sbx`](https://docs.docker.com/reference/cli/sbx/) CLI on SSH hosts 
 
 Tools: `hosts`, `list`, `create` (agent kit, workspace mounts, ports, cpus/memory, initial deny rules), `stop`, `remove`, `exec` (`sh -c`, no TTY), `read_file`, `write_file` (≤ 90 KB, sent base64 over the ssh command line), `copy` (`sbx cp` between the host and a sandbox), `ports`, `policy`, `network_log`, `network_check`, `network_allow`, `network_deny`, `network_remove`. `create` needs the first workspace read/write (sbx refuses a read-only primary). Everything inside a sandbox is fair game; on the **host**, `create` mounts and `copy` paths must sit inside the host's **Workspace roots** (empty = no host file access). That check is lexical, so keep untrusted symlinks out of the roots. The plugin has no rules of its own: gate the mutating tools (`network_allow`, `remove`, `create`, `exec`…) with the server's Tool rules.
 
+### Native hosts
+
+Tick **Native (this machine)** on a sandbox host to run `sbx` where MControlProgram runs, without ssh (no SSH host needed). Agents given that host can drive every sandbox the local sbx user owns.
+
+When MControlProgram runs in a container on the Docker host, mount sbx into it at the **same paths** as on the host, and set the host's **sbx binary** to `env HOME=/home/<user> sbx`:
+
+- `/usr/bin/sbx` (read-only; it is a static binary)
+- `~/.local/state/sandboxes` (the sandboxd socket), `~/.sbx`, `~/.config/sandboxes`, `~/.config/com.docker.sandboxes`
+- `~/.docker` (read-only; the Docker login)
+- every workspace root, also at its host path: `create` hands paths to the daemon (host paths) while `cp` reads and writes them in the container
+
+The container user must match the uid that owns those files (the image runs as 1000). See the commented lines in `docker-compose.yml`. Anyone with access to these mounts controls all of that user's sandboxes.
+
 The plugin page shows, per host: the sandboxes (status, ports, workspaces; create, start, stop, remove), a panel for the selected sandbox (run a command, copy files, publish/unpublish ports), the network policy (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.

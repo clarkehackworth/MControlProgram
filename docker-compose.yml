@@ -9,6 +9,14 @@ services:
     volumes:
       - ./data:/data:z
       - ./test/fixtures:/app/fixtures:ro,z # lets the mcp plugin run the echo test server: node /app/fixtures/echo-mcp.mjs
+      # Docker Sandboxes plugin, native host (sbx on this Docker host; set the host's sbx binary to `env HOME=/home/you sbx`).
+      # Same paths as on the host; the host user must be uid 1000 like this container. Mount workspace roots at their host paths too.
+      # - /usr/bin/sbx:/usr/bin/sbx:ro
+      # - /home/you/.local/state/sandboxes:/home/you/.local/state/sandboxes
+      # - /home/you/.sbx:/home/you/.sbx
+      # - /home/you/.docker:/home/you/.docker:ro
+      # - /home/you/.config/sandboxes:/home/you/.config/sandboxes
+      # - /home/you/.config/com.docker.sandboxes:/home/you/.config/com.docker.sandboxes
     environment:
       # Optional. If unset, /data/master.key is generated on first run; keep it with the DB.
       # MCONTROLPROGRAM_MASTER_KEY:
