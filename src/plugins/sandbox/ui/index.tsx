@@ -255,7 +255,7 @@ function NetworkRules({ host, sandbox }: { host: string; sandbox?: string }) {
 
 function NetLog({ host, sandbox }: { host: string; sandbox?: string }) {
   const [rows, setRows] = useState<Conn[]>()
-  const [live, setLive] = useState(false)
+  const [live, setLive] = useState(true)
   const [only, setOnly] = useState('')
   const { run, error, busy } = useAction()
   const load = useCallback(() => run(async () => {
