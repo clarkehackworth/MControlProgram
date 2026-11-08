@@ -1,4 +1,4 @@
-# MControlProgram — MCP gateway with a plugin architecture
+# MControlProgram — MCP gateway and control
 
 MControlProgram sits between AI agents and the things you don't want them to hold directly: SSH keys,
 API tokens, internal networks. Agents connect to MControlProgram over the standard
