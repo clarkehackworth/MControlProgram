@@ -62,7 +62,7 @@ const hostSchema = {
   'x-kind-column': { title: 'Type', flags: { native: 'Native' }, default: 'SSH' },
   properties: {
     name: { type: 'string', title: 'Name', pattern: '^[a-zA-Z0-9_.-]+$', 'x-pattern-hint': 'letters, digits, _ . -' },
-    native: { type: 'boolean', title: 'Native (this machine)', default: false, description: 'Run sbx on the machine MControlProgram runs on, without ssh. In a container, sbx and its daemon state must be mounted in (see docs: Docker Sandboxes, native hosts); workspace roots are then paths as the container sees them.' },
+    native: { type: 'boolean', title: 'Native (this machine)', default: false, description: 'Run sbx on the machine MControlProgram runs on, without ssh. In a container, sbx and its daemon state must be mounted in (see docs: sandbox plugin, native hosts); workspace roots are then paths as the container sees them.' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (pinned host key) where the sbx CLI is installed and logged in. Not used for native hosts.', 'x-options-from': 'ssh:hosts' },
     description: { type: 'string', title: 'Description', description: 'Shown to agents' },
     workspaceRoots: { type: 'array', title: 'Workspace roots', 'x-no-column': true, description: 'Absolute directories on the host that agents may mount into new sandboxes and copy files to/from. Empty = no host file access (sandbox-internal files still work).', items: { type: 'string' }, default: [] },
@@ -72,8 +72,9 @@ const hostSchema = {
 
 const plugin: MControlProgramPlugin = {
   id: 'sandbox',
-  name: 'Docker Sandboxes',
+  name: 'Docker SBX',
   version: '0.2.0',
+  navOrder: 50,
   description: 'Manage Docker Sandboxes (sbx) on SSH hosts or this machine: list, create and remove sandboxes, run commands, read/write and copy files, publish ports, and inspect or change their network policy.',
   dependencies: { ssh: '^0.2.0' },
   globalConfigSchema: {

@@ -155,6 +155,8 @@ export interface MControlProgramPlugin {
   name: string;
   version: string;
   description: string;
+  /** Position in the sidebar (ascending; plugins without one come after, by name). */
+  navOrder?: number;
   /** JSON Schema for the per-instance config. Rendered as a form in the UI. */
   configSchema: ConfigSchema;
   defaultConfig?: Record<string, any>;

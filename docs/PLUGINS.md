@@ -32,6 +32,7 @@ Called once per load, after dependency checks, dependencies first.
 export default {
   id: 'ssh',                 // [a-z][a-z0-9_-]* ; default tool prefix
   name: 'SSH', version: '1.0.0', description: '…',
+  navOrder: 10,                         // optional: sidebar position (ascending; unset = after, by name)
   configSchema: { type: 'object', properties: { … } },   // JSON Schema → UI form
   defaultConfig: { … },
   create(ctx) { return { tools: [ … ], start, stop, status, actions, resources, onSessionClosed }; },

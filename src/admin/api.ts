@@ -75,7 +75,7 @@ export function adminApi() {
 
   // ---- plugins ----
   const pluginView = (p: ReturnType<typeof plugins.list>[number]) => ({
-    id: p.id, name: p.name, version: p.version, description: p.description, source: p.source,
+    id: p.id, name: p.name, version: p.version, description: p.description, source: p.source, navOrder: p.navOrder,
     configSchema: p.configSchema, defaultConfig: p.defaultConfig ?? {},
     globalConfigSchema: p.globalConfigSchema, globalConfig: p.globalConfigSchema ? pluginConfig.redacted(p.id) : undefined,
     globalActions: Object.entries(p.globalActions ?? {}).filter(([, a]) => !a.hidden).map(([key, a]) => ({ key, title: a.title, inventory: a.inventory, when: a.when })),

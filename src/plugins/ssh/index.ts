@@ -269,7 +269,7 @@ const api: SshApi = {
 };
 
 const plugin: MControlProgramPlugin = {
-  id: 'ssh', name: 'SSH', version: '0.2.0',
+  id: 'ssh', name: 'SSH', version: '0.2.0', navOrder: 10,
   api,
   init(h) { host = h; cmdRules.init(h); },
   description: 'Execute commands, run persistent shells, and transfer files over SSH on admin-configured hosts.',

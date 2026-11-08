@@ -326,6 +326,7 @@ const plugin: MControlProgramPlugin = {
   id: 'browserpaw',
   name: 'BrowserPaw',
   version: '0.2.0',
+  navOrder: 40,
   description: 'Run isolated Chromium profiles with the BrowserPaw extension on SSH hosts and give agents their browser tools. MControlProgram sets up the profiles, launches Chromium and tunnels to the bridge; agents never get SSH access or the bridge token. Hosts without ssh can be "manual": the admin runs the shown setup script and MControlProgram reaches the bridge over http.',
   dependencies: { ssh: '^0.2.0', web: '^0.2.0' },
   init(h) { host = h; policy.init(h); Object.assign(plugin.globalActions!, policy.actions); },

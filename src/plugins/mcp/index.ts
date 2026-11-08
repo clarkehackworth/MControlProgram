@@ -120,6 +120,7 @@ const plugin: MControlProgramPlugin = {
   id: 'mcp',
   name: 'MCP pass-through',
   version: '0.1.0',
+  navOrder: 30,
   optionalDependencies: { ssh: '^0.2.0' },
   init(h) { host = h; toolRules.init(h); },
   description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with a call log, an expose/hide list, and per-tool allow/ask/deny rules.',

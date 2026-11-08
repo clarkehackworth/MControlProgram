@@ -147,7 +147,7 @@ export type WebApi = typeof api;
 export type { Rule, Verdict, RuleStore } from './url-policy.js';
 
 const plugin: MControlProgramPlugin = {
-  id: 'web', name: 'Web', version: '0.2.0',
+  id: 'web', name: 'Web', version: '0.2.0', navOrder: 20,
   api,
   init(h) { host = h; },
   description: 'HTTP requests and page fetching with URL filtering and server-side credential injection.',
