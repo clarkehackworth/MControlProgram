@@ -16,6 +16,8 @@ the sandbox. Enable only what the current job needs (one host, one browser profi
 turn it off again afterwards. Risky tool calls can additionally be held for human approval, so the
 agent's exposure at any moment is limited to what you have deliberately opened up.
 
+![Approving an MCP tool call](docs/images/mcp-approval.png)
+
 **SSH** — hosts agents may use, with per-server toggles, global command allow/deny rules (parsed with a real shell grammar, so pipes, `sudo`, `sh -c` and `$( )` are all checked) and a command log.
 
 ![SSH plugin: host inventory, per-server toggles and command rules](docs/images/ssh.png)
@@ -142,8 +144,6 @@ Every rule in MControlProgram is **allow**, **ask** or **deny** (shown as *block
   without `readOnlyHint`; ask for everything) plus per-tool allow/ask/deny. Deny refuses the tool.
 - **Plugin rules**: SSH command rules, Web and BrowserPaw URL rules each take block / ask / allow
   rules and an *allow*, *ask* or *deny* default. Block beats ask, ask beats allow.
-
-![Approving an MCP tool call](docs/images/mcp-approval.png)
 
 An ask queues the call on the **Approvals** page (every ask) and on the plugin's own page (its asks),
 with the caller, what it wants (`web01: systemctl restart nginx`, `GET https://…`), and why it asked.
