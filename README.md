@@ -39,23 +39,25 @@ BrowserPaw has its own URL access rules, pushed to every profile (fail closed if
 ## Architecture
 
 ```text
-              ┌──────────────────────────────┐
-              │  AI agent (sandboxed)        │
-              │  Claude Code, Cursor, …      │
-              └──────────────┬───────────────┘
-                             │ MCP/HTTP + auth
-                             ▼
-              ┌──────────────────────────────┐
-              │  MCP server  :7801           │
-              │  tokens / OAuth, logging     │
-              └───────┬──────────┬───────────┘
-          ┌───────────┘          │          └───────────┐
-          ▼                      ▼                      ▼
-   ┌─────────────┐        ┌─────────────┐        ┌─────────────┐
-   │ ssh plugin  │        │ web plugin  │        │ browserpaw  │
-   └──────┬──────┘        └──────┬──────┘        └──────┬──────┘
-          ▼                      ▼                      ▼
-      SSH hosts             APIs / sites          Chromium isolated profiles
+                       ┌──────────────────────────────┐
+                       │ AI agent (sandboxed)         │
+                       │ Claude Code, Cursor, …       │
+                       └───────────────┬──────────────┘
+                                       │ MCP/HTTP + auth
+                                       ▼
+                       ┌──────────────────────────────┐      ┌──────────────────┐
+                       │ MCP server  :7801            │ ask ▶│ Admin UI  :7700  │
+                       │ tokens / OAuth, logging      │◀ ok  │ approvals, logs  │
+                       │ allow / ask / deny rules     │      └──────────────────┘
+                       └───────────────┬──────────────┘
+       ┌───────────────┬───────────────┼───────────────┬───────────────┐
+       ▼               ▼               ▼               ▼               ▼
+┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+│    ssh     │  │    web     │  │    mcp     │  │ browserpaw │  │ docker sbx │
+└──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
+       ▼               ▼               ▼               ▼               ▼
+   SSH hosts      APIs / sites    upstream MCP      Chromium      sbx microVMs
+                                    servers         profiles     (ssh / native)
 ```
 
 - **Multiple MCP servers**, each on its own port with its own plugins, auth mode, and log level.
@@ -68,8 +70,10 @@ BrowserPaw has its own URL access rules, pushed to every profile (fail closed if
   `ssh` (exec, persistent shells, SFTP, per-host and global command allow/deny, command log),
   `web` (HTTP requests, page-to-text, global and per-instance URL allow/deny, private-network
   blocking, server-side credential injection, isolated cookie jars, request log),
-  `mcp` (proxy other MCP servers) and `browserpaw` (agent-driven Chromium profiles on SSH, native
-  or manual hosts, with a managed URL policy and per-agent request log).
+  `mcp` (proxy other MCP servers with per-tool allow/ask/deny), `browserpaw` (agent-driven
+  Chromium profiles on SSH, native or manual hosts, with a managed URL policy and per-agent request
+  log) and `sandbox` (Docker Sandboxes via `sbx` over SSH or on this machine: create, exec, files,
+  ports, network policy).
 - **Secrets encrypted at rest** (AES-256-GCM, key in `MCONTROLPROGRAM_MASTER_KEY` or `data/master.key`);
   the UI never returns a stored secret.
 - **First-run setup**: no default credentials. The first visit to the admin UI asks you to create
