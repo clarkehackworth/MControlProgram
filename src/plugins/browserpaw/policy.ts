@@ -90,7 +90,7 @@ export async function pull(profile: string, call: BridgeCall) {
       if (r.epoch !== s.epoch) { s.epoch = r.epoch; s.after = 0; }
       const d = db();
       d.transaction(() => {
-        if (r.dropped) record({ profile, type: 'other', url: '', via: 'dropped', blocked: `${r.dropped} events lost (extension buffer overflowed)` });
+        if (r.dropped) record({ profile, type: 'other', url: '', via: 'dropped', blocked: `${r.dropped} events lost (extension restarted or its buffer overflowed)` });
         for (const e of r.events ?? []) record({ ...e, profile, ts: e.ts });
       })();
       const last = r.events?.at(-1)?.seq;
