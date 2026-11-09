@@ -1,5 +1,5 @@
 /**
- * MCP pass-through plugin: MControlProgram connects to external MCP servers (Streamable HTTP or stdio),
+ * MCP pass-through plugin: MControlProgram connects to external MCP servers (Streamable HTTP, legacy SSE or stdio),
  * holds their credentials, and re-exposes their tools so every call goes through MControlProgram's
  * auth, logging and approval gate. Upstream tool schemas and annotations are forwarded unchanged.
  */
@@ -7,6 +7,7 @@ import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js';
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
@@ -16,7 +17,7 @@ import { ask, effective } from '../../core/plugin-api.js';
 import * as toolRules from './rules.js';
 
 interface ServerCfg {
-  name: string; description?: string; transport: 'http' | 'stdio';
+  name: string; description?: string; transport: 'http' | 'sse' | 'stdio';
   url?: string; auth: 'none' | 'bearer' | 'header' | 'oauth'; token?: string; headerName?: string; sshHost?: string;
   command?: string; args?: string; env?: string; cwd?: string;
 }
@@ -29,10 +30,10 @@ const serverSchema = {
   properties: {
     name: { type: 'string', title: 'Name', description: 'Prefix for its tools (e.g. github → github_create_issue)', pattern: '^[a-zA-Z0-9_-]+$' },
     description: { type: 'string', title: 'Description', 'x-no-column': true },
-    transport: { type: 'string', title: 'Transport', enum: ['http', 'stdio'], default: 'http' },
-    url: { type: 'string', title: 'URL', 'x-column-title': 'URL / command', 'x-column-fallback': 'command', description: 'Streamable HTTP endpoint, e.g. https://mcp.example.com/mcp', 'x-show-if': { transport: 'http' } },
-    sshHost: { type: 'string', title: 'Reach via SSH host (optional)', 'x-no-column': true, description: 'Name of a host in the SSH plugin (must have a pinned host key). The URL is then resolved on that host, like ssh -L: e.g. http://127.0.0.1:12306/mcp is the remote machine\'s localhost. http only; not with OAuth.', 'x-show-if': { transport: 'http' } },
-    auth: { type: 'string', title: 'Authentication', 'x-no-column': true, enum: ['none', 'bearer', 'header', 'oauth'], default: 'none', 'x-show-if': { transport: 'http' } },
+    transport: { type: 'string', title: 'Transport', enum: ['http', 'sse', 'stdio'], default: 'http' },
+    url: { type: 'string', title: 'URL', 'x-column-title': 'URL / command', 'x-column-fallback': 'command', description: 'Streamable HTTP endpoint, e.g. https://mcp.example.com/mcp; for the sse transport, the SSE stream URL, e.g. http://127.0.0.1:9876 (Burp serves its stream at the root)', 'x-show-if': { transport: ['http', 'sse'] } },
+    sshHost: { type: 'string', title: 'Reach via SSH host (optional)', 'x-no-column': true, description: 'Name of a host in the SSH plugin (must have a pinned host key). The URL is then resolved on that host, like ssh -L: e.g. http://127.0.0.1:12306/mcp is the remote machine\'s localhost. http/sse only; not with OAuth.', 'x-show-if': { transport: ['http', 'sse'] } },
+    auth: { type: 'string', title: 'Authentication', 'x-no-column': true, enum: ['none', 'bearer', 'header', 'oauth'], default: 'none', 'x-show-if': { transport: ['http', 'sse'] } },
     token: { type: 'string', title: 'Token / header value', 'x-secret': true, 'x-show-if': { auth: ['bearer', 'header'] } },
     headerName: { type: 'string', title: 'Header name', 'x-no-column': true, default: 'X-API-Key', 'x-show-if': { auth: 'header' } },
     command: { type: 'string', title: 'Command', 'x-no-column': true, description: 'Executable to spawn, e.g. npx', 'x-show-if': { transport: 'stdio' } },
@@ -87,12 +88,14 @@ function makeTransport(s: ServerCfg) {
   const headers: Record<string, string> = {};
   if (s.auth === 'bearer' && s.token) headers.authorization = `Bearer ${s.token}`;
   if (s.auth === 'header' && s.token) headers[s.headerName || 'X-API-Key'] = s.token;
-  return new StreamableHTTPClientTransport(new URL(s.url), { requestInit: { headers }, authProvider: s.auth === 'oauth' ? oauthProvider(s.name) : undefined });
+  const opts = { requestInit: { headers }, authProvider: s.auth === 'oauth' ? oauthProvider(s.name) : undefined };
+  // ponytail: SDK (>=1.32) already sends requestInit.headers on the SSE GET too
+  return s.transport === 'sse' ? new SSEClientTransport(new URL(s.url), opts) : new StreamableHTTPClientTransport(new URL(s.url), opts);
 }
 
 /** If the server is reached through an SSH host, open the tunnel and return the server with its URL pointed at the local end. */
 async function viaTunnel(s: ServerCfg, log: PluginContext['log']) {
-  if (s.transport !== 'http' || !s.sshHost) return { s, close: () => {} };
+  if (s.transport === 'stdio' || !s.sshHost) return { s, close: () => {} };
   if (s.auth === 'oauth') throw new Error(`server ${s.name}: OAuth is not supported through an SSH host`);
   const u = new URL(s.url ?? '');
   if (u.protocol !== 'http:') throw new Error(`server ${s.name}: only http:// URLs can go through an SSH host`);
@@ -177,7 +180,7 @@ const plugin: MControlProgramPlugin = {
         if (!flow || flow.exp < Date.now()) throw new Error('unknown or expired authorization flow; start it again from the MCP plugin page');
         const s = (config.servers as ServerCfg[]).find((x) => x.name === flow.name);
         if (!s || !code) throw new Error('unknown server or missing code');
-        const transport = makeTransport(s) as StreamableHTTPClientTransport;
+        const transport = makeTransport(s) as StreamableHTTPClientTransport | SSEClientTransport;
         await transport.finishAuth(String(code));
         saveOauth(s.name, { verifier: undefined });
         return { ok: true, name: s.name };
