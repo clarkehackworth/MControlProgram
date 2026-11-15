@@ -16,7 +16,7 @@ type Act = <T>(key: string, body?: Record<string, unknown>) => Promise<T>
 const actOf = (plugin: string): Act => (key, body = {}) => api<{ result: any }>(`/plugins/${plugin}/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
 
 /**
- * Per-tool allow/ask/deny across groups (MCP: upstream servers; github: repos), default policy, pending asks and the call log.
+ * Per-tool allow/ask/deny across groups (MCP: upstream servers; git: repos), default policy, pending asks and the call log.
  * Reused by plugins that depend on mcp (`@plugin/mcp`); `refresh` = the global action that lists a group's tools.
  */
 export default function McpTools({ upstreams, plugin = 'mcp', refresh: refreshAction = 'test_server', groupLabel = 'upstream' }: { upstreams: string[]; plugin?: string; refresh?: string; groupLabel?: string }) {

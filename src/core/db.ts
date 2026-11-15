@@ -26,6 +26,15 @@ function migrate(db: Database.Database) {
   // approvals asked by plugins (feature-level asks), not just the core tool gate
   for (const c of ["plugin_id TEXT NOT NULL DEFAULT ''", "feature TEXT NOT NULL DEFAULT 'tool'", "summary TEXT NOT NULL DEFAULT ''", "reason TEXT NOT NULL DEFAULT ''", 'subject TEXT'])
     defer.push(() => addCol(`ALTER TABLE approvals ADD COLUMN ${c}`));
+  // the `github` plugin became `git`: move its config, instances (and the default instance's name = tool prefix) and
+  // pending approvals; the plugin renames its own tables. Idempotent: nothing matches once moved.
+  defer.push(() => db.transaction(() => {
+    db.prepare("UPDATE plugin_config SET plugin_id='git' WHERE plugin_id='github' AND NOT EXISTS (SELECT 1 FROM plugin_config WHERE plugin_id='git')").run();
+    db.prepare(`UPDATE plugin_instances SET name='git' WHERE plugin_id='github' AND name='github'
+      AND NOT EXISTS (SELECT 1 FROM plugin_instances o WHERE o.server_id=plugin_instances.server_id AND o.name='git')`).run();
+    db.prepare("UPDATE plugin_instances SET plugin_id='git' WHERE plugin_id='github' AND NOT EXISTS (SELECT 1 FROM plugin_instances o WHERE o.server_id=plugin_instances.server_id AND o.plugin_id='git')").run();
+    db.prepare("UPDATE approvals SET plugin_id='git', feature=CASE feature WHEN 'github_tool' THEN 'git_tool' ELSE feature END WHERE plugin_id='github'").run();
+  })());
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS admins (

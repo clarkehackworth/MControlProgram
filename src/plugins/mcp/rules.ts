@@ -3,7 +3,7 @@
  * group, and the call log. Own tables like ssh/web: changes apply live, no restarts.
  *
  * `toolRuleStore(db, prefix)` keeps them in `<prefix>_rules` / `_tools` / `_policy` / `_calls`. The MCP pass-through
- * groups by upstream server; other plugins reuse it through mcp's `api` (github groups by repo).
+ * groups by upstream server; other plugins reuse it through mcp's `api` (git groups by repo).
  */
 import type { PluginHost, ToolCallContext } from '../../core/plugin-api.js';
 import { ask } from '../../core/plugin-api.js';

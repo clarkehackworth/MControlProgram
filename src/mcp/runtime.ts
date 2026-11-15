@@ -275,7 +275,7 @@ export class RunningServer {
         if (!gate.ok) throw new ApprovalError(gate.status, gate.message);
         return gate.by;
       };
-      const result = await tool.handler(args ?? {}, { sessionId: session.id, principal: session.principal, signal: extra.signal, log: li.log, ask });
+      const result = await tool.handler(args ?? {}, { sessionId: session.id, principal: session.principal, client: session.clientInfo, signal: extra.signal, log: li.log, ask });
       if (lvl === 'tools' || lvl === 'full') {
         log({ level: result.isError ? 'warn' : 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id,
           message: `${fullName}${urlOf(args)} by ${session.principal} ${result.isError ? 'ERROR' : 'ok'} ${Date.now() - t0}ms`,

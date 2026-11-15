@@ -26,6 +26,8 @@ export interface ToolCallContext {
   sessionId?: string;
   /** Authenticated principal (bearer token name / oauth client id). */
   principal?: string;
+  /** MCP client the agent connected with, `name version` from its initialize request (e.g. `claude-code 2.1.0`). */
+  client?: string;
   signal: AbortSignal;
   log: ScopedLogger;
   /**

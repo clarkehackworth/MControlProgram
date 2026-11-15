@@ -5,11 +5,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-github-'));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-git-'));
 process.env.MCONTROLPROGRAM_DATA_DIR = path.join(tmp, 'data');
 process.env.HOME = tmp; // the native git host's ~ (repos dir, ssh key)
-await (await import('../src/core/plugin-loader.js')).loadPlugins(); // init: github gets mcp's rule store
-const { default: plugin, globMatch, isMbox, agentBranch, slug, qp } = await import('../src/plugins/github/index.js');
+await (await import('../src/core/plugin-loader.js')).loadPlugins(); // init: git gets mcp's rule store
+const { default: plugin, globMatch, isMbox, agentBranch, slug, qp } = await import('../src/plugins/git/index.js');
 const { ScopedLogger } = await import('../src/core/logger.js');
 const log = new ScopedLogger({ category: 'test' });
 
@@ -24,7 +24,7 @@ sh(clone, 'add', '-A'); sh(clone, 'commit', '-qm', 'init'); sh(clone, 'push', '-
 const main = sh(clone, 'rev-parse', 'HEAD');
 
 // admin side: a native git host; actions save config here
-let config: any = { hosts: [{ name: 'local', native: true, reposDir: '~/repos', token: 'SECRET123' }], repos: [] };
+let config: any = { hosts: [{ name: 'local', native: true, reposDir: '~/repos', token: 'SECRET123', provider: 'github' }], repos: [] };
 const act = (k: string, p: any) => plugin.globalActions![k].run(p, { config, setConfig: async (c: any) => { config = c; }, log, dep: () => undefined } as any) as Promise<any>;
 
 test('helpers', () => {
@@ -37,6 +37,7 @@ test('helpers', () => {
   for (const bad of ['../x', 'a..b', 'a b', 'x.lock', '', "a'b"]) assert.throws(() => agentBranch(r, bad), undefined, bad);
   assert.equal(slug({ name: 'x', url: 'git@github.com:o/r.git' }), 'o/r');
   assert.equal(slug({ name: 'x', url: 'https://github.com/o/r' }), 'o/r');
+  assert.equal(slug({ name: 'x', url: 'ssh://git@gitlab.example:2222/g/sub/r.git' }), 'g/sub/r');
   assert.equal(execFileSync('sh', ['-c', `printf %s ${qp("~/a b'c")}`], { env: { ...process.env, HOME: '/h' } }).toString(), "/h/a b'c");
 });
 
@@ -57,9 +58,10 @@ test('host setup makes a key; clone and scan fill the repos inventory', async ()
 });
 
 test('resolve, submit (mbox, then plain diff with force + sensitive path), one ask per call, rules and log', async () => {
-  const inst: any = await plugin.create({ instanceId: 'i', instanceName: 'github', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined } as any);
+  config.repos[0].url = 'https://github.com/o/demo'; // as if cloned from GitHub (git itself uses the clone's remote)
+  const inst: any = await plugin.create({ instanceId: 'i', instanceName: 'git', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined } as any);
   const asks: any[] = [];
-  const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async (a: any) => { asks.push(a); return 'approved by test'; } };
+  const call = { principal: 'agent1', client: 'test-client 1.0', signal: new AbortController().signal, log, ask: async (a: any) => { asks.push(a); return 'approved by test'; } };
   const t = (n: string) => inst.tools.find((x: any) => x.name === n);
   const json = (r: any) => JSON.parse(r.content[0].text);
 
@@ -74,7 +76,9 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   const mbox = sh(clone, 'format-patch', '--stdout', main) + '\n';
   const r1 = json(await t('submit_patch').handler({ base: main, patch: mbox, branch: 'feat' }, call));
   assert.equal(sh(origin, 'rev-parse', 'refs/heads/agent/feat'), r1.sha);
-  assert.equal(sh(origin, 'log', '-1', '--format=%s|%an|%cn', r1.sha), 'readme: greet the world|agent|MControlProgram');
+  // re-signed by the host's identity, the agent named in the trailer (here: its MCP client)
+  assert.equal(sh(origin, 'log', '-1', '--format=%s|%an|%cn', r1.sha), 'readme: greet the world|MControlProgram|MControlProgram');
+  assert.match(sh(origin, 'log', '-1', '--format=%B', r1.sha), /\n\nAssisted-by: test-client 1\.0$/);
   assert.deepEqual(asks.map((a) => a.subject.features), [['submit_patch']]);
 
   // plain diff from main touching CI: not a fast-forward of agent/feat → refused without force, one combined ask with it
@@ -83,10 +87,11 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   const diff = sh(clone, 'diff') + '\n';
   await assert.rejects(t('submit_patch').handler({ base: main, patch: diff, branch: 'agent/feat', message: 'ci: run on PRs' }, call), /force: true/);
   await assert.rejects(t('submit_patch').handler({ base: main, patch: diff, branch: 'feat2' }, call), /commit message/);
-  const r2 = json(await t('submit_patch').handler({ base: 'main', patch: diff, branch: 'feat', message: 'ci: run on PRs', force: true }, call));
+  await assert.rejects(t('submit_patch').handler({ base: 'main', patch: diff, branch: 'feat', message: 'm', force: true, assisted_by: 'x\nSigned-off-by: y' }, call), /invalid assisted_by/);
+  const r2 = json(await t('submit_patch').handler({ base: 'main', patch: diff, branch: 'feat', message: 'ci: run on PRs', force: true, assisted_by: 'Claude Code (claude-opus-5-5)' }, call));
   assert.equal(r2.forced, true);
   assert.deepEqual(asks.at(-1).subject.features, ['submit_patch', 'force_push', 'sensitive_paths']);
-  assert.match(sh(origin, 'log', '-1', '--format=%B', 'refs/heads/agent/feat'), /Submitted-by: agent1 via MControlProgram/);
+  assert.match(sh(origin, 'log', '-1', '--format=%B', 'refs/heads/agent/feat'), /Submitted-by: agent1 via MControlProgram\nAssisted-by: Claude Code \(claude-opus-5-5\)/);
 
   // committer identity from the agent: committer (and author of a plain diff), its own rule feature
   fs.writeFileSync(path.join(clone, 'README.md'), 'hi\n');
@@ -122,7 +127,7 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   try {
     const pr = json(await t('create_pr').handler({ branch: 'feat', title: 't' }, call));
     assert.deepEqual([pr.number, pr.existing], [7, true]);
-    assert.match(seen[0], /^POST https:\/\/api\.github\.com\/repos\/[^/]+\/demo\/pulls Bearer SECRET123$/);
+    assert.match(seen[0], /^POST https:\/\/api\.github\.com\/repos\/o\/demo\/pulls Bearer SECRET123$/);
   } finally { globalThis.fetch = real; }
 });
 
@@ -131,7 +136,7 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
   const asks: any[] = [];
   let inst: any;
   const srv = http.createServer((req, res) => {
-    const m = /^\/plugins\/github(\/.*)$/.exec(req.url ?? '');
+    const m = /^\/plugins\/git(\/.*)$/.exec(req.url ?? '');
     if (!m) { res.writeHead(404).end(); return; }
     req.url = m[1];
     void inst.http(req, res, { ask: async (_p: string, _t: string, spec: any) => { asks.push(spec); return 'approved by test'; } });
@@ -139,13 +144,13 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
   await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
   const base = `http://127.0.0.1:${(srv.address() as any).port}`;
   try {
-    inst = await plugin.create({ instanceId: 'i', instanceName: 'github', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined, serverUrl: () => base } as any);
+    inst = await plugin.create({ instanceId: 'i', instanceName: 'git', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined, serverUrl: () => base } as any);
     const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async () => 'approved by test' };
     const cu = JSON.parse((await inst.tools.find((x: any) => x.name === 'clone_url').handler({}, call)).content[0].text);
-    assert.equal(cu.url, `${base}/plugins/github/git/demo.git`);
+    assert.equal(cu.url, `${base}/plugins/git/git/demo.git`);
     // async: the server runs in this process
     const { execFile } = await import('node:child_process');
-    const run = (cwd: string, cmd: string) => new Promise<string>((ok, no) => execFile('sh', ['-c', cmd], { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_AUTHOR_NAME: 'agent', GIT_AUTHOR_EMAIL: 'a@x', GIT_COMMITTER_NAME: 'agent', GIT_COMMITTER_EMAIL: 'a@x' } },
+    const run = (cwd: string, cmd: string) => new Promise<string>((ok, no) => execFile('sh', ['-c', cmd], { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } }, // identity: what clone_url configured
       (e, stdout, stderr) => (e ? no(Object.assign(e, { stderr })) : ok(stdout))));
     const refused = async (cmd: Promise<string>, re: RegExp) => { try { await cmd; } catch (e: any) { assert.match(String(e.stderr), re); return; } assert.fail(`not refused: ${re}`); };
 
@@ -167,7 +172,7 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
     const mine = sh(a2, 'rev-parse', 'HEAD');
     await run(a2, 'git push -q mcp HEAD:agent/http');
     assert.equal(sh(origin, 'rev-parse', 'agent/http'), mine);
-    assert.equal(sh(origin, 'log', '-1', '--format=%an|%cn', mine), 'agent|agent');
+    assert.equal(sh(origin, 'log', '-1', '--format=%an|%cn', mine), 'MControlProgram|MControlProgram');
     assert.deepEqual(asks.at(-1).subject.features, ['git_push']);
     await run(a2, 'git fetch -q mcp');
     assert.equal(sh(a2, 'rev-parse', 'mcp/agent/http'), mine);
@@ -175,9 +180,10 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
     assert.equal(sh(origin, 'rev-parse', 'main'), main);
 
     // rewrite: force needs force_push, and touching CI asks for sensitive_paths
-    fs.writeFileSync(path.join(a2, '.github/workflows/ci.yml'), 'on: [push]\n'); await run(a2, 'git commit -qa --amend -m "ci too"');
+    fs.writeFileSync(path.join(a2, '.github/workflows/ci.yml'), 'on: [push]\n'); await run(a2, 'git -c user.name=agent -c user.email=a@x commit -qa --amend --reset-author -m "ci too"');
     await run(a2, 'git push -qf mcp HEAD:agent/http');
-    assert.deepEqual(asks.at(-1).subject.features, ['git_push', 'force_push', 'sensitive_paths']);
+    assert.deepEqual(asks.at(-1).subject.features, ['git_push', 'force_push', 'custom_identity', 'sensitive_paths']);
+    assert.match(asks.at(-1).summary, /as agent <a@x>/);
     assert.equal(sh(origin, 'rev-parse', 'agent/http'), sh(a2, 'rev-parse', 'HEAD'));
 
     // a deny rule refuses, and the mirror goes back to origin's value
@@ -190,6 +196,35 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
     // bad token: a 403 that says what to do, no password prompt
     await refused(run(tmp, `git -c http.extraHeader="Authorization: Bearer nope" ls-remote ${cu.url}`), /expired MControlProgram git token/);
   } finally { srv.close(); }
+});
+
+test('PR providers: GitLab merge requests, Gitea, none', async () => {
+  const { provider, apiBase } = await import('../src/plugins/git/providers.js');
+  assert.equal(apiBase('github', {} as any, 'ghe.corp'), 'https://ghe.corp/api/v3');
+  const real = globalThis.fetch; const seen: string[] = [];
+  const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
+  try {
+    globalThis.fetch = (async (url: string, o: any) => {
+      seen.push(`${o.method} ${url} ${o.headers['PRIVATE-TOKEN'] ?? o.headers.Authorization} ${o.body ?? ''}`);
+      if (o.method === 'POST') return reply(409, { message: ['Another open merge request already exists for this source branch: !4'] });
+      return reply(200, [{ iid: 4, title: 'Draft: t', state: 'opened', draft: true, source_branch: 'agent/x', target_branch: 'main', web_url: 'u', author: { username: 'bot' } }]);
+    }) as any;
+    const gl = provider({ name: 'h', provider: 'gitlab', token: 'T' }, { name: 'r', url: 'git@gitlab.example:grp/sub/r.git' });
+    assert.deepEqual(await gl.create({ head: 'agent/x', base: 'main', title: 't', body: '', draft: true }),
+      { number: 4, title: 'Draft: t', state: 'open', draft: true, head: 'agent/x', base: 'main', url: 'u', user: 'bot', updated: undefined, existing: true });
+    assert.match(seen[0], /^POST https:\/\/gitlab\.example\/api\/v4\/projects\/grp%2Fsub%2Fr\/merge_requests T .*"source_branch":"agent\/x".*"title":"Draft: t"/);
+    assert.match(seen[1], /merge_requests\?state=opened&source_branch=agent%2Fx/);
+
+    seen.length = 0;
+    globalThis.fetch = (async (url: string, o: any) => { seen.push(`${o.method} ${url} ${o.headers.Authorization}`); return reply(201, { number: 2, title: 'WIP: t', state: 'open', merged: false, head: { ref: 'agent/x' }, base: { ref: 'main' }, html_url: 'u' }); }) as any;
+    const gt = provider({ name: 'h', provider: 'gitea', token: 'T', apiUrl: 'https://forge.example/api/v1/' }, { name: 'r', url: 'https://forge.example/o/r.git' });
+    assert.equal((await gt.create({ head: 'agent/x', base: 'main', title: 't', body: '', draft: true })).draft, true);
+    assert.equal(seen[0], 'POST https://forge.example/api/v1/repos/o/r/pulls token T');
+  } finally { globalThis.fetch = real; }
+  assert.throws(() => provider({ name: 'h', provider: 'none' }, { name: 'r', url: 'git@x:o/r' }), /no PR provider/);
+  // a host without a provider: git tools only
+  const inst: any = await plugin.create({ instanceId: 'i2', instanceName: 'git', serverId: 's', config: { repos: ['demo'] }, pluginConfig: { ...config, hosts: [{ ...config.hosts[0], provider: 'none' }] }, global: () => ({}) as any, log, dep: () => undefined } as any);
+  assert.ok(!inst.tools.some((t: any) => ['create_pr', 'pr', 'comment'].includes(t.name)) && inst.tools.some((t: any) => t.name === 'clone_url'));
 });
 
 test('a clone removed from the host drops out of the inventory', async () => {

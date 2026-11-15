@@ -1,11 +1,11 @@
 /**
- * GitHub through MControlProgram: agents keep a read-only clone, MControlProgram works in clones on a **git host**
+ * Git through MControlProgram: agents keep a read-only clone, MControlProgram works in clones on a **git host**
  * (an SSH host or this machine) that hold the push credential: an ssh key generated there, never seen by agents.
- * Repos are discovered in the host's repos directory and paired with MCP servers like any inventory.
+ * Any git server works. Repos are discovered in the host's repos directory and paired with MCP servers like any inventory.
  *
  * An agent pins its clone with `resolve`, sends a patch with the commit it was based on (`submit_patch`), and
- * MControlProgram applies, commits and pushes it to an agent branch, opens PRs and reads their state (REST API,
- * with the host's token).
+ * MControlProgram applies, commits and pushes it to an agent branch. With a PR provider on the host (GitHub,
+ * GitLab, Gitea / Forgejo) it also opens PRs and reads their state, with the host's API token (providers.ts).
  *
  * Agents can also use MControlProgram as a git remote (smart HTTP on the MCP server's port, per-agent token from
  * `clone_url`): fetch to see exactly what MControlProgram has, `git push` to have it forwarded to an agent branch.
@@ -13,7 +13,7 @@
  * the host clone's own work never leaks.
  *
  * Every tool and git feature (force push, touching CI paths) is allow / ask / deny per repo, using mcp's rule store
- * (own `github_*` tables, same panel as the MCP pass-through). One call asks once, for everything it touches.
+ * (own `git_*` tables, same panel as the MCP pass-through). One call asks once, for everything it touches.
  */
 import { spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
@@ -26,12 +26,13 @@ import { text } from '../../core/plugin-api.js';
 import type { McpApi } from '../mcp/index.js';
 import type { ToolRuleStore, LogEntry } from '../mcp/rules.js';
 import type { Proc, SshApi } from '../ssh/index.js';
+import { PROVIDERS, origin, provider, type ProviderName } from './providers.js';
 
 export interface HostCfg {
   name: string; native?: boolean; sshHost?: string; description?: string; reposDir: string; sshKey: string;
-  committerName: string; committerEmail: string; token?: string; apiUrl?: string;
+  committerName: string; committerEmail: string; provider?: ProviderName; token?: string; apiUrl?: string;
 }
-export interface RepoCfg { name: string; host: string; path: string; url?: string; description?: string; branchPrefix: string; baseBranches: string[]; askPaths: string[]; maxPatchKB: number }
+export interface RepoCfg { name: string; host: string; path: string; url?: string; description?: string; branchPrefix: string; baseBranches: string[]; askPaths: string[]; maxPatchKB: number; assistTrailer: string }
 interface GlobalCfg { hosts: HostCfg[]; repos: RepoCfg[] }
 interface Cfg { repos: string[]; reposDisabled?: string[] }
 type Repo = RepoCfg & { h: HostCfg };
@@ -43,11 +44,11 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'submit_patch', ro: false, description: 'Apply a patch on a base commit, commit it and push it to an agent branch' },
   { name: 'git_push', ro: false, description: "git push to MControlProgram's remote, forwarded to an agent branch (the agent's commits as they are, authors and committers included)" },
   { name: 'force_push', ro: false, description: 'submit_patch or git push that rewrites an agent branch (not a fast-forward)' },
-  { name: 'custom_identity', ro: false, description: 'submit_patch with a committer name and email from the agent instead of the git host\'s' },
+  { name: 'custom_identity', ro: false, description: 'submit_patch or git push with an author / committer other than the git host\'s identity' },
   { name: 'sensitive_paths', ro: false, description: "submit_patch or git push touching the repo's sensitive paths (CI workflows, CODEOWNERS…)" },
-  { name: 'create_pr', ro: false, description: 'Open a pull request from an agent branch' },
+  { name: 'create_pr', ro: false, description: 'Open a pull request (GitLab: merge request) from an agent branch' },
   { name: 'pr', ro: true, description: 'List pull requests, or read one: state, checks, reviews and comments' },
-  { name: 'comment', ro: false, description: 'Comment on a pull request or issue' },
+  { name: 'comment', ro: false, description: 'Comment on a pull request (GitHub, Gitea: or an issue)' },
 ];
 const RO = Object.fromEntries(FEATURES.map((f) => [f.name, f.ro]));
 const featureList = FEATURES.map((f) => ({ name: f.name, description: f.description, annotations: { readOnlyHint: f.ro } }));
@@ -166,6 +167,14 @@ const ref = (s: string) => { if (!REF.test(s)) throw new Error(`invalid ref "${s
 
 interface Applied { base: string; sha: string; previous?: string; force: boolean; commits: number; files: string[] }
 /** Fetch, then apply `patch` on `base` in a throwaway worktree and commit it. Nothing is pushed; the commit stays in the repo's objects. */
+/** `<repo trailer>: <who>`: who the agent says it is, else its MCP client; none when the repo's trailer name is empty. */
+export function assistTrailer(trailer: string, who?: string, client?: string): string | undefined {
+  const ok = (w: string) => w.length <= 100 && !/[<>\p{Cc}]/u.test(w);
+  if (who?.trim() && !ok(who.trim())) throw new Error('invalid assisted_by: one line, at most 100 characters, no < >');
+  const w = who?.trim() || (client && ok(client.trim()) ? client.trim() : '');
+  return trailer && w ? `${trailer}: ${w}` : undefined;
+}
+
 /** A committer identity from an agent: both fields, nothing that could break out of a header. */
 export function identity(name?: string, email?: string): { name: string; email: string } | undefined {
   if (!name && !email) return undefined;
@@ -176,11 +185,14 @@ export function identity(name?: string, email?: string): { name: string; email: 
   return { name: n, email: e };
 }
 
-async function apply(run: Run, r: Repo, a: { base: string; patch: string; branch: string; message?: string; principal?: string; ident?: { name: string; email: string } }, log: ScopedLogger): Promise<Applied> {
+async function apply(run: Run, r: Repo, a: { base: string; patch: string; branch: string; message?: string; principal?: string; ident?: { name: string; email: string }; assisted?: string }, log: ScopedLogger): Promise<Applied> {
   const mbox = isMbox(a.patch);
   if (!mbox && !a.message?.trim()) throw new Error('a plain diff needs a commit message (or send `git format-patch` output)');
-  const commit = `g commit -q --no-gpg-sign -m ${q(a.message ?? '')}${a.principal ? ` --trailer ${q(`Submitted-by: ${a.principal} via MControlProgram`)}` : ''}`;
-  // committer of every commit, and author of a plain diff's commit (a mailbox keeps its own authors)
+  const assisted = a.assisted ? ` --trailer ${q(a.assisted)}` : '';
+  const commit = `g commit -q --no-gpg-sign -m ${q(a.message ?? '')}${a.principal ? ` --trailer ${q(`Submitted-by: ${a.principal} via MControlProgram`)}` : ''}${assisted}`;
+  // every commit is authored and committed by the host's identity (or the agent's, see custom_identity): a mailbox's
+  // commits keep their messages but are re-signed, with the assisted-by trailer added
+  const resign = `g rebase -q "$base" --exec ${q(`git -c core.hooksPath=/dev/null commit -q --amend --no-edit --no-verify --no-gpg-sign --reset-author${assisted}`)} >/dev/null || { g rebase --abort >/dev/null 2>&1 || true; exit 4; }`;
   const ident = a.ident ? `export GIT_COMMITTER_NAME=${q(a.ident.name)} GIT_COMMITTER_EMAIL=${q(a.ident.email)} GIT_AUTHOR_NAME=${q(a.ident.name)} GIT_AUTHOR_EMAIL=${q(a.ident.email)}\n` : '';
   const script = `${prelude(r.h)}${ident}P=$(mktemp); trap 'rm -f "$P"' EXIT; cat > "$P"
 cd ${qp(r.path)}
@@ -192,7 +204,7 @@ wt="$(g rev-parse --absolute-git-dir)/mcontrolprogram-work/${randomUUID()}"
 g worktree add -q --detach "$wt" "$base"
 trap 'rm -f "$P"; cd "$repo"; g worktree remove --force "$wt" >/dev/null 2>&1 || { rm -rf "$wt"; g worktree prune; }' EXIT
 cd "$wt"
-${mbox ? 'g am -q --3way --no-gpg-sign < "$P" || { g am --abort >/dev/null 2>&1 || true; exit 4; }' : `g apply --index --3way --whitespace=nowarn < "$P" || exit 4\n${commit}`}
+${mbox ? `g am -q --3way --no-gpg-sign < "$P" || { g am --abort >/dev/null 2>&1 || true; exit 4; }\n${resign}` : `g apply --index --3way --whitespace=nowarn < "$P" || exit 4\n${commit}`}
 sha=$(g rev-parse HEAD)
 [ "$sha" != "$base" ] || { echo "the patch changes nothing" >&2; exit 5; }
 force=0
@@ -247,11 +259,11 @@ const TOKEN_TTL_MS = 24 * 3600e3;
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 /** Per-agent git tokens (hashed): a principal on one instance, for every repo the instance exposes when used. */
 const tokens = {
-  init: (d: BetterSqlite3.Database) => d.exec('CREATE TABLE IF NOT EXISTS github_git_tokens (hash TEXT PRIMARY KEY, principal TEXT NOT NULL, instance_id TEXT NOT NULL, expires INTEGER NOT NULL)'),
+  init: (d: BetterSqlite3.Database) => d.exec('CREATE TABLE IF NOT EXISTS git_tokens (hash TEXT PRIMARY KEY, principal TEXT NOT NULL, instance_id TEXT NOT NULL, expires INTEGER NOT NULL)'),
   mint(principal: string, instanceId: string) {
     const t = `mcpgit_${randomBytes(24).toString('base64url')}`, expires = Date.now() + TOKEN_TTL_MS;
-    db().prepare('DELETE FROM github_git_tokens WHERE expires<?').run(Date.now());
-    db().prepare('INSERT INTO github_git_tokens(hash,principal,instance_id,expires) VALUES(?,?,?,?)').run(sha256(t), principal, instanceId, expires);
+    db().prepare('DELETE FROM git_tokens WHERE expires<?').run(Date.now());
+    db().prepare('INSERT INTO git_tokens(hash,principal,instance_id,expires) VALUES(?,?,?,?)').run(sha256(t), principal, instanceId, expires);
     return { token: t, expires };
   },
   /** `Authorization: Bearer <t>`, or Basic with the token as password (or user). */
@@ -260,7 +272,7 @@ const tokens = {
     const b = /^Basic\s+(\S+)$/i.exec(auth ?? '')?.[1];
     if (b) { const [u, ...pw] = Buffer.from(b, 'base64').toString().split(':'); t = pw.join(':') || u; }
     if (!t) return;
-    const r = db().prepare('SELECT principal FROM github_git_tokens WHERE hash=? AND instance_id=? AND expires>?').get(sha256(t), instanceId, Date.now()) as { principal: string } | undefined;
+    const r = db().prepare('SELECT principal FROM git_tokens WHERE hash=? AND instance_id=? AND expires>?').get(sha256(t), instanceId, Date.now()) as { principal: string } | undefined;
     return r?.principal;
   },
 };
@@ -279,7 +291,7 @@ for d in */; do
 done
 `;
 
-const repoDefaults = { branchPrefix: 'agent/', baseBranches: [] as string[], askPaths: ['.github/', 'CODEOWNERS'], maxPatchKB: 1024 };
+const repoDefaults = { branchPrefix: 'agent/', baseBranches: [] as string[], askPaths: ['.github/', 'CODEOWNERS'], maxPatchKB: 1024, assistTrailer: 'Assisted-by' };
 
 /**
  * Bring the `repos` inventory in line with what is on the hosts (all, or `only`): new clones are added, ones gone
@@ -309,8 +321,14 @@ export async function scan(run: Run, a: Pick<PluginActionContext, 'config' | 'se
   return { repos: repos.filter((r) => !only || r.host === only).map((r) => r.name), added, removed, errors };
 }
 
-/** git present, repos dir and ssh key created if missing; the public key to add to GitHub, and whether GitHub accepts it. */
+/** The ssh host `ssh -T git@…` checks the key against: the provider's (API URL's host, github.com), if any. */
+const forgeSsh = (h: HostCfg) => {
+  if (h.apiUrl) try { return new URL(h.apiUrl).hostname.replace(/^api\./, ''); } catch { return undefined; }
+  return h.provider === 'github' ? 'github.com' : h.provider === 'gitlab' ? 'gitlab.com' : undefined;
+};
+/** git present, repos dir and ssh key created if missing; the public key to add to the git server, and whether the forge accepts it. */
 async function setupHost(run: Run, h: HostCfg, log: ScopedLogger) {
+  const forge = forgeSsh(h);
   const out = await sh(run, h, `set -e
 command -v git >/dev/null || { echo "git is not installed on this host" >&2; exit 2; }
 echo "git=$(git --version)"
@@ -319,10 +337,11 @@ mkdir -p "$(dirname "$K")" ${qp(h.reposDir)}
 chmod 700 "$(dirname "$K")" 2>/dev/null || true
 [ -f "$K" ] || { ssh-keygen -q -t ed25519 -N '' -C "mcontrolprogram-git@$(hostname)" -f "$K" && echo "created=1"; }
 echo "pub=$(cat "$K.pub")"
-echo "github=$(ssh -i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -T git@github.com 2>&1 | grep -E '^Hi |denied' | head -1 || true)"
+${forge ? `echo "auth=$(ssh -i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -T ${q(`git@${forge}`)} 2>&1 | grep -Ei '^Hi |welcome|successfully authenticated|denied' | head -1 || true)"` : ''}
 `, log);
   const kv = Object.fromEntries(out.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
-  return { git: kv.git, keyCreated: !!kv.created, publicKey: kv.pub, github: kv.github || 'no answer from github.com (blocked network?)' };
+  const auth = !forge ? 'not checked: set a PR provider to test the key against it' : kv.auth || `no answer from ${forge} (blocked network?)`;
+  return { git: kv.git, keyCreated: !!kv.created, publicKey: kv.pub, auth, keyAccepted: /^Hi |welcome|successfully authenticated/i.test(auth) };
 }
 
 /** Clone `url` into the host's repos dir with the host's key. */
@@ -337,25 +356,8 @@ g clone -q ${q(url)} ${q(dir)}
   return dir;
 }
 
-// ---- GitHub REST --------------------------------------------------------------------------------------------
-
-/** owner/repo from the origin URL's last two path segments (https or scp-style). */
-export const slug = (r: Pick<RepoCfg, 'name' | 'url'>) => {
-  const m = /([^/:]+)\/([^/]+?)(?:\.git)?\/?$/.exec(r.url ?? '');
-  if (!m) throw new Error(`cannot tell owner/repo from origin "${r.url ?? ''}" of ${r.name}`);
-  return `${m[1]}/${m[2]}`;
-};
-async function gh(r: Repo, method: string, p: string, body?: unknown, signal?: AbortSignal): Promise<any> {
-  if (!r.h.token) throw new Error(`git host "${r.h.name}" has no GitHub token; PRs and comments need one`);
-  const res = await fetch(`${(r.h.apiUrl || 'https://api.github.com').replace(/\/$/, '')}/repos/${slug(r)}${p}`, {
-    method, signal, body: body === undefined ? undefined : JSON.stringify(body),
-    headers: { Authorization: `Bearer ${r.h.token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'MControlProgram', ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-  });
-  const j: any = await res.json().catch(() => null);
-  if (!res.ok) throw Object.assign(new Error(`GitHub ${method} ${p}: ${res.status} ${j?.message ?? res.statusText}${j?.errors ? ' ' + JSON.stringify(j.errors) : ''}`.split(r.h.token).join('***')), { status: res.status, body: j });
-  return j;
-}
-const prSummary = (p: any) => ({ number: p.number, title: p.title, state: p.merged_at ? 'merged' : p.state, draft: p.draft, head: p.head?.ref, base: p.base?.ref, url: p.html_url, user: p.user?.login, updated: p.updated_at });
+/** owner/repo (GitLab: group/…/repo) of the origin URL. */
+export const slug = (r: Pick<RepoCfg, 'name' | 'url'>) => origin(r).path;
 
 // ---- plugin -------------------------------------------------------------------------------------------------
 
@@ -367,13 +369,14 @@ const hostSchema = {
     name: { type: 'string', title: 'Name', pattern: '^[a-zA-Z0-9_.-]+$', 'x-pattern-hint': 'letters, digits, _ . -' },
     native: { type: 'boolean', title: 'Native (this machine)', default: false, description: 'Run git on the machine MControlProgram runs on (inside its container if it is containerised), without ssh. Paths and ~ are the MControlProgram user\'s.' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (pinned host key) with git installed. Commands run as that user. Not used for native hosts.', 'x-options-from': 'ssh:hosts' },
-    reposDir: { type: 'string', title: 'Repos directory', description: 'Clones directly under it are picked up as repos. ~/ = the host user\'s home. Native host in a container: use a path on the data volume (e.g. /data/github/repos, and SSH key /data/github/id_ed25519) so clones and key survive rebuilds.', default: '~/mcontrolprogram-repos' },
+    reposDir: { type: 'string', title: 'Repos directory', description: 'Clones directly under it are picked up as repos. ~/ = the host user\'s home. Native host in a container: use a path on the data volume (e.g. /data/git/repos, and SSH key /data/git/id_ed25519) so clones and key survive rebuilds.', default: '~/mcontrolprogram-repos' },
+    provider: { type: 'string', title: 'PR provider', enum: [...PROVIDERS], default: 'none', description: 'Forge behind these repos, for create_pr / pr / comment (with the token below). none = git only: any git server.' },
     description: { type: 'string', title: 'Description', 'x-no-column': true },
-    sshKey: { type: 'string', title: 'SSH key', description: 'Private key on the host for pushing over ssh; "Set up host" creates it. Add its public key to GitHub as a deploy key with write access (one repo) or to a machine user.', default: '~/.ssh/mcontrolprogram_git', 'x-no-column': true },
+    sshKey: { type: 'string', title: 'SSH key', description: 'Private key on the host for pushing over ssh; "Set up host" creates it. Add its public key to the git server: a deploy key with write access (one repo) or a machine user\'s key.', default: '~/.ssh/mcontrolprogram_git', 'x-no-column': true },
     committerName: { type: 'string', title: 'Committer name', default: 'MControlProgram', 'x-no-column': true },
-    committerEmail: { type: 'string', title: 'Committer email', default: 'mcontrolprogram@users.noreply.github.com', 'x-no-column': true },
-    token: { type: 'string', title: 'GitHub token', 'x-secret': true, 'x-no-column': true, description: 'For PRs and comments (REST API): fine-grained token with Pull requests read & write on these repos. Kept by MControlProgram, never sent to the host or agents. Empty = git only.' },
-    apiUrl: { type: 'string', title: 'API URL', 'x-no-column': true, description: 'Empty = https://api.github.com (GitHub Enterprise: https://host/api/v3)' },
+    committerEmail: { type: 'string', title: 'Committer email', default: 'mcontrolprogram@noreply.invalid', 'x-no-column': true },
+    token: { type: 'string', title: 'API token', 'x-secret': true, 'x-no-column': true, description: 'For the PR provider\'s REST API. GitHub: fine-grained token with Pull requests read & write. GitLab: api scope. Gitea / Forgejo: repository read & write. Kept by MControlProgram, never sent to the host or agents.' },
+    apiUrl: { type: 'string', title: 'API URL', 'x-no-column': true, description: 'Empty = from the origin\'s host: https://api.github.com (other hosts: https://host/api/v3), GitLab https://host/api/v4, Gitea / Forgejo https://host/api/v1' },
   },
 };
 const repoSchema = {
@@ -389,17 +392,27 @@ const repoSchema = {
     baseBranches: { type: 'array', title: 'Base branches', description: 'PR targets; never pushed to. Empty = the default branch.', items: { type: 'string' }, default: [], 'x-no-column': true },
     askPaths: { type: 'array', title: 'Sensitive paths', description: 'Patches touching these use the sensitive_paths rule (** any path, * one component; a plain path covers everything under it)', items: { type: 'string' }, default: ['.github/', 'CODEOWNERS'], 'x-no-column': true },
     maxPatchKB: { type: 'integer', title: 'Max patch size (KB)', default: 1024, 'x-no-column': true },
+    assistTrailer: { type: 'string', title: 'Assisted-by trailer', default: 'Assisted-by', pattern: '^([A-Za-z][A-Za-z0-9-]*)?$', 'x-pattern-hint': 'a trailer name like Assisted-by, or empty for none', 'x-no-column': true,
+      description: 'Trailer naming the agent on commits made through submit_patch (e.g. Assisted-by: Claude Code). Empty = none. Commits are authored and committed by the git host\'s identity.' },
   },
 };
 
 const plugin: MControlProgramPlugin = {
-  id: 'github',
-  name: 'GitHub',
-  version: '0.3.0',
+  id: 'git',
+  name: 'Git',
+  version: '0.4.0',
   navOrder: 35,
   dependencies: { mcp: '^0.2.0', ssh: '^0.2.2' },
-  description: 'Agents with a read-only clone sync to the same commit and submit patches; MControlProgram applies, commits and pushes them from clones on a git host (SSH or this machine) and opens PRs. Every tool and git feature is allow / ask / deny per repo.',
-  init(h) { rules = h.dep<McpApi>('mcp').toolRuleStore(() => h.db, 'github', { defaultPolicy: 'readonly' }); db = () => h.db; tokens.init(h.db); },
+  description: 'Agents with a read-only clone fetch from and push to MControlProgram (or submit patches); it commits and pushes from clones on a git host (SSH or this machine) to any git server, and opens PRs on GitHub, GitLab or Gitea / Forgejo. Every tool and git feature is allow / ask / deny per repo.',
+  init(h) {
+    // was the `github` plugin: its tables become ours (core moved its config, instances and approvals)
+    for (const t of ['calls', 'rules', 'tools', 'policy', 'git_tokens']) {
+      const has = (n: string) => !!h.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(n);
+      const to = t === 'git_tokens' ? 'git_tokens' : `git_${t}`;
+      if (has(`github_${t}`) && !has(to)) h.db.exec(`ALTER TABLE github_${t} RENAME TO ${to}`);
+    }
+    rules = h.dep<McpApi>('mcp').toolRuleStore(() => h.db, 'git', { defaultPolicy: 'readonly' }); db = () => h.db; tokens.init(h.db);
+  },
   globalConfigSchema: {
     type: 'object',
     properties: {
@@ -420,7 +433,7 @@ const plugin: MControlProgramPlugin = {
         const h = hostOf(withDefaults(a.config), name);
         const run = runner(a.dep<SshApi>('ssh'));
         const setup = await setupHost(run, h, a.log);
-        return { ...setup, ...(await scan(run, a, h.name)), next: setup.github.startsWith('Hi ') ? undefined : 'Add publicKey to GitHub: a deploy key with write access (repo Settings → Deploy keys) or an SSH key of a machine user, then run Set up host again.' };
+        return { ...setup, ...(await scan(run, a, h.name)), next: setup.keyAccepted ? undefined : 'Add publicKey to the git server: a deploy key with write access (GitHub: repo Settings → Deploy keys) or an SSH key of a machine user, then run Set up host again.' };
       },
     },
     scan: { title: 'Rescan repos', inventory: 'hosts', async run({ name }, a) { return scan(runner(a.dep<SshApi>('ssh')), a, name || undefined); } },
@@ -473,7 +486,7 @@ const plugin: MControlProgramPlugin = {
         let allowedBy: string | undefined, gated = false;
         const gate: Gate = async (features, summary, subject) => {
           gated = true;
-          allowedBy = await rules.gate(call, entry, RO[name], { feature: 'github_tool', summary: `${r.name}: ${summary}`, subject: { upstream: r.name, tool: name, features, ...subject } },
+          allowedBy = await rules.gate(call, entry, RO[name], { feature: 'git_tool', summary: `${r.name}: ${summary}`, subject: { upstream: r.name, tool: name, features, ...subject } },
             features.map((f) => ({ tool: f, readOnly: RO[f] })));
           gated = false;
           return allowedBy;
@@ -513,7 +526,7 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           const under = (p: string) => Object.fromEntries(refs.filter((x) => x.n.startsWith(p)).map((x) => [x.n.slice(p.length), x.sha]));
           return { defaultBranch: first.replace(/^default=(origin\/)?/, '') || undefined, branches: under('refs/remotes/origin/'), tags: under('refs/tags/') };
         }),
-      tool('clone_url', `A git remote on MControlProgram for the repo, with a token for you (valid 24h). It has origin's branches and tags, so after \`git fetch mcp\`, \`git log mcp/<base>..HEAD\` and \`git diff mcp/<base>\` show exactly what you have that MControlProgram doesn't. \`git push mcp HEAD:<branch prefix><name>\` sends your commits as they are; MControlProgram forwards them to that branch on GitHub (if the push says it awaits approval, run the same push again later). On 403 "expired git token", call this again and run \`refresh\`.`,
+      tool('clone_url', `A git remote on MControlProgram for the repo, with a token for you (valid 24h). It has origin's branches and tags, so after \`git fetch mcp\`, \`git log mcp/<base>..HEAD\` and \`git diff mcp/<base>\` show exactly what you have that MControlProgram doesn't. \`git push mcp HEAD:<branch prefix><name>\` sends your commits as they are (commit as the identity it returns, with an Assisted-by trailer); MControlProgram forwards them to that branch on GitHub (if the push says it awaits approval, run the same push again later). On 403 "expired git token", call this again and run \`refresh\`.`,
         {},
         async (r, _a, call, gate) => {
           await gate(['clone_url'], 'git remote URL and token', {});
@@ -522,86 +535,70 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           const key = `http.${url}.extraHeader`, val = `Authorization: Bearer ${token}`;
           return {
             url, expires: new Date(expires).toISOString(), branchPrefix: r.branchPrefix,
-            addRemote: `git remote add mcp ${q(url)} && git config ${q(key)} ${q(val)}`,
+            // commits under the host's identity push without custom_identity; the trailer names the agent
+            addRemote: `git remote add mcp ${q(url)} && git config ${q(key)} ${q(val)} && git config user.name ${q(r.h.committerName)} && git config user.email ${q(r.h.committerEmail)}`,
             refresh: `git config ${q(key)} ${q(val)}`,
-            clone: `git clone -o mcp -c ${q(`${key}=${val}`)} ${q(url)}`,
-            then: ['git fetch mcp', 'git log --oneline mcp/<base>..HEAD  # your commits MControlProgram lacks', `git push mcp HEAD:${r.branchPrefix}<name>`],
+            clone: `git clone -o mcp -c ${q(`${key}=${val}`)} -c ${q(`user.name=${r.h.committerName}`)} -c ${q(`user.email=${r.h.committerEmail}`)} ${q(url)}`,
+            then: ['git fetch mcp', 'git log --oneline mcp/<base>..HEAD  # your commits MControlProgram lacks',
+              ...(r.assistTrailer ? [`git commit --trailer ${q(`${r.assistTrailer}: <you, e.g. Claude Code (model)>`)} …`] : []), `git push mcp HEAD:${r.branchPrefix}<name>`],
+            identity: `${r.h.committerName} <${r.h.committerEmail}>: commit as this (the setup commands configure it); other authors or committers need approval`,
             ...(/\/\/(localhost|127\.)/.test(url) ? { note: "This URL is the server's default; if you can't reach it, ask the admin to set the server's Public URL." } : {}),
           };
         }),
-      tool('submit_patch', 'Apply your change on `base` (the commit you started from, see resolve), commit it and push it to an agent branch. `patch` is `git format-patch --stdout <base>` output (keeps your commits and messages; preferred) or a plain `git diff` plus `message`. Pushing over a branch you pushed before needs it to fast-forward, else `force: true`. Returns the pushed sha: `git fetch origin <branch>` to sync. Binary files need `format-patch --binary`.',
+      tool('submit_patch', 'Apply your change on `base` (the commit you started from, see resolve), commit it and push it to an agent branch. `patch` is `git format-patch --stdout <base>` output (keeps your commits and messages; preferred) or a plain `git diff` plus `message`. Pushing over a branch you pushed before needs it to fast-forward, else `force: true`. Commits are authored and committed by the git identity of MControlProgram, with an Assisted-by trailer naming you (`assisted_by`), so they get new shas: returns the pushed sha, `git fetch origin <branch>` to sync. Binary files need `format-patch --binary`.',
         {
           base: z.string().describe('Commit sha (or branch/tag) the patch was made on'),
           patch: z.string().describe('git format-patch --stdout output, or a unified git diff'),
           branch: z.string().describe('Agent branch to push to; the repo prefix is added if missing'),
           message: z.string().optional().describe('Commit message, required for a plain diff'),
           force: z.boolean().optional().describe('Allow rewriting the branch (not a fast-forward)'),
-          committer_name: z.string().optional().describe("Committer name (with committer_email) instead of the git host's; also the author of a plain diff's commit. A format-patch keeps its own authors."),
+          assisted_by: z.string().optional().describe('Who made the change, for the Assisted-by trailer, e.g. "Claude Code (claude-opus-5-5)". Default: your MCP client name and version.'),
+          committer_name: z.string().optional().describe("Author and committer name (with committer_email) instead of MControlProgram's git identity"),
           committer_email: z.string().optional().describe('Committer email, with committer_name'),
         },
         async (r, a, call, gate) => {
           if (Buffer.byteLength(a.patch) > r.maxPatchKB * 1024) throw new Error(`patch is over ${r.maxPatchKB} KB`);
           const branch = agentBranch(r, a.branch);
           const ident = identity(a.committer_name, a.committer_email);
-          const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal, ident }, call.log);
+          const assisted = assistTrailer(r.assistTrailer, a.assisted_by, call.client);
+          const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal, ident, assisted }, call.log);
           if (x.force && !a.force) throw new Error(`${branch} is at ${x.previous}, which your commits don't build on. Rebase onto it (resolve ${branch}), or pass force: true to replace it.`);
           const sensitive = x.files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
           const features = ['submit_patch', ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
           const what = `${x.force ? 'force-push' : 'push'} ${x.commits} commit(s) to ${branch}: ${x.files.length} file(s)${ident ? `, as ${ident.name} <${ident.email}>` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
-          const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force, ident });
+          const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force, ident, assisted });
           await push(run, r, x, branch, call.log);
           ctx.log.info(`${r.name}: ${what} (${x.sha.slice(0, 12)}) for ${call.principal ?? 'agent'}, ${by}`);
           return { branch, sha: x.sha, base: x.base, commits: x.commits, files: x.files, forced: x.force, sync: `git fetch origin ${branch} && git checkout ${x.sha}` };
         }),
-      tool('create_pr', 'Open a pull request from an agent branch (push it with submit_patch first). If one is already open for the branch, returns it.',
-        {
-          branch: z.string().describe('Agent branch (head)'),
-          base: z.string().optional().describe('Target branch; default: the first base branch, else the default branch'),
-          title: z.string(), body: z.string().optional(), draft: z.boolean().optional(),
-        },
-        async (r, a, call, gate) => {
-          const head = agentBranch(r, a.branch);
-          if (a.base && r.baseBranches.length && !r.baseBranches.includes(a.base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`);
-          await gate(['create_pr'], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}`, { head, base: a.base, title: a.title });
-          const base = a.base ?? r.baseBranches[0] ?? (await gh(r, 'GET', '', undefined, call.signal)).default_branch;
-          try {
-            return prSummary(await gh(r, 'POST', '/pulls', { title: a.title, head, base, body: a.body ?? '', draft: !!a.draft }, call.signal));
-          } catch (e: any) {
-            if (e.status !== 422 || !/already exists/i.test(JSON.stringify(e.body ?? ''))) throw e;
-            const open = await gh(r, 'GET', `/pulls?state=open&head=${encodeURIComponent(`${slug(r).split('/')[0]}:${head}`)}`, undefined, call.signal);
-            if (!open[0]) throw e;
-            return { ...prSummary(open[0]), existing: true };
-          }
-        }),
-      tool('pr', 'Without `number`: list pull requests. With `number`: the PR with its checks, reviews and comments.',
-        { number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open') },
-        async (r, a, call, gate) => {
-          await gate(['pr'], a.number ? `read PR #${a.number}` : 'list PRs', { number: a.number });
-          const s = call.signal;
-          if (!a.number) return (await gh(r, 'GET', `/pulls?state=${a.state ?? 'open'}&per_page=50`, undefined, s)).map(prSummary);
-          const p = await gh(r, 'GET', `/pulls/${a.number}`, undefined, s);
-          const [checks, status, reviews, comments, inline] = await Promise.all([
-            gh(r, 'GET', `/commits/${p.head.sha}/check-runs?per_page=100`, undefined, s).catch(() => ({ check_runs: [] })),
-            gh(r, 'GET', `/commits/${p.head.sha}/status`, undefined, s).catch(() => ({ statuses: [] })),
-            gh(r, 'GET', `/pulls/${a.number}/reviews?per_page=100`, undefined, s),
-            gh(r, 'GET', `/issues/${a.number}/comments?per_page=100`, undefined, s),
-            gh(r, 'GET', `/pulls/${a.number}/comments?per_page=100`, undefined, s),
-          ]);
-          return {
-            ...prSummary(p), headSha: p.head.sha, mergeable: p.mergeable, mergeableState: p.mergeable_state, body: p.body,
-            checks: [...checks.check_runs.map((c: any) => ({ name: c.name, status: c.status, conclusion: c.conclusion, url: c.html_url })),
-              ...status.statuses.map((c: any) => ({ name: c.context, status: 'completed', conclusion: c.state, url: c.target_url }))],
-            reviews: reviews.map((x: any) => ({ user: x.user?.login, state: x.state, body: x.body })),
-            comments: comments.map((x: any) => ({ user: x.user?.login, at: x.created_at, body: x.body })),
-            inline: inline.map((x: any) => ({ user: x.user?.login, path: x.path, line: x.line, body: x.body })),
-          };
-        }),
-      tool('comment', 'Comment on a pull request or issue.', { number: z.number().int(), body: z.string() },
-        async (r, a, call, gate) => {
-          await gate(['comment'], `comment on #${a.number}`, { number: a.number, body: a.body });
-          const c = await gh(r, 'POST', `/issues/${a.number}/comments`, { body: a.body }, call.signal);
-          return { url: c.html_url };
-        }),
+      ...(exposed.some((r) => r.h.provider !== 'none') ? [
+        tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it.',
+          {
+            branch: z.string().describe('Agent branch (head)'),
+            base: z.string().optional().describe('Target branch; default: the first base branch, else the default branch'),
+            title: z.string(), body: z.string().optional(), draft: z.boolean().optional(),
+          },
+          async (r, a, call, gate) => {
+            const head = agentBranch(r, a.branch);
+            if (a.base && r.baseBranches.length && !r.baseBranches.includes(a.base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`);
+            const p = provider(r.h, r, call.signal);
+            await gate(['create_pr'], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}`, { head, base: a.base, title: a.title });
+            return p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
+          }),
+        tool('pr', 'Without `number`: list pull requests (GitLab: merge requests). With `number`: the PR with its checks, reviews and comments.',
+          { number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open') },
+          async (r, a, call, gate) => {
+            const p = provider(r.h, r, call.signal);
+            await gate(['pr'], a.number ? `read PR #${a.number}` : 'list PRs', { number: a.number });
+            return a.number ? p.get(a.number) : p.list(a.state ?? 'open');
+          }),
+        tool('comment', 'Comment on a pull request (GitHub, Gitea: or an issue; GitLab: a merge request).', { number: z.number().int(), body: z.string() },
+          async (r, a, call, gate) => {
+            const p = provider(r.h, r, call.signal);
+            await gate(['comment'], `comment on #${a.number}`, { number: a.number, body: a.body });
+            return p.comment(a.number, a.body);
+          }),
+      ] : []),
     ];
 
     /** One pushed ref, already in the mirror: check it like submit_patch, ask, then push it to origin. */
@@ -614,17 +611,20 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
 new=${q(c.nu)}; prev=${q(prev)}
 force=0; if [ -n "$prev" ] && ! g merge-base --is-ancestor "$prev" "$new"; then force=1; fi
 if [ -n "$prev" ] && [ $force = 0 ]; then base=$prev; else base=$(g merge-base "$new" HEAD 2>/dev/null || g hash-object -t tree /dev/null); fi
-printf 'force=%s\\ncommits=%s\\n--files--\\n' "$force" "$(g rev-list --count "$new" --not "$base" 2>/dev/null || g rev-list --count "$new")"
+ids=$( { g log --format='%an <%ae>%n%cn <%ce>' "$new" --not "$base" 2>/dev/null || g log --format='%an <%ae>%n%cn <%ce>' "$new"; } | sort -u | tr '\\n' '\\t')
+printf 'force=%s\\ncommits=%s\\nids=%s\\n--files--\\n' "$force" "$(g rev-list --count "$new" --not "$base" 2>/dev/null || g rev-list --count "$new")" "$ids"
 g diff --name-only -z "$base" "$new"
 `, ctx.log));
         const [head, list = ''] = out.split('--files--\n');
-        const kv = Object.fromEntries(head.trim().split('\n').map((l) => l.split('=')));
+        const kv = Object.fromEntries(head.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
         const force = kv.force === '1', files = list.split('\0').filter(Boolean);
         const sensitive = files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
-        const features = ['git_push', ...(force ? ['force_push'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
-        const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
+        // commits are expected under the host's identity (clone_url sets it up); anyone else is custom_identity
+        const others = (kv.ids ?? '').split('\t').filter((x) => x && x !== `${r.h.committerName} <${r.h.committerEmail}>`);
+        const features = ['git_push', ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+        const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${others.length ? `, as ${others.slice(0, 3).join(', ')}` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
         try {
-          allowedBy = await rules.gate(call, entry, false, { feature: 'github_tool', summary: `${r.name}: ${what}`, subject: { upstream: r.name, tool: 'git_push', features, branch, sha: c.nu, force } },
+          allowedBy = await rules.gate(call, entry, false, { feature: 'git_tool', summary: `${r.name}: ${what}`, subject: { upstream: r.name, tool: 'git_push', features, branch, sha: c.nu, force } },
             features.map((f) => ({ tool: f, readOnly: RO[f] })));
         } catch (e) { (e as any).gated = true; throw e; }
         await locked(r, () => sh(run, r.h, `${inServe(r)}url=$(g remote get-url origin)
@@ -659,7 +659,7 @@ g -C "$S" push -q --no-verify "$W" ${q(`+${c.nu}:refs/remotes/origin/${branch}`)
       try {
         if (m[2] === 'info/refs') {
           if (push) { if (rules.verdict(r.name, 'git_push', false).action === 'deny') throw new Error(`${r.name}/git_push is disabled by the administrator. Tell the user if you need it.`); }
-          else await rules.gate(call, entry, true, { feature: 'github_tool', summary: `${r.name}: git fetch`, subject: { upstream: r.name, tool, features: [tool] } });
+          else await rules.gate(call, entry, true, { feature: 'git_tool', summary: `${r.name}: git fetch`, subject: { upstream: r.name, tool, features: [tool] } });
           // ponytail: fetches origin on every advertisement (~1s); cache for a few seconds if agents fetch in loops
           const out = await locked(r, async () => collect(await spawnOn(r.h, `${inServe(r)}[ -d "$S" ] || g init -q --bare "$S"
 fetch || true
@@ -740,7 +740,7 @@ const hostOf = (g: GlobalCfg, name: unknown) => { const h = g.hosts.find((x) => 
 /** Config with defaults filled in (fields added later, or left empty in the form). */
 function withDefaults(c: Record<string, any>): GlobalCfg {
   return {
-    hosts: (c.hosts ?? []).map((h: HostCfg) => ({ ...h, reposDir: h.reposDir || '~/mcontrolprogram-repos', sshKey: h.sshKey || '~/.ssh/mcontrolprogram_git', committerName: h.committerName || 'MControlProgram', committerEmail: h.committerEmail || 'mcontrolprogram@users.noreply.github.com' })),
+    hosts: (c.hosts ?? []).map((h: HostCfg) => ({ ...h, provider: h.provider ?? (h.token ? 'github' : 'none'), reposDir: h.reposDir || '~/mcontrolprogram-repos', sshKey: h.sshKey || '~/.ssh/mcontrolprogram_git', committerName: h.committerName || 'MControlProgram', committerEmail: h.committerEmail || 'mcontrolprogram@noreply.invalid' })),
     repos: (c.repos ?? []).map((r: RepoCfg) => ({ ...repoDefaults, ...r, branchPrefix: r.branchPrefix ?? 'agent/', maxPatchKB: r.maxPatchKB || 1024 })),
   };
 }

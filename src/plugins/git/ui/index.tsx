@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Alert, Field, Modal, api, type PluginUi } from '@mcontrolprogram/ui'
 import { ToolRules } from '@plugin/mcp'
 
-const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/github/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
+const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/git/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
 interface Scan { added: string[]; removed: string[]; errors: Record<string, string> }
 
 /** Repos come from the git hosts: rescan when the page opens (saves only on change), plus Rescan and Clone buttons. */
@@ -36,7 +36,7 @@ function CloneDialog({ onClose, onDone }: { onClose: () => void; onDone: (msg: s
   const [busy, setBusy] = useState(false)
   useEffect(() => {
     void api<{ id: string; globalConfig?: { hosts?: { name: string }[] } }[]>('/plugins').then((ps) => {
-      const hs = (ps.find((p) => p.id === 'github')?.globalConfig?.hosts ?? []).map((h) => h.name)
+      const hs = (ps.find((p) => p.id === 'git')?.globalConfig?.hosts ?? []).map((h) => h.name)
       setHosts(hs); setF((x) => ({ ...x, host: x.host || hs[0] || '' }))
     })
   }, [])
@@ -48,7 +48,7 @@ function CloneDialog({ onClose, onDone }: { onClose: () => void; onDone: (msg: s
     {err && <Alert kind="err">{err}</Alert>}
     {!hosts.length && <Alert kind="err">Add a git host first.</Alert>}
     <Field label="Git host"><select value={f.host} onChange={(e) => setF({ ...f, host: e.target.value })}>{hosts.map((h) => <option key={h}>{h}</option>)}</select></Field>
-    <Field label="Clone URL" desc="git@github.com:owner/repo.git uses the host's ssh key (run Set up host first). https:// works for public repos."><input value={f.url} onChange={(e) => setF({ ...f, url: e.target.value.trim() })} autoFocus /></Field>
+    <Field label="Clone URL" desc="git@host:owner/repo.git uses the host's ssh key (run Set up host first). https:// works for public repos."><input value={f.url} onChange={(e) => setF({ ...f, url: e.target.value.trim() })} autoFocus /></Field>
     <Field label="Directory (optional)" desc="Default: the repo name. Becomes the repo's name for agents."><input value={f.name} onChange={(e) => setF({ ...f, name: e.target.value.trim() })} /></Field>
     <div className="row" style={{ justifyContent: 'flex-end' }}>
       <button onClick={onClose}>Cancel</button>
@@ -59,14 +59,14 @@ function CloneDialog({ onClose, onDone }: { onClose: () => void; onDone: (msg: s
 
 const ui: PluginUi = {
   inventory: { repos: { AddButton: RepoButtons } },
-  Page: ({ plugin }) => <ToolRules plugin="github" groupLabel="repo" refresh="tool_rules"
+  Page: ({ plugin }) => <ToolRules plugin="git" groupLabel="repo" refresh="tool_rules"
     upstreams={((plugin.globalConfig?.repos ?? []) as { name: string }[]).map((r) => r.name)} />,
   asks: {
     // one call asks once for every feature it touches (push + force + sensitive paths): Enable/Disable sets them all
-    direct: (a) => a.feature === 'github_tool',
+    direct: (a) => a.feature === 'git_tool',
     setRule: async (a, rule) => {
       for (const tool of (a.subject?.features ?? [a.subject?.tool]) as string[])
-        await api(`/plugins/github/actions/set_tool_rule`, { method: 'POST', body: { upstream: a.subject?.upstream, tool, action: rule } })
+        await api(`/plugins/git/actions/set_tool_rule`, { method: 'POST', body: { upstream: a.subject?.upstream, tool, action: rule } })
     },
   },
 }

@@ -188,7 +188,7 @@ export default {
   `mcp` uses `ssh` this way to reach upstream servers through an SSH host.
 - Import a dependency's *types* only (`import type { SshApi } from '../ssh/index.js'`); values come from `dep()`.
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
-- Built-in providers: `mcp@0.2.0` exposes `McpApi` (`toolRuleStore(db, prefix, { defaultPolicy })`: per-group, per-tool allow/ask/deny rules, a default policy, a call log and `gate()`, in the caller's own `<prefix>_rules` / `_tools` / `_policy` / `_calls` tables, with the admin actions; its UI exports the `ToolRules` panel). github uses it. `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
+- Built-in providers: `mcp@0.2.0` exposes `McpApi` (`toolRuleStore(db, prefix, { defaultPolicy })`: per-group, per-tool allow/ask/deny rules, a default policy, a call log and `gate()`, in the caller's own `<prefix>_rules` / `_tools` / `_policy` / `_calls` tables, with the admin actions; its UI exports the `ToolRules` panel). git uses it. `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
   rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables, with the admin actions the rules
   UI uses, including `check` for server-side verdicts; plus `verdict`, `ruleMatches`, `normalizeBlock`).
   browserpaw keeps its browser list this way. `ssh@0.2.2` exposes `SshApi` (`hostNames`, `exec` (optional stdin `input` since 0.2.1), `spawn` (streaming binary stdin/stdout, since 0.2.2), `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
@@ -323,25 +323,38 @@ The container user must match the uid that owns those files (the image runs as 1
 
 The plugin page shows, for the host selected in the hosts table (click a row): the sandboxes (status, ports, workspaces; create, start, stop, remove), an expandable row per sandbox (run a command, publish/unpublish ports), the policy in two tabs: Network (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and Filesystem (read-only: which host paths may be mounted; sbx has no CLI to change them) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.
 
-## Built-in: github
+## Built-in: git
 
-Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram does the git work in clones on a **git host**: an SSH host from the ssh plugin (depends on `ssh@^0.2.2`: `exec` with stdin, streaming `spawn`) or this machine (**Native**). The push credential stays on that host: an ssh key that **Set up host** generates there (`~/.ssh/mcontrolprogram_git` by default). Agents never see it. Repo hooks never run (`core.hooksPath=/dev/null`). Pushes use `GIT_SSH_COMMAND` with that key, `IdentitiesOnly` and `StrictHostKeyChecking=accept-new`.
+Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. It works with any git server. PRs need a **PR provider** on the git host: GitHub, GitLab or Gitea / Forgejo.
+
+This plugin used to be called `github`. On startup MControlProgram moves the old plugin's config, server pairings, pending approvals and tables to `git`. A default instance named `github` becomes `git`, so agents' tools are renamed from `github_…` to `git_…`.
+
+ MControlProgram does the git work in clones on a **git host**: an SSH host from the ssh plugin (depends on `ssh@^0.2.2`: `exec` with stdin, streaming `spawn`) or this machine (**Native**). The push credential stays on that host: an ssh key that **Set up host** generates there (`~/.ssh/mcontrolprogram_git` by default). Agents never see it. Repo hooks never run (`core.hooksPath=/dev/null`). Pushes use `GIT_SSH_COMMAND` with that key, `IdentitiesOnly` and `StrictHostKeyChecking=accept-new`.
 
 **Git hosts:**
 
 - **Repos directory**: every clone directly under it is a repo.
 - **SSH key**
 - **Committer identity**
-- **GitHub token**: optional, kept by MControlProgram and used only for the REST API (PRs, checks, comments). It's never sent to the host.
+- **PR provider**: `none` (git only, the default), `github`, `gitlab` or `gitea` (also Forgejo). Hosts saved before the rename that have a token count as `github`.
+- **API token**: optional, kept by MControlProgram and used only for the provider's REST API (PRs, checks, comments). It's never sent to the host.
+- **API URL**: empty means it's worked out from the origin's host:
+  - GitHub: `api.github.com`, or `https://host/api/v3` for Enterprise
+  - GitLab: `https://host/api/v4`
+  - Gitea / Forgejo: `https://host/api/v1`
 
-**Set up host** checks for git, creates the repos directory and the key, and returns the public key and what `ssh -T git@github.com` answers. Add the key to GitHub as a deploy key with write access (one repo) or to a machine user, then run it again. A native host inside the container should keep the repos directory and key on the data volume (`/data/github/...`).
+`create_pr`, `pr` and `comment` give the same result shapes on every provider, and only appear when an exposed repo's host has a provider. Differences:
+- **GitLab**: `number` is the merge request's iid. Checks are its pipelines and reviews are its approvals. Comments go on merge requests only.
+- **Gitea / Forgejo**: checks come from commit statuses. Drafts are opened with a `WIP:` title.
+
+**Set up host** checks for git, creates the repos directory and the key, and returns the public key and what `ssh -T git@<forge>` answers. The forge is the API URL's host, or github.com / gitlab.com for those providers; with no provider the key isn't checked. Add the key to the git server as a deploy key with write access (one repo) or to a machine user, then run it again. A native host inside the container should keep the repos directory and key on the data volume (`/data/git/...`).
 
 **Repos** are discovered:
 
 - **When they're scanned:** whenever the plugin page opens, on **Rescan**, and after **Set up host** or **Clone repo…** (`git clone` into the repos directory with the host's key).
 - **New clones** are added, named after their directory, or `<host>-<dir>` when that name is taken.
 - **Clones gone from a reachable host** are dropped.
-- **Settings you edited** are kept: agent branch prefix (default `agent/`), base branches (PR targets, never pushed to), sensitive paths (default `.github/`, `CODEOWNERS`), max patch size.
+- **Settings you edited** are kept: agent branch prefix (default `agent/`), base branches (PR targets, never pushed to), sensitive paths (default `.github/`, `CODEOWNERS`), max patch size, and the **Assisted-by trailer** name (default `Assisted-by`; empty = no trailer).
 
 Pair repos with servers like any inventory.
 
@@ -350,21 +363,25 @@ The host's clone is only used through its object store and `origin`. Each patch 
 Agent workflow:
 
 1. `resolve {ref}`: fetch, then give the sha to `git fetch && git checkout <sha>` (no `ref`: list branches and tags). Refs are resolved as remote branches, then tags, then a sha the remote has.
-2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is `git format-patch --stdout <base>` output (applied with `git am --3way`; keeps the agent's commits, messages and authorship) or a plain `git diff` plus `message` (one commit by the bot, with a `Submitted-by: <agent>` trailer). Optional `committer_name` + `committer_email` replace the host's committer identity for that call: committer of every commit, and author of a plain diff's commit. A mailbox keeps its own authors. The push uses `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
+2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is either:
+   - `git format-patch --stdout <base>` output. It's applied with `git am --3way`, which keeps the agent's commits and messages, then each commit is re-signed: author and committer become the host's identity, and the trailer is added.
+   - A plain `git diff` plus `message`: one commit by the host's identity, with `Submitted-by: <agent>` and the trailer.
+
+   Every commit gets `<trailer>: <assisted_by>`, e.g. `Assisted-by: Claude Code (claude-opus-5-5)`. `assisted_by` is one line of at most 100 characters with no `<` or `>`. It defaults to the MCP client name and version the agent connected with (`ToolCallContext.client`), and a duplicate trailer isn't added. Optional `committer_name` + `committer_email` replace the host's identity, as author and committer, for that call. The push uses `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
 3. `create_pr` (returns the open PR if there is one), `pr` (list, or one PR with checks, reviews and comments) and `comment`.
 
 **MControlProgram as a git remote.** Agents that can reach the MCP server's port can skip patches:
 
 - **`clone_url`** gives `<server>/plugins/<prefix>/git/<repo>.git` and a per-agent token. The token is valid for 24 hours, stored hashed, and tied to the agent's principal and to this instance's repos. It also returns ready-made commands: `git remote add mcp …` plus `git config http.<url>.extraHeader "Authorization: Bearer …"` (the header is scoped to that URL, so it never goes to GitHub), a `clone`, and `refresh`. A missing or expired token gets a 403 telling the agent to call `clone_url` again (Basic auth with the token as password works too).
-- **Fetching** gives exactly what MControlProgram has, so `git log mcp/main..HEAD` and `git diff mcp/main` show the agent's changes.
+- **Fetching** gives exactly what MControlProgram has, so `git log mcp/main..HEAD` and `git diff mcp/main` show the agent's changes. The setup commands also set the clone's `user.name`/`user.email` to the host's identity, and suggest `git commit --trailer "Assisted-by: …"`.
   - It's served from a bare mirror, `.git/mcontrolprogram-serve.git`, created on first use. The mirror holds origin's branches (from the clone's `refs/remotes/origin/*`), the clone's tags, and agent pushes. Branches, stashes and commits that exist only in the host clone are never served.
   - Every fetch fetches origin first.
   - Only protocol v0 is served: v2 lets a client fetch any object by sha.
 - **`git push mcp HEAD:<prefix><name>`**: receive-pack stores the push in the mirror, then each ref is checked like `submit_patch` and pushed to origin with `--force-with-lease`.
   - The checks are: the `git_push` rule, plus `force_push` if it isn't a fast-forward and `sensitive_paths` for the files changed since the merge-base with the default branch.
-  - The commits go through unchanged, with the agent's authors and committers and no `Submitted-by` trailer.
+  - The commits go through unchanged: git can't rewrite them without the agent's `ok` lying about the sha. Commits whose author or committer isn't the host's identity add `custom_identity` to the checks. The trailer is up to the agent.
   - Only agent branches are accepted. Tags, deletes and base branches are refused, with a message naming the right ref.
   - Refused, failed or pending refs show as `! [remote rejected]` with the reason, and the mirror goes back to origin's value. While an ask is pending, re-running the same push checks back.
   - Pushes over the repo's max patch size get a 413. Objects are fsck'ed. Hooks never run.
 
-**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools (`clone_url` also covers fetching over HTTP), `git_push`, and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own committer name and email) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.
+**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools (`clone_url` also covers fetching over HTTP), `git_push`, and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own name and email, or pushed commits by anyone but the host's identity) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.
