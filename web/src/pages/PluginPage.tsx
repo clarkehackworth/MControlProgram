@@ -88,6 +88,7 @@ function Inventory({ p, k, servers, reload, options, ui, selected, onSelect }: {
   const [deleting, setDeleting] = useState<any>()
   const [pairing, setPairing] = useState<string>()
   const [out, setOut] = useState<any>()
+  const [running, setRunning] = useState<string>() // the row action in progress
   const { run, error, busy } = useAction()
   const save = (next: any[]) => api(`/plugins/${p.id}/config`, { method: 'PUT', body: { ...p.globalConfig, [k]: next } })
   return (
@@ -113,7 +114,7 @@ function Inventory({ p, k, servers, reload, options, ui, selected, onSelect }: {
               {fk.field ? <td><ServerToggles item={it.name} users={users} reload={reload} /></td> : ref ? <td>{refs(it.name).length ? <div className="chips">{refs(it.name).map((n) => <span key={n} className="chip small">{n}</span>)}</div> : <span className="muted small">—</span>}</td> : null}
               <td><div className="row" style={{ justifyContent: 'flex-end', flexWrap: 'wrap' }}>
                 {actions.filter((a) => !a.when || Object.entries(a.when).every(([f, v]) => it[f] === v)).map((a) => <button key={a.key} className="sm" disabled={busy}
-                  onClick={() => run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }) })}>{a.title}</button>)}
+                  onClick={() => { setRunning(`${a.key}\0${it.name}`); void run(async () => { const r = await api<{ result: any }>(`/plugins/${p.id}/actions/${a.key}`, { method: 'POST', body: { name: it.name } }); setOut({ action: `${a.title} — ${it.name}`, ...r.result }); await reload() /* actions may save config (e.g. a scan) */ }).finally(() => setRunning(undefined)) }}>{running === `${a.key}\0${it.name}` ? `${a.title}…` : a.title}</button>)}
                 {fk.field && <button className="sm" onClick={() => setPairing(it.name)}>Pair server</button>}
                 <button className="sm" onClick={() => setEditing({ index: i, value: it })}>Edit</button>
                 <button className="sm danger" disabled={busy} onClick={() => { if (ui.Delete?.when(it)) setDeleting(it); else if (window.confirm(`Delete "${it.name}"?${refs(it.name).length ? ` It is used by ${ref!.inventory}: ${refs(it.name).join(', ')}, which will stop working.` : ''}`)) void run(async () => { await save(items.filter((_, j) => j !== i)); await reload() }) }}>Delete</button>
