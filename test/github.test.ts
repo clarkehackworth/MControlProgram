@@ -87,6 +87,17 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   assert.equal(r2.forced, true);
   assert.deepEqual(asks.at(-1).subject.features, ['submit_patch', 'force_push', 'sensitive_paths']);
   assert.match(sh(origin, 'log', '-1', '--format=%B', 'refs/heads/agent/feat'), /Submitted-by: agent1 via MControlProgram/);
+
+  // committer identity from the agent: committer (and author of a plain diff), its own rule feature
+  fs.writeFileSync(path.join(clone, 'README.md'), 'hi\n');
+  const readme = sh(clone, 'diff', 'README.md') + '\n';
+  await assert.rejects(t('submit_patch').handler({ base: r2.sha, patch: readme, branch: 'feat', message: 'm', committer_name: 'Ada' }, call), /go together/);
+  await assert.rejects(t('submit_patch').handler({ base: r2.sha, patch: readme, branch: 'feat', message: 'm', committer_name: 'Ada', committer_email: 'x>@y\nz' }, call), /invalid committer_email/);
+  const r3 = json(await t('submit_patch').handler({ base: r2.sha, patch: readme, branch: 'feat', message: 'readme: hi', committer_name: 'Ada Lovelace', committer_email: 'ada@example.com' }, call));
+  assert.equal(sh(origin, 'log', '-1', '--format=%an <%ae>|%cn <%ce>', r3.sha), 'Ada Lovelace <ada@example.com>|Ada Lovelace <ada@example.com>');
+  assert.deepEqual(asks.at(-1).subject.features, ['submit_patch', 'custom_identity']);
+  assert.match(asks.at(-1).summary, /as Ada Lovelace <ada@example\.com>/);
+
   assert.equal(sh(origin, 'rev-parse', 'refs/heads/main'), main, 'base branch untouched');
   await assert.rejects(t('submit_patch').handler({ base: 'deadbeef', patch: diff, branch: 'x', message: 'm' }, call), /not on the remote/);
   await assert.rejects(t('submit_patch').handler({ base: main, patch: 'diff --git a/nope b/nope\n--- a/nope\n+++ b/nope\n@@ -1 +1 @@\n-a\n+b\n', branch: 'x', message: 'm' }, call), /does not apply/);

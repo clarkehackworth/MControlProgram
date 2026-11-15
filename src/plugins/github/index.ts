@@ -33,6 +33,7 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'resolve', ro: true, description: 'Fetch, then resolve a branch, tag or sha to a commit, or list branches and tags' },
   { name: 'submit_patch', ro: false, description: 'Apply a patch on a base commit, commit it and push it to an agent branch' },
   { name: 'force_push', ro: false, description: 'submit_patch that rewrites an agent branch (not a fast-forward)' },
+  { name: 'custom_identity', ro: false, description: 'submit_patch with a committer name and email from the agent instead of the git host\'s' },
   { name: 'sensitive_paths', ro: false, description: "submit_patch touching the repo's sensitive paths (CI workflows, CODEOWNERS…)" },
   { name: 'create_pr', ro: false, description: 'Open a pull request from an agent branch' },
   { name: 'pr', ro: true, description: 'List pull requests, or read one: state, checks, reviews and comments' },
@@ -127,11 +128,23 @@ const ref = (s: string) => { if (!REF.test(s)) throw new Error(`invalid ref "${s
 
 interface Applied { base: string; sha: string; previous?: string; force: boolean; commits: number; files: string[] }
 /** Fetch, then apply `patch` on `base` in a throwaway worktree and commit it. Nothing is pushed; the commit stays in the repo's objects. */
-async function apply(run: Run, r: Repo, a: { base: string; patch: string; branch: string; message?: string; principal?: string }, log: ScopedLogger): Promise<Applied> {
+/** A committer identity from an agent: both fields, nothing that could break out of a header. */
+export function identity(name?: string, email?: string): { name: string; email: string } | undefined {
+  if (!name && !email) return undefined;
+  if (!name?.trim() || !email?.trim()) throw new Error('committer_name and committer_email go together');
+  const n = name.trim(), e = email.trim();
+  if (n.length > 100 || /[<>\p{Cc}]/u.test(n)) throw new Error('invalid committer_name');
+  if (e.length > 254 || !/^[^\s<>@]+@[^\s<>@]+$/.test(e)) throw new Error('invalid committer_email');
+  return { name: n, email: e };
+}
+
+async function apply(run: Run, r: Repo, a: { base: string; patch: string; branch: string; message?: string; principal?: string; ident?: { name: string; email: string } }, log: ScopedLogger): Promise<Applied> {
   const mbox = isMbox(a.patch);
   if (!mbox && !a.message?.trim()) throw new Error('a plain diff needs a commit message (or send `git format-patch` output)');
   const commit = `g commit -q --no-gpg-sign -m ${q(a.message ?? '')}${a.principal ? ` --trailer ${q(`Submitted-by: ${a.principal} via MControlProgram`)}` : ''}`;
-  const script = `${prelude(r.h)}P=$(mktemp); trap 'rm -f "$P"' EXIT; cat > "$P"
+  // committer of every commit, and author of a plain diff's commit (a mailbox keeps its own authors)
+  const ident = a.ident ? `export GIT_COMMITTER_NAME=${q(a.ident.name)} GIT_COMMITTER_EMAIL=${q(a.ident.email)} GIT_AUTHOR_NAME=${q(a.ident.name)} GIT_AUTHOR_EMAIL=${q(a.ident.email)}\n` : '';
+  const script = `${prelude(r.h)}${ident}P=$(mktemp); trap 'rm -f "$P"' EXIT; cat > "$P"
 cd ${qp(r.path)}
 fetch
 base=$(res ${q(ref(a.base))}) || { echo "base not on the remote" >&2; exit 3; }
@@ -415,16 +428,19 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           branch: z.string().describe('Agent branch to push to; the repo prefix is added if missing'),
           message: z.string().optional().describe('Commit message, required for a plain diff'),
           force: z.boolean().optional().describe('Allow rewriting the branch (not a fast-forward)'),
+          committer_name: z.string().optional().describe("Committer name (with committer_email) instead of the git host's; also the author of a plain diff's commit. A format-patch keeps its own authors."),
+          committer_email: z.string().optional().describe('Committer email, with committer_name'),
         },
         async (r, a, call, gate) => {
           if (Buffer.byteLength(a.patch) > r.maxPatchKB * 1024) throw new Error(`patch is over ${r.maxPatchKB} KB`);
           const branch = agentBranch(r, a.branch);
-          const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal }, call.log);
+          const ident = identity(a.committer_name, a.committer_email);
+          const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal, ident }, call.log);
           if (x.force && !a.force) throw new Error(`${branch} is at ${x.previous}, which your commits don't build on. Rebase onto it (resolve ${branch}), or pass force: true to replace it.`);
           const sensitive = x.files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
-          const features = ['submit_patch', ...(x.force ? ['force_push'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
-          const what = `${x.force ? 'force-push' : 'push'} ${x.commits} commit(s) to ${branch}: ${x.files.length} file(s)${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
-          const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force });
+          const features = ['submit_patch', ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+          const what = `${x.force ? 'force-push' : 'push'} ${x.commits} commit(s) to ${branch}: ${x.files.length} file(s)${ident ? `, as ${ident.name} <${ident.email}>` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
+          const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force, ident });
           await push(run, r, x, branch, call.log);
           ctx.log.info(`${r.name}: ${what} (${x.sha.slice(0, 12)}) for ${call.principal ?? 'agent'}, ${by}`);
           return { branch, sha: x.sha, base: x.base, commits: x.commits, files: x.files, forced: x.force, sync: `git fetch origin ${branch} && git checkout ${x.sha}` };
