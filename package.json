@@ -2,7 +2,7 @@
   "name": "mcontrolprogram",
   "version": "0.1.5",
   "description": "MControlProgram - MCP gateway with plugin architecture",
-  "main": "index.js",
+  "main": "dist/main.js",
   "scripts": {
     "test": "node --test --import tsx 'test/**/*.test.ts'",
     "dev": "tsx watch src/main.ts",
