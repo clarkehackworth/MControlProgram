@@ -227,6 +227,33 @@ test('PR providers: GitLab merge requests, Gitea, none', async () => {
   assert.ok(!inst.tools.some((t: any) => ['create_pr', 'pr', 'comment'].includes(t.name)) && inst.tools.some((t: any) => t.name === 'clone_url'));
 });
 
+test('gh provider: PRs through the gh CLI on the git host, with its login', async () => {
+  // a fake gh: logs its args and stdin, answers like `gh api`
+  const bin = path.join(tmp, 'bin'); fs.mkdirSync(bin, { recursive: true });
+  const log1 = path.join(tmp, 'gh.log');
+  fs.writeFileSync(path.join(bin, 'gh'), `#!/bin/sh
+echo "$*" >> ${log1}
+case "$*" in
+  "auth status") echo "  ✓ Logged in to github.com account bot (keyring)"; exit 0;;
+  *"-X POST"*) cat >> ${log1}; echo '{"message":"Validation Failed","errors":[{"message":"A pull request already exists for o:agent/feat."}]}'; echo "gh: Validation Failed (HTTP 422)" >&2; exit 1;;
+  *) echo '[{"number":9,"title":"t","state":"open","head":{"ref":"agent/feat"},"base":{"ref":"main"},"html_url":"u"}]';;
+esac
+`, { mode: 0o755 });
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath}`;
+  try {
+    const hosts = [{ ...config.hosts[0], provider: 'gh', token: undefined }];
+    const s = await plugin.globalActions!.setup_host.run({ name: 'local' }, { config: { ...config, hosts }, setConfig: async () => {}, log, dep: () => undefined } as any) as any;
+    assert.match(s.gh, /Logged in to github\.com/); assert.equal(s.ghNext, undefined);
+    const inst: any = await plugin.create({ instanceId: 'i3', instanceName: 'git', serverId: 's', config: { repos: ['demo'] }, pluginConfig: { ...config, hosts, repos: config.repos.map((r: any) => ({ ...r, url: 'git@github.com:o/demo.git' })) }, global: () => ({}) as any, log, dep: () => undefined } as any);
+    const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async () => 'approved by test' };
+    const pr = JSON.parse((await inst.tools.find((x: any) => x.name === 'create_pr').handler({ branch: 'feat', title: 't', base: 'main' }, call)).content[0].text);
+    assert.deepEqual([pr.number, pr.existing], [9, true]);
+    const lines = fs.readFileSync(log1, 'utf8').split('\n');
+    assert.ok(lines.includes("api -X POST -H X-GitHub-Api-Version: 2022-11-28 repos/o/demo/pulls --input -"), lines.join('\n'));
+    assert.ok(lines.some((l) => l.includes('"head":"agent/feat"')), 'body on stdin');
+  } finally { process.env.PATH = oldPath; }
+});
+
 test('a clone removed from the host drops out of the inventory', async () => {
   fs.rmSync(path.join(tmp, 'repos/demo'), { recursive: true });
   assert.deepEqual((await act('scan', { name: 'local' })).removed, ['demo']);

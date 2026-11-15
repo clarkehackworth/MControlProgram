@@ -324,11 +324,12 @@ export async function scan(run: Run, a: Pick<PluginActionContext, 'config' | 'se
 /** The ssh host `ssh -T git@…` checks the key against: the provider's (API URL's host, github.com), if any. */
 const forgeSsh = (h: HostCfg) => {
   if (h.apiUrl) try { return new URL(h.apiUrl).hostname.replace(/^api\./, ''); } catch { return undefined; }
-  return h.provider === 'github' ? 'github.com' : h.provider === 'gitlab' ? 'gitlab.com' : undefined;
+  return h.provider === 'github' || h.provider === 'gh' ? 'github.com' : h.provider === 'gitlab' ? 'gitlab.com' : undefined;
 };
 /** git present, repos dir and ssh key created if missing; the public key to add to the git server, and whether the forge accepts it. */
 async function setupHost(run: Run, h: HostCfg, log: ScopedLogger) {
   const forge = forgeSsh(h);
+  const ghStatus = h.provider === 'gh' ? `echo "gh=$(command -v gh >/dev/null && { GH_PROMPT_DISABLED=1 gh auth status 2>&1 | grep -Ei 'logged in|not logged|failed' | head -1; } || echo 'gh is not installed')"` : '';
   const out = await sh(run, h, `set -e
 command -v git >/dev/null || { echo "git is not installed on this host" >&2; exit 2; }
 echo "git=$(git --version)"
@@ -337,11 +338,13 @@ mkdir -p "$(dirname "$K")" ${qp(h.reposDir)}
 chmod 700 "$(dirname "$K")" 2>/dev/null || true
 [ -f "$K" ] || { ssh-keygen -q -t ed25519 -N '' -C "mcontrolprogram-git@$(hostname)" -f "$K" && echo "created=1"; }
 echo "pub=$(cat "$K.pub")"
+${ghStatus}
 ${forge ? `echo "auth=$(ssh -i "$K" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -T ${q(`git@${forge}`)} 2>&1 | grep -Ei '^Hi |welcome|successfully authenticated|denied' | head -1 || true)"` : ''}
 `, log);
   const kv = Object.fromEntries(out.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
   const auth = !forge ? 'not checked: set a PR provider to test the key against it' : kv.auth || `no answer from ${forge} (blocked network?)`;
-  return { git: kv.git, keyCreated: !!kv.created, publicKey: kv.pub, auth, keyAccepted: /^Hi |welcome|successfully authenticated/i.test(auth) };
+  return { git: kv.git, keyCreated: !!kv.created, publicKey: kv.pub, auth, keyAccepted: /^Hi |welcome|successfully authenticated/i.test(auth),
+    ...(h.provider === 'gh' ? { gh: (kv.gh || 'no answer').trim(), ...(/logged in to/i.test(kv.gh ?? '') ? {} : { ghNext: 'Run `gh auth login` on the git host as the user MControlProgram runs git as (scopes: repo), then Set up host again.' }) } : {}) };
 }
 
 /** Clone `url` into the host's repos dir with the host's key. */
@@ -370,7 +373,7 @@ const hostSchema = {
     native: { type: 'boolean', title: 'Native (this machine)', default: false, description: 'Run git on the machine MControlProgram runs on (inside its container if it is containerised), without ssh. Paths and ~ are the MControlProgram user\'s.' },
     sshHost: { type: 'string', title: 'SSH host', description: 'Host from the SSH plugin inventory (pinned host key) with git installed. Commands run as that user. Not used for native hosts.', 'x-options-from': 'ssh:hosts' },
     reposDir: { type: 'string', title: 'Repos directory', description: 'Clones directly under it are picked up as repos. ~/ = the host user\'s home. Native host in a container: use a path on the data volume (e.g. /data/git/repos, and SSH key /data/git/id_ed25519) so clones and key survive rebuilds.', default: '~/mcontrolprogram-repos' },
-    provider: { type: 'string', title: 'PR provider', enum: [...PROVIDERS], default: 'none', description: 'Forge behind these repos, for create_pr / pr / comment (with the token below). none = git only: any git server.' },
+    provider: { type: 'string', title: 'PR provider', enum: [...PROVIDERS], default: 'none', description: 'Forge behind these repos, for create_pr / pr / comment. none = git only: any git server. gh = GitHub through the gh CLI on the git host, using its `gh auth login` (no token here). The others use the API token below.' },
     description: { type: 'string', title: 'Description', 'x-no-column': true },
     sshKey: { type: 'string', title: 'SSH key', description: 'Private key on the host for pushing over ssh; "Set up host" creates it. Add its public key to the git server: a deploy key with write access (one repo) or a machine user\'s key.', default: '~/.ssh/mcontrolprogram_git', 'x-no-column': true },
     committerName: { type: 'string', title: 'Committer name', default: 'MControlProgram', 'x-no-column': true },
@@ -581,20 +584,20 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           async (r, a, call, gate) => {
             const head = agentBranch(r, a.branch);
             if (a.base && r.baseBranches.length && !r.baseBranches.includes(a.base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`);
-            const p = provider(r.h, r, call.signal);
+            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
             await gate(['create_pr'], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}`, { head, base: a.base, title: a.title });
             return p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
           }),
         tool('pr', 'Without `number`: list pull requests (GitLab: merge requests). With `number`: the PR with its checks, reviews and comments.',
           { number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open') },
           async (r, a, call, gate) => {
-            const p = provider(r.h, r, call.signal);
+            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
             await gate(['pr'], a.number ? `read PR #${a.number}` : 'list PRs', { number: a.number });
             return a.number ? p.get(a.number) : p.list(a.state ?? 'open');
           }),
         tool('comment', 'Comment on a pull request (GitHub, Gitea: or an issue; GitLab: a merge request).', { number: z.number().int(), body: z.string() },
           async (r, a, call, gate) => {
-            const p = provider(r.h, r, call.signal);
+            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
             await gate(['comment'], `comment on #${a.number}`, { number: a.number, body: a.body });
             return p.comment(a.number, a.body);
           }),

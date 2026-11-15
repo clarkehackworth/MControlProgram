@@ -2,7 +2,8 @@
  * PR providers: the REST calls behind create_pr / pr / comment, per git host. Each returns the same shapes, so the
  * tools and agents don't care which forge is behind a repo. The token stays here: never on the git host or agents.
  */
-export const PROVIDERS = ['none', 'github', 'gitlab', 'gitea'] as const;
+/** `gh` = GitHub through the `gh` CLI on the git host, with its own login (`gh auth login` there): no token in MControlProgram. */
+export const PROVIDERS = ['none', 'github', 'gh', 'gitlab', 'gitea'] as const;
 export type ProviderName = (typeof PROVIDERS)[number];
 
 export interface Pr { number: number; title: string; state: 'open' | 'closed' | 'merged'; draft?: boolean; head: string; base: string; url: string; user?: string; updated?: string }
@@ -22,6 +23,8 @@ export interface Provider {
   comment(n: number, body: string): Promise<{ url?: string }>;
 }
 export interface ProviderHost { name: string; provider?: ProviderName; token?: string; apiUrl?: string }
+/** Runs a script on the git host (for `gh`). */
+export type HostRun = (script: string, input?: string) => Promise<{ stdout: string; stderr: string; code: number | null }>;
 
 /** Host and repo path (`owner/repo`, `group/sub/repo`) of an origin URL: https, ssh:// or scp-style. */
 export function origin(r: { name: string; url?: string }): { host: string; path: string } {
@@ -41,9 +44,31 @@ export function apiBase(p: ProviderName, h: ProviderHost, host: string) {
   return `https://${host}/api/${p === 'gitlab' ? 'v4' : 'v1'}`;
 }
 
-export function provider(h: ProviderHost, r: { name: string; url?: string }, signal?: AbortSignal): Provider {
+const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+/** `gh api` on the host: same calls as the github provider, gh's login instead of a token. */
+function ghApi(h: ProviderHost, host: string, path: string, run: HostRun): Api {
+  const hostname = h.apiUrl ? (() => { try { return new URL(h.apiUrl!).hostname.replace(/^api\./, ''); } catch { return host; } })() : host;
+  return async (method, p, body) => {
+    const script = `command -v gh >/dev/null || { echo "gh is not installed on git host ${h.name.replace(/[^\w.-]/g, '')}" >&2; exit 127; }
+GH_PROMPT_DISABLED=1 NO_COLOR=1 gh api ${hostname === 'github.com' ? '' : `--hostname ${sq(hostname)} `}-X ${method} -H 'X-GitHub-Api-Version: 2022-11-28' ${sq(`repos/${path}${p}`)}${body === undefined ? '' : ' --input -'}`;
+    const r = await run(script, body === undefined ? undefined : JSON.stringify(body));
+    const j: any = (() => { try { return JSON.parse(r.stdout); } catch { return null; } })();
+    if (r.code !== 0) {
+      const status = Number(/\(HTTP (\d{3})\)/.exec(r.stderr)?.[1] ?? 0);
+      throw Object.assign(new Error(`gh ${method} ${p}: ${(r.stderr.trim() || j?.message || `exit ${r.code}`).split('\n')[0]}${j?.errors ? ' ' + JSON.stringify(j.errors) : ''}`), { status, body: j });
+    }
+    return j;
+  };
+}
+
+export function provider(h: ProviderHost, r: { name: string; url?: string }, signal?: AbortSignal, run?: HostRun): Provider {
   const p = h.provider ?? 'none';
   if (p === 'none') throw new Error(`git host "${h.name}" has no PR provider; set one (and a token) on the host to use PRs`);
+  if (p === 'gh') {
+    if (!run) throw new Error('the gh provider needs the git host');
+    const o = origin(r);
+    return githubLike(ghApi(h, o.host, o.path, run), false);
+  }
   if (!h.token) throw new Error(`git host "${h.name}" has no API token; PRs and comments need one`);
   const o = origin(r);
   const token = h.token;

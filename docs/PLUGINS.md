@@ -337,6 +337,7 @@ This plugin used to be called `github`. On startup MControlProgram moves the old
 - **SSH key**
 - **Committer identity**
 - **PR provider**: `none` (git only, the default), `github`, `gitlab` or `gitea` (also Forgejo). Hosts saved before the rename that have a token count as `github`.
+  - `gh` is GitHub through the `gh` CLI on the git host. It uses the host's own `gh auth login` (scope `repo`), so MControlProgram holds no token. The calls are the `github` provider's, made with `gh api`; `--hostname` follows the origin or API URL, for Enterprise. `gh` must be installed and logged in as the user that runs git there. **Set up host** reports `gh auth status`. The trade-off: that login is a credential on the host, usable by anything else running as that user.
 - **API token**: optional, kept by MControlProgram and used only for the provider's REST API (PRs, checks, comments). It's never sent to the host.
 - **API URL**: empty means it's worked out from the origin's host:
   - GitHub: `api.github.com`, or `https://host/api/v3` for Enterprise
