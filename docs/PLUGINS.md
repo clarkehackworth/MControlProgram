@@ -184,7 +184,7 @@ export default {
   `mcp` uses `ssh` this way to reach upstream servers through an SSH host.
 - Import a dependency's *types* only (`import type { SshApi } from '../ssh/index.js'`); values come from `dep()`.
 - The provider exports what it offers as `api` on its plugin object, and bumps `version` when that changes (semver: a breaking change bumps the major version, or the minor version while it is 0.x).
-- Built-in providers: `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
+- Built-in providers: `mcp@0.2.0` exposes `McpApi` (`toolRuleStore(db, prefix, { defaultPolicy })`: per-group, per-tool allow/ask/deny rules, a default policy, a call log and `gate()`, in the caller's own `<prefix>_rules` / `_tools` / `_policy` / `_calls` tables, with the admin actions; its UI exports the `ToolRules` panel). github uses it. `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
   rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables, with the admin actions the rules
   UI uses, including `check` for server-side verdicts; plus `verdict`, `ruleMatches`, `normalizeBlock`).
   browserpaw keeps its browser list this way. `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
@@ -318,3 +318,17 @@ When MControlProgram runs in a container on the Docker host, mount sbx into it a
 The container user must match the uid that owns those files (the image runs as 1000). See the commented lines in `docker-compose.yml`. Anyone with access to these mounts controls all of that user's sandboxes.
 
 The plugin page shows, for the host selected in the hosts table (click a row): the sandboxes (status, ports, workspaces; create, start, stop, remove), an expandable row per sandbox (run a command, publish/unpublish ports), the policy in two tabs: Network (add allow/deny rules globally or for the selected sandbox, remove rules, check a host or URL) and Filesystem (read-only: which host paths may be mounted; sbx has no CLI to change them) and the network log (allowed and blocked connections, with **Allow host** on blocked ones). It runs the agent tools through the hidden `call` global action, so it applies the same workspace-root checks but not the server's Tool rules.
+
+## Built-in: github
+
+Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram keeps a bare mirror per repo (`data/github/<repo>.git`) and the write token. The token goes to git only through env-only config (`GIT_CONFIG_*`, scoped to the repo's origin), never argv, `.git/config` or tool output. Repo hooks never run (`core.hooksPath=/dev/null`).
+
+**Repositories** (plugin-wide): HTTPS clone URL, fine-grained token (Contents and Pull requests: read & write), committer identity, **agent branch prefix** (default `agent/`; agents push only there), **base branches** (PR targets, never pushed to), **sensitive paths** (default `.github/`, `CODEOWNERS`), max patch size. **Check repo** fetches and reports the default branch and whether the token can push. Instances pick which repos they expose.
+
+Agent workflow:
+
+1. `resolve {ref}`: fetch, then give the sha to `git fetch && git checkout <sha>` (no `ref`: list branches and tags).
+2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is `git format-patch --stdout <base>` output (applied with `git am --3way`; keeps the agent's commits, messages and authorship) or a plain `git diff` plus `message` (one commit by the bot, with a `Submitted-by: <agent>` trailer). Each call applies in a throwaway worktree, then pushes with `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
+3. `create_pr` (returns the open PR if there is one), `pr` (list, or one PR with checks, reviews and comments) and `comment`.
+
+**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools and two git features: `force_push` (a submit that isn't a fast-forward) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.

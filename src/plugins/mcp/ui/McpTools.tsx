@@ -5,7 +5,6 @@ type Action = 'allow' | 'ask' | 'deny'
 interface Tool { upstream: string; tool: string; description: string; read_only: boolean; rule: Action | null }
 interface Call { id: number; ts: number; server_id: string; instance: string; principal: string | null; upstream: string; tool: string; args: string | null; error: string | null; blocked: string | null; allowed_by: string | null; ms: number | null; now: Action }
 
-const act = <T,>(key: string, body: Record<string, unknown> = {}) => api<{ result: T }>(`/plugins/mcp/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
 type Policy = Action | 'readonly'
 const POLICIES = [['allow', 'Allow by default', 'Agents can call any tool not set to ask or deny.'], ['readonly', 'Allow read-only, ask by default', 'Tools the server marks read-only run; the rest wait for your approval.'], ['ask', 'Ask by default', 'Tools without their own rule wait for your approval.'], ['deny', 'Deny by default', 'Agents can call only tools set to allow.']] as const
 const ACTIONS: Action[] = ['allow', 'ask', 'deny']
@@ -13,16 +12,23 @@ const RANGES: [string, number][] = [['Last 15 minutes', 15 * 60e3], ['Last hour'
 const fmt = (ts: number) => { const d = new Date(ts); return d.toDateString() === new Date().toDateString() ? d.toLocaleTimeString() : d.toLocaleString() }
 const asked = (b: string | null) => !!b?.startsWith('awaiting approval')
 
-/** MCP pass-through: per-tool allow/ask/deny across upstream servers, default policy, pending asks and the call log. */
-export default function McpTools({ upstreams }: { upstreams: string[] }) {
+type Act = <T>(key: string, body?: Record<string, unknown>) => Promise<T>
+const actOf = (plugin: string): Act => (key, body = {}) => api<{ result: any }>(`/plugins/${plugin}/actions/${key}`, { method: 'POST', body }).then((r) => r.result)
+
+/**
+ * Per-tool allow/ask/deny across groups (MCP: upstream servers; github: repos), default policy, pending asks and the call log.
+ * Reused by plugins that depend on mcp (`@plugin/mcp`); `refresh` = the global action that lists a group's tools.
+ */
+export default function McpTools({ upstreams, plugin = 'mcp', refresh: refreshAction = 'test_server', groupLabel = 'upstream' }: { upstreams: string[]; plugin?: string; refresh?: string; groupLabel?: string }) {
+  const act = actOf(plugin)
   const [state, setState] = useState<{ policy?: Policy; tools: Tool[] }>({ tools: [] }) // no policy until loaded: no radio lit
   const { run, error, busy } = useAction()
-  const load = useCallback(() => run(async () => setState(await act('tool_rules'))), []) // eslint-disable-line react-hooks/exhaustive-deps
+  const load = useCallback(() => run(async () => setState(await act<{ policy?: Policy; tools: Tool[] }>('tool_rules'))), []) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => { void load() }, [load])
   const { policy, tools } = state
   const setRule = (t: Tool, action: Action | '') => run(async () => { await act('set_tool_rule', { upstream: t.upstream, tool: t.tool, action }); await load() })
   const setPolicy = (p: Policy) => { if (window.confirm(`${POLICIES.find((x) => x[0] === p)![1]}?\n\nTools without their own rule will ${p === 'allow' ? 'run without asking' : p === 'readonly' ? 'run if read-only, otherwise wait for your approval' : p === 'ask' ? 'wait for your approval' : 'be refused'}.`)) void run(async () => { await act('set_policy', { policy: p }); await load() }) }
-  const refresh = (name: string) => run(async () => { await act('test_server', { name }); await load() })
+  const refresh = (name: string) => run(async () => { await act(refreshAction, { name }); await load() })
   const unseen = upstreams.filter((u) => !tools.some((t) => t.upstream === u))
   const groups = [...new Set(tools.map((t) => t.upstream))]
   const [expanded, setExpanded] = useState<Set<string>>(new Set()) // groups start closed
@@ -30,7 +36,7 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
 
   return (
     <>
-      <PendingAsks plugin="mcp" title="Tool calls waiting for approval" hideEmpty onChange={load} />
+      <PendingAsks plugin={plugin} title="Tool calls waiting for approval" hideEmpty onChange={load} />
       <div className="card">
         <h2 style={{ margin: 0 }}>Access rules</h2>
         {error && <Alert kind="err">{error}</Alert>}
@@ -67,21 +73,21 @@ export default function McpTools({ upstreams }: { upstreams: string[] }) {
           <tbody>
             {unseen.map((u) => <tr key={u}><td colSpan={3} className="muted small"><strong>{u}</strong>: tools not listed yet. <button className="sm" disabled={busy} onClick={() => void refresh(u)}>Fetch tools</button></td></tr>)}
             {!policy && <LoadingRow cols={3} />}
-            {policy && tools.length === 0 && unseen.length === 0 && <tr><td colSpan={3} className="muted">No upstream servers configured.</td></tr>}
+            {policy && tools.length === 0 && unseen.length === 0 && <tr><td colSpan={3} className="muted">No {groupLabel}s configured.</td></tr>}
           </tbody>
         </table>
         <p className="muted small" style={{ marginBottom: 0 }}>
-          Applies to every MCP pass-through instance on every server, immediately (connections are kept). Tools hidden by an instance's expose/hide lists aren't offered to agents at all.
-          A tool's own rule wins over the default; a blue button is the tool's own rule; click it again to go back to the default. Click a server to show its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
-          The list updates whenever an instance connects or you run <em>Test server</em>.
+          Applies to every instance of this plugin on every server, immediately (connections are kept). Tools hidden by an instance's expose/hide lists aren't offered to agents at all.
+          A tool's own rule wins over the default; a blue button is the tool's own rule; click it again to go back to the default. Click a {groupLabel} to show its tools. Asks block the agent for a short while, then it is told to check back; decide here or on the Approvals page.
+          {plugin === 'mcp' && <>The list updates whenever an instance connects or you run <em>Test server</em>.</>}
         </p>
       </div>
-      {policy && <CallLog upstreams={upstreams} reloadKey={tools} />}
+      {policy && <CallLog act={act} plugin={plugin} groupLabel={groupLabel} upstreams={upstreams} reloadKey={tools} />}
     </>
   )
 }
 
-function CallLog({ upstreams, reloadKey }: { upstreams: string[]; reloadKey: unknown }) {
+function CallLog({ act, plugin, groupLabel, upstreams, reloadKey }: { act: Act; plugin: string; groupLabel: string; upstreams: string[]; reloadKey: unknown }) {
   const [servers] = useApi<Server[]>('/servers')
   const [range, setRange] = useState(86400e3)
   const [f, setF] = useState({ q: '', upstream: '', outcome: '', server: '' })
@@ -89,7 +95,7 @@ function CallLog({ upstreams, reloadKey }: { upstreams: string[]; reloadKey: unk
   const [data, setData] = useState<{ rows: Call[]; more: boolean }>()
   const [open, setOpen] = useState<number>()
   const { run, error, busy } = useAction()
-  const load = useCallback(() => run(async () => setData(await act('calls', { since: Date.now() - range, until: Date.now(), ...f }))), [range, f, reloadKey]) // eslint-disable-line react-hooks/exhaustive-deps
+  const load = useCallback(() => run(async () => setData(await act<{ rows: Call[]; more: boolean }>('calls', { since: Date.now() - range, until: Date.now(), ...f }))), [range, f, reloadKey]) // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     void load()
     if (!live) return
@@ -112,18 +118,18 @@ function CallLog({ upstreams, reloadKey }: { upstreams: string[]; reloadKey: unk
       <div className="row" style={{ margin: '12px 0' }}>
         <select value={range} onChange={(e) => setRange(Number(e.target.value))} style={{ width: 160 }}>{RANGES.map(([l, ms]) => <option key={ms} value={ms}>{l}</option>)}</select>
         <select value={f.outcome} onChange={(e) => setF({ ...f, outcome: e.target.value })} style={{ width: 130 }}><option value="">Allowed & blocked</option><option value="allowed">Allowed</option><option value="blocked">Blocked</option><option value="error">Errors</option></select>
-        <select value={f.upstream} onChange={(e) => setF({ ...f, upstream: e.target.value })} style={{ width: 160 }}><option value="">All upstreams</option>{upstreams.map((u) => <option key={u}>{u}</option>)}</select>
+        <select value={f.upstream} onChange={(e) => setF({ ...f, upstream: e.target.value })} style={{ width: 160 }}><option value="">All {groupLabel}s</option>{upstreams.map((u) => <option key={u}>{u}</option>)}</select>
         <select value={f.server} onChange={(e) => setF({ ...f, server: e.target.value })} style={{ width: 160 }}><option value="">All servers</option>{servers?.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}</select>
         <input type="text" placeholder="Search tool, arguments or agent…" value={f.q} onChange={(e) => setF({ ...f, q: e.target.value })} style={{ width: 240 }} />
       </div>
       {error && <Alert kind="err">{error}</Alert>}
       <div style={{ overflowX: 'auto' }}>
         <table>
-          <thead><tr><th>Time</th><th>Server / agent</th><th>Upstream</th><th>Tool</th><th>Arguments</th><th>Access</th><th>Result</th></tr></thead>
+          <thead><tr><th>Time</th><th>Server / agent</th><th style={{ textTransform: 'capitalize' }}>{groupLabel}</th><th>Tool</th><th>Arguments</th><th>Access</th><th>Result</th></tr></thead>
           <tbody>
             {rows.map((r) => <tr key={r.id} className="log-row">
               <td className="ts">{fmt(r.ts)}</td>
-              <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== 'mcp' ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
+              <td className="small" style={{ whiteSpace: 'nowrap' }}>{sname(r.server_id)}{r.instance !== plugin ? `/${r.instance}` : ''}<div className="muted">{r.principal ?? '—'}</div></td>
               <td className="small">{r.upstream}</td>
               <td className="mono">{r.tool}</td>
               <td className="mono small" style={{ width: '100%', minWidth: 300, cursor: 'pointer' }} onClick={() => setOpen(open === r.id ? undefined : r.id)}>

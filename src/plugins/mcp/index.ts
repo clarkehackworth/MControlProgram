@@ -13,8 +13,8 @@ import { UnauthorizedError, type OAuthClientProvider } from '@modelcontextprotoc
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, ToolDefinition, ToolResult } from '../../core/plugin-api.js';
 import type { SshApi } from '../ssh/index.js';
-import { ask, effective } from '../../core/plugin-api.js';
-import * as toolRules from './rules.js';
+import { effective } from '../../core/plugin-api.js';
+import { toolRuleStore, type LogEntry } from './rules.js';
 
 interface ServerCfg {
   name: string; description?: string; transport: 'http' | 'sse' | 'stdio';
@@ -44,6 +44,9 @@ const serverSchema = {
 };
 
 let host: PluginHost;
+export const toolRules = toolRuleStore(() => host.db, 'mcp');
+/** What plugins depending on mcp get: the per-tool allow/ask/deny rule store, in their own tables. */
+export interface McpApi { toolRuleStore: typeof toolRuleStore }
 
 // ---- OAuth client state, encrypted in settings (kept out of the config form) ----
 const oauthKey = (name: string) => `oauth.${name}`;
@@ -122,10 +125,11 @@ async function connect(s0: ServerCfg, log: PluginContext['log']): Promise<{ clie
 const plugin: MControlProgramPlugin = {
   id: 'mcp',
   name: 'MCP pass-through',
-  version: '0.1.0',
+  version: '0.2.0',
   navOrder: 30,
+  api: { toolRuleStore } satisfies McpApi,
   optionalDependencies: { ssh: '^0.2.0' },
-  init(h) { host = h; toolRules.init(h); },
+  init(h) { host = h; },
   description: 'Proxy external MCP servers (HTTP or stdio): MControlProgram holds their credentials and re-exposes their tools with a call log, an expose/hide list, and per-tool allow/ask/deny rules.',
   globalConfigSchema: {
     type: 'object',
@@ -253,15 +257,9 @@ const plugin: MControlProgramPlugin = {
                 async handler(args, call) {
                   const t0 = Date.now();
                   const entry = { serverId: ctx.serverId, instance: ctx.instanceName, principal: call.principal, upstream: s.name, tool: t.name, args };
-                  const rec = (e: Partial<toolRules.LogEntry>) => { try { toolRules.record({ ...entry, ...e }); } catch (err) { ctx.log.warn(`call log write failed: ${(err as Error).message}`); } };
+                  const rec = (e: Partial<LogEntry>) => { try { toolRules.record({ ...entry, ...e }); } catch (err) { ctx.log.warn(`call log write failed: ${(err as Error).message}`); } };
                   // read live per call: rule changes apply without reconnecting
-                  const v = toolRules.verdict(s.name, t.name, !!t.annotations?.readOnlyHint);
-                  if (v.action === 'deny') { rec({ blocked: v.by }); throw new Error(`${s.name}/${t.name} is disabled by the administrator. Tell the user if you need it.`); }
-                  let allowedBy = v.by;
-                  if (v.action === 'ask') {
-                    try { allowedBy = await ask(call, { feature: 'mcp_tool', summary: `${s.name}/${t.name}`, reason: v.by, subject: { upstream: s.name, tool: t.name, args } }); }
-                    catch (e) { rec({ blocked: `awaiting approval: ${v.by}` }); throw e; }
-                  }
+                  const allowedBy = await toolRules.gate(call, entry, !!t.annotations?.readOnlyHint, { feature: 'mcp_tool', summary: `${s.name}/${t.name}`, subject: { upstream: s.name, tool: t.name, args } });
                   try {
                     const c = await client(s);
                     const r = await c.callTool({ name: t.name, arguments: args }, undefined, { signal: call.signal, timeout: g.callTimeoutMs }) as unknown as ToolResult;

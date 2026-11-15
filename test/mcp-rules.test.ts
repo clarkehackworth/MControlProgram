@@ -8,7 +8,7 @@ process.env.MCONTROLPROGRAM_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'mc
 await (await import('../src/core/plugin-loader.js')).loadPlugins(); // runs each plugin's init(host)
 
 test('mcp tool rules: per-tool rule beats default, renames carry rules, calls logged with current verdict', async () => {
-  const r = await import('../src/plugins/mcp/rules.js');
+  const r = (await import('../src/plugins/mcp/index.js')).toolRules;
   assert.deepEqual(r.verdict('gh', 'create_issue', false), { action: 'ask', by: 'default: ask' }, 'new installs ask by default');
   r.seen('gh', [{ name: 'create_issue' }, { name: 'list_issues', annotations: { readOnlyHint: true } }]);
   await r.actions.set_tool_rule.run({ upstream: 'gh', tool: 'list_issues', action: 'allow' });

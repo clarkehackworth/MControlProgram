@@ -112,6 +112,7 @@ export function makeHost(p: MControlProgramPlugin): PluginHost {
   const k = (key: string) => `${p.id}.${key}`;
   return {
     id: p.id,
+    dataDir: path.join(config.dataDir, p.id),
     get db() { return getDb(); },
     kv: { get: (key) => setting.get(k(key)), set: (key, value) => setting.set(k(key), value) },
     secrets: { encrypt, decrypt },

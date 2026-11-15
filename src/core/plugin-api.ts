@@ -98,6 +98,8 @@ export interface PluginActionContext {
 export interface PluginHost {
   /** The plugin's id. */
   id: string;
+  /** Directory for the plugin's own files (`<data dir>/<plugin id>`); create it when needed. */
+  dataDir: string;
   /** Shared SQLite database. Name every table you create `<plugin id>_…`. */
   db: BetterSqlite3.Database;
   /** Key/value settings private to this plugin (stored as `<plugin id>.<key>`). */

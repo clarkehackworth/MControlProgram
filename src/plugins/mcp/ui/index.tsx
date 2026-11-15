@@ -1,6 +1,9 @@
 import { api, type PluginUi } from '@mcontrolprogram/ui'
 import McpTools from './McpTools'
 
+// Also imported by plugins that depend on mcp and reuse its tool rules panel (`@plugin/mcp`).
+export { default as ToolRules } from './McpTools'
+
 const ui: PluginUi = {
   Page: ({ plugin }) => <McpTools upstreams={((plugin.globalConfig?.servers ?? []) as { name: string }[]).map((s) => s.name)} />,
   asks: {
