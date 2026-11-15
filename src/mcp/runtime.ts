@@ -60,6 +60,7 @@ export class RunningServer {
     const app = express();
     app.disable('x-powered-by');
     app.use(guard(this.record.host, this.record.public_url));
+    app.use('/plugins', (req, res, next) => this.pluginHttp(req, res, next)); // before the body parsers: plugins read raw bodies
     app.use(express.json({ limit: '8mb' }));
     app.use(express.urlencoded({ extended: false }));
     app.use(cookieParser());
@@ -107,7 +108,7 @@ export class RunningServer {
       return;
     }
     try {
-      const instance = await plugin.create({ instanceId: rec.id, instanceName: rec.name, serverId: this.record.id, config: instanceStore.decrypted(rec), pluginConfig: pluginConfig.decrypted(rec.plugin_id), global: getGlobalConfig, log: ilog, dep: depResolver(plugin) });
+      const instance = await plugin.create({ instanceId: rec.id, instanceName: rec.name, serverId: this.record.id, config: instanceStore.decrypted(rec), pluginConfig: pluginConfig.decrypted(rec.plugin_id), global: getGlobalConfig, log: ilog, dep: depResolver(plugin), serverUrl: () => this.publicUrl });
       await instance.start?.();
       this.live.set(rec.id, { record: rec, plugin, instance, log: ilog });
       ilog.info(`plugin instance "${rec.name}" started (${instance.tools.length} tools)`);
@@ -136,6 +137,20 @@ export class RunningServer {
     await this.unloadInstance(id);
     const rec = instanceStore.get(id);
     if (rec && rec.enabled && rec.server_id === this.record.id) await this.loadInstance(rec);
+  }
+
+  /** `/plugins/<prefix>/rest` → that instance's `http` handler with `req.url` = `/rest`. */
+  private pluginHttp(req: Request, res: Response, next: NextFunction) {
+    const m = /^\/([^/?]+)(.*)$/.exec(req.url);
+    const li = m && [...this.live.values()].find((l) => !l.error && l.instance.http && sanitize(l.record.name || l.plugin.toolPrefix || l.plugin.id) === m[1]);
+    if (!li) return next();
+    req.url = m![2] || '/';
+    const ask = async (principal: string, tool: string, spec: AskSpec, signal?: AbortSignal) => {
+      const gate = await approvals.gate({ serverId: this.record.id, instanceId: li.record.id, instanceName: li.record.name, pluginId: li.plugin.id, tool, principal, args: {}, signal, ...spec });
+      if (!gate.ok) throw new ApprovalError(gate.status, gate.message);
+      return gate.by;
+    };
+    Promise.resolve(li.instance.http!(req, res, { ask })).catch(next);
   }
 
   // ---------- auth ----------

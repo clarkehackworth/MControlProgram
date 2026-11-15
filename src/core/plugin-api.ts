@@ -7,6 +7,7 @@
  * config, other plugins) reaches the plugin through `init(host)` and the contexts below.
  */
 import type { ZodRawShape } from 'zod';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type BetterSqlite3 from 'better-sqlite3';
 import type { ScopedLogger } from './logger.js';
 import type { GlobalConfig } from './global-config.js';
@@ -133,6 +134,14 @@ export interface PluginContext {
   log: ScopedLogger;
   /** See `PluginHost.dep`. */
   dep<T = any>(id: string): T;
+  /** Base URL agents reach this MCP server at (its Public URL setting, else http://host:port). */
+  serverUrl?(): string;
+}
+
+/** Given to `PluginInstance.http`: the plugin authenticates the request itself, then may ask for approvals as that principal. */
+export interface HttpContext {
+  /** Like `ToolCallContext.ask`, for a request from `principal`; `tool` labels it on the Approvals page. */
+  ask(principal: string, tool: string, spec: AskSpec, signal?: AbortSignal): Promise<string>;
 }
 
 export interface PluginInstance {
@@ -148,6 +157,11 @@ export interface PluginInstance {
   onSessionClosed?(sessionId: string): Promise<void> | void;
   /** Arbitrary status shown in the UI (connection counts, health). */
   status?(): Record<string, unknown> | Promise<Record<string, unknown>>;
+  /**
+   * HTTP requests to `<server url>/plugins/<tool prefix>/…` on the MCP server's own port, with `req.url` the part
+   * after the prefix. No MCP auth is applied: authenticate them yourself.
+   */
+  http?(req: IncomingMessage, res: ServerResponse, ctx: HttpContext): void | Promise<void>;
   /** Optional admin actions exposed as buttons in the UI (e.g. "test connection"). */
   actions?: Record<string, { title: string; run: (params?: Record<string, unknown>) => Promise<unknown> }>;
 }

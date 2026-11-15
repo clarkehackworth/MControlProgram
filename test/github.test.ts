@@ -110,7 +110,7 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   const { rows } = await act('calls', { since: 0 });
   assert.ok(rows.some((r: any) => r.tool === 'submit_patch' && r.blocked === 'tool rule: deny'));
   const { tools } = await act('tool_rules', {});
-  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['pr', 'resolve']);
+  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['clone_url', 'pr', 'resolve']);
 
   // PRs go to the API with the host's token; an existing PR for the branch is returned
   const real = globalThis.fetch; const seen: string[] = [];
@@ -124,6 +124,72 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
     assert.deepEqual([pr.number, pr.existing], [7, true]);
     assert.match(seen[0], /^POST https:\/\/api\.github\.com\/repos\/[^/]+\/demo\/pulls Bearer SECRET123$/);
   } finally { globalThis.fetch = real; }
+});
+
+test('git remote over HTTP: clone, hidden local work, push forwarded with rules', async () => {
+  const http = await import('node:http');
+  const asks: any[] = [];
+  let inst: any;
+  const srv = http.createServer((req, res) => {
+    const m = /^\/plugins\/github(\/.*)$/.exec(req.url ?? '');
+    if (!m) { res.writeHead(404).end(); return; }
+    req.url = m[1];
+    void inst.http(req, res, { ask: async (_p: string, _t: string, spec: any) => { asks.push(spec); return 'approved by test'; } });
+  });
+  await new Promise<void>((r) => srv.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${(srv.address() as any).port}`;
+  try {
+    inst = await plugin.create({ instanceId: 'i', instanceName: 'github', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined, serverUrl: () => base } as any);
+    const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async () => 'approved by test' };
+    const cu = JSON.parse((await inst.tools.find((x: any) => x.name === 'clone_url').handler({}, call)).content[0].text);
+    assert.equal(cu.url, `${base}/plugins/github/git/demo.git`);
+    // async: the server runs in this process
+    const { execFile } = await import('node:child_process');
+    const run = (cwd: string, cmd: string) => new Promise<string>((ok, no) => execFile('sh', ['-c', cmd], { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_AUTHOR_NAME: 'agent', GIT_AUTHOR_EMAIL: 'a@x', GIT_COMMITTER_NAME: 'agent', GIT_COMMITTER_EMAIL: 'a@x' } },
+      (e, stdout, stderr) => (e ? no(Object.assign(e, { stderr })) : ok(stdout))));
+    const refused = async (cmd: Promise<string>, re: RegExp) => { try { await cmd; } catch (e: any) { assert.match(String(e.stderr), re); return; } assert.fail(`not refused: ${re}`); };
+
+    // local work in the host clone is never served
+    const host = path.join(tmp, 'repos/demo');
+    sh(host, 'checkout', '-qb', 'secret'); fs.writeFileSync(path.join(host, 'secret.txt'), 'x'); sh(host, 'add', '-A'); sh(host, 'commit', '-qm', 'secret');
+    const secret = sh(host, 'rev-parse', 'HEAD'); sh(host, 'checkout', '-q', 'main'); sh(host, 'tag', 'localtag-not-really', main);
+
+    await run(tmp, cu.clone + ' agent2');
+    const a2 = path.join(tmp, 'agent2');
+    assert.equal(sh(a2, 'rev-parse', 'mcp/main'), sh(origin, 'rev-parse', 'main'));
+    assert.equal(sh(a2, 'rev-parse', 'mcp/agent/feat'), sh(origin, 'rev-parse', 'agent/feat'));
+    assert.ok(!(await run(a2, 'git ls-remote mcp')).includes('secret'));
+    await refused(run(a2, `git fetch -q mcp ${secret}`), /not our ref|unadvertised/);
+    await refused(run(a2, `git -c protocol.version=2 fetch -q mcp ${secret}`), /not our ref|unadvertised/);
+
+    // push: forwarded to origin as is; only agent branches
+    fs.writeFileSync(path.join(a2, 'new.txt'), 'n\n'); await run(a2, 'git add new.txt && git commit -qm "add new"');
+    const mine = sh(a2, 'rev-parse', 'HEAD');
+    await run(a2, 'git push -q mcp HEAD:agent/http');
+    assert.equal(sh(origin, 'rev-parse', 'agent/http'), mine);
+    assert.equal(sh(origin, 'log', '-1', '--format=%an|%cn', mine), 'agent|agent');
+    assert.deepEqual(asks.at(-1).subject.features, ['git_push']);
+    await run(a2, 'git fetch -q mcp');
+    assert.equal(sh(a2, 'rev-parse', 'mcp/agent/http'), mine);
+    await refused(run(a2, 'git push mcp HEAD:main'), /agent branch: git push mcp HEAD:agent\/main/);
+    assert.equal(sh(origin, 'rev-parse', 'main'), main);
+
+    // rewrite: force needs force_push, and touching CI asks for sensitive_paths
+    fs.writeFileSync(path.join(a2, '.github/workflows/ci.yml'), 'on: [push]\n'); await run(a2, 'git commit -qa --amend -m "ci too"');
+    await run(a2, 'git push -qf mcp HEAD:agent/http');
+    assert.deepEqual(asks.at(-1).subject.features, ['git_push', 'force_push', 'sensitive_paths']);
+    assert.equal(sh(origin, 'rev-parse', 'agent/http'), sh(a2, 'rev-parse', 'HEAD'));
+
+    // a deny rule refuses, and the mirror goes back to origin's value
+    await act('set_tool_rule', { upstream: 'demo', tool: 'git_push', action: 'deny' });
+    await run(a2, 'git commit -q --allow-empty -m more');
+    await refused(run(a2, 'git push mcp HEAD:agent/http'), /disabled by the administrator/);
+    assert.equal(sh(path.join(tmp, 'repos/demo/.git/mcontrolprogram-serve.git'), 'rev-parse', 'agent/http'), sh(origin, 'rev-parse', 'agent/http'));
+    await act('set_tool_rule', { upstream: 'demo', tool: 'git_push', action: '' });
+
+    // bad token: a 403 that says what to do, no password prompt
+    await refused(run(tmp, `git -c http.extraHeader="Authorization: Bearer nope" ls-remote ${cu.url}`), /expired MControlProgram git token/);
+  } finally { srv.close(); }
 });
 
 test('a clone removed from the host drops out of the inventory', async () => {

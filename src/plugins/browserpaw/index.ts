@@ -42,6 +42,7 @@ const local: SshApi = {
   hostNames: () => [],
   exec: (_host, cmd) => new Promise((resolve) => exec(cmd, { timeout: 120_000, maxBuffer: 16 << 20 }, (e: any, stdout, stderr) => resolve({ stdout, stderr, code: e ? (typeof e.code === 'number' ? e.code : 1) : 0 }))),
   openTunnel: async (_host, _remoteHost, port) => ({ port, close() {} }),
+  spawn: () => { throw new Error('not used for native hosts'); },
 };
 const via = (ssh: SshApi, h: HostCfg) => (h.native ? local : ssh);
 

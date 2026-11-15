@@ -84,7 +84,8 @@ admin UI (below).
 ## `create(ctx)` → `PluginInstance`
 
 ```ts
-interface PluginContext { instanceId; instanceName; serverId; config; pluginConfig; global: () => GlobalConfig; log: ScopedLogger }
+interface PluginContext { instanceId; instanceName; serverId; config; pluginConfig; global: () => GlobalConfig; log: ScopedLogger; serverUrl?(): string }
+// serverUrl() = the base URL agents reach this MCP server at (its Public URL, else http://host:port).
 // config = this instance's decrypted config; pluginConfig = decrypted plugin-wide config (shared inventory).
 // GlobalConfig = { stateIdleSec, connectionIdleSec, logRetentionDays } — MControlProgram-wide defaults set in the UI.
 // Call ctx.global() at use time (inside your reaper), not once at create, so admin changes apply live.
@@ -97,6 +98,9 @@ interface PluginInstance {
   onSessionClosed?(sessionId): void;  // agent disconnected — drop per-session state
   status?(): object;                  // shown in UI
   actions?: { [key]: { title, run(params) } };  // admin buttons in UI
+  http?(req, res, ctx: HttpContext): void | Promise<void>;
+  // requests to <server>/plugins/<tool prefix>/… on the MCP port, req.url = the rest, raw body unread.
+  // No MCP auth is applied: authenticate them yourself. ctx.ask(principal, tool, spec, signal) = ToolCallContext.ask.
 }
 ```
 
@@ -187,7 +191,7 @@ export default {
 - Built-in providers: `mcp@0.2.0` exposes `McpApi` (`toolRuleStore(db, prefix, { defaultPolicy })`: per-group, per-tool allow/ask/deny rules, a default policy, a call log and `gate()`, in the caller's own `<prefix>_rules` / `_tools` / `_policy` / `_calls` tables, with the admin actions; its UI exports the `ToolRules` panel). github uses it. `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
   rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables, with the admin actions the rules
   UI uses, including `check` for server-side verdicts; plus `verdict`, `ruleMatches`, `normalizeBlock`).
-  browserpaw keeps its browser list this way. `ssh@0.2.1` exposes `SshApi` (`hostNames`, `exec` (optional stdin `input` since 0.2.1), `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
+  browserpaw keeps its browser list this way. `ssh@0.2.2` exposes `SshApi` (`hostNames`, `exec` (optional stdin `input` since 0.2.1), `spawn` (streaming binary stdin/stdout, since 0.2.2), `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
 - The "Used by" column (server toggles + Pair server) appears only on inventories that an instance config selects from (`x-options-from`). An inventory that other inventory items point at by name can say so with `'x-referenced-by': { inventory, field, title }`; its table then lists those items instead (and the delete confirmation warns about them).
 - `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
@@ -321,7 +325,7 @@ The plugin page shows, for the host selected in the hosts table (click a row): t
 
 ## Built-in: github
 
-Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram does the git work in clones on a **git host**: an SSH host from the ssh plugin (depends on `ssh@^0.2.1`, whose `exec` takes stdin) or this machine (**Native**). The push credential stays on that host: an ssh key that **Set up host** generates there (`~/.ssh/mcontrolprogram_git` by default). Agents never see it. Repo hooks never run (`core.hooksPath=/dev/null`). Pushes use `GIT_SSH_COMMAND` with that key, `IdentitiesOnly` and `StrictHostKeyChecking=accept-new`.
+Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram does the git work in clones on a **git host**: an SSH host from the ssh plugin (depends on `ssh@^0.2.2`: `exec` with stdin, streaming `spawn`) or this machine (**Native**). The push credential stays on that host: an ssh key that **Set up host** generates there (`~/.ssh/mcontrolprogram_git` by default). Agents never see it. Repo hooks never run (`core.hooksPath=/dev/null`). Pushes use `GIT_SSH_COMMAND` with that key, `IdentitiesOnly` and `StrictHostKeyChecking=accept-new`.
 
 **Git hosts:**
 
@@ -349,4 +353,18 @@ Agent workflow:
 2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is `git format-patch --stdout <base>` output (applied with `git am --3way`; keeps the agent's commits, messages and authorship) or a plain `git diff` plus `message` (one commit by the bot, with a `Submitted-by: <agent>` trailer). Optional `committer_name` + `committer_email` replace the host's committer identity for that call: committer of every commit, and author of a plain diff's commit. A mailbox keeps its own authors. The push uses `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
 3. `create_pr` (returns the open PR if there is one), `pr` (list, or one PR with checks, reviews and comments) and `comment`.
 
-**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own committer name and email) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.
+**MControlProgram as a git remote.** Agents that can reach the MCP server's port can skip patches:
+
+- **`clone_url`** gives `<server>/plugins/<prefix>/git/<repo>.git` and a per-agent token. The token is valid for 24 hours, stored hashed, and tied to the agent's principal and to this instance's repos. It also returns ready-made commands: `git remote add mcp …` plus `git config http.<url>.extraHeader "Authorization: Bearer …"` (the header is scoped to that URL, so it never goes to GitHub), a `clone`, and `refresh`. A missing or expired token gets a 403 telling the agent to call `clone_url` again (Basic auth with the token as password works too).
+- **Fetching** gives exactly what MControlProgram has, so `git log mcp/main..HEAD` and `git diff mcp/main` show the agent's changes.
+  - It's served from a bare mirror, `.git/mcontrolprogram-serve.git`, created on first use. The mirror holds origin's branches (from the clone's `refs/remotes/origin/*`), the clone's tags, and agent pushes. Branches, stashes and commits that exist only in the host clone are never served.
+  - Every fetch fetches origin first.
+  - Only protocol v0 is served: v2 lets a client fetch any object by sha.
+- **`git push mcp HEAD:<prefix><name>`**: receive-pack stores the push in the mirror, then each ref is checked like `submit_patch` and pushed to origin with `--force-with-lease`.
+  - The checks are: the `git_push` rule, plus `force_push` if it isn't a fast-forward and `sensitive_paths` for the files changed since the merge-base with the default branch.
+  - The commits go through unchanged, with the agent's authors and committers and no `Submitted-by` trailer.
+  - Only agent branches are accepted. Tags, deletes and base branches are refused, with a message naming the right ref.
+  - Refused, failed or pending refs show as `! [remote rejected]` with the reason, and the mirror goes back to origin's value. While an ask is pending, re-running the same push checks back.
+  - Pushes over the repo's max patch size get a 413. Objects are fsck'ed. Hooks never run.
+
+**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools (`clone_url` also covers fetching over HTTP), `git_push`, and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own committer name and email) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.

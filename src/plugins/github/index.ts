@@ -7,17 +7,25 @@
  * MControlProgram applies, commits and pushes it to an agent branch, opens PRs and reads their state (REST API,
  * with the host's token).
  *
+ * Agents can also use MControlProgram as a git remote (smart HTTP on the MCP server's port, per-agent token from
+ * `clone_url`): fetch to see exactly what MControlProgram has, `git push` to have it forwarded to an agent branch.
+ * It serves a bare mirror next to the host clone holding only origin's branches and tags plus agent pushes, so
+ * the host clone's own work never leaks.
+ *
  * Every tool and git feature (force push, touching CI paths) is allow / ask / deny per repo, using mcp's rule store
  * (own `github_*` tables, same panel as the MCP pass-through). One call asks once, for everything it touches.
  */
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import zlib from 'node:zlib';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
-import type { MControlProgramPlugin, PluginActionContext, PluginContext, PluginInstance, ScopedLogger, ToolCallContext, ToolDefinition } from '../../core/plugin-api.js';
+import type BetterSqlite3 from 'better-sqlite3';
+import type { HttpContext, MControlProgramPlugin, PluginActionContext, PluginContext, PluginInstance, ScopedLogger, ToolCallContext, ToolDefinition } from '../../core/plugin-api.js';
 import { text } from '../../core/plugin-api.js';
 import type { McpApi } from '../mcp/index.js';
 import type { ToolRuleStore, LogEntry } from '../mcp/rules.js';
-import type { SshApi } from '../ssh/index.js';
+import type { Proc, SshApi } from '../ssh/index.js';
 
 export interface HostCfg {
   name: string; native?: boolean; sshHost?: string; description?: string; reposDir: string; sshKey: string;
@@ -31,10 +39,12 @@ type Repo = RepoCfg & { h: HostCfg };
 /** Tools and git features the rules apply to, per repo. `ro` = read-only (allowed under the read-only policy). */
 export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'resolve', ro: true, description: 'Fetch, then resolve a branch, tag or sha to a commit, or list branches and tags' },
+  { name: 'clone_url', ro: true, description: "Get a git URL and token to clone / fetch the repo from MControlProgram (origin's branches and tags), and fetch with it" },
   { name: 'submit_patch', ro: false, description: 'Apply a patch on a base commit, commit it and push it to an agent branch' },
-  { name: 'force_push', ro: false, description: 'submit_patch that rewrites an agent branch (not a fast-forward)' },
+  { name: 'git_push', ro: false, description: "git push to MControlProgram's remote, forwarded to an agent branch (the agent's commits as they are, authors and committers included)" },
+  { name: 'force_push', ro: false, description: 'submit_patch or git push that rewrites an agent branch (not a fast-forward)' },
   { name: 'custom_identity', ro: false, description: 'submit_patch with a committer name and email from the agent instead of the git host\'s' },
-  { name: 'sensitive_paths', ro: false, description: "submit_patch touching the repo's sensitive paths (CI workflows, CODEOWNERS…)" },
+  { name: 'sensitive_paths', ro: false, description: "submit_patch or git push touching the repo's sensitive paths (CI workflows, CODEOWNERS…)" },
   { name: 'create_pr', ro: false, description: 'Open a pull request from an agent branch' },
   { name: 'pr', ro: true, description: 'List pull requests, or read one: state, checks, reviews and comments' },
   { name: 'comment', ro: false, description: 'Comment on a pull request or issue' },
@@ -43,6 +53,7 @@ const RO = Object.fromEntries(FEATURES.map((f) => [f.name, f.ro]));
 const featureList = FEATURES.map((f) => ({ name: f.name, description: f.description, annotations: { readOnlyHint: f.ro } }));
 
 let rules: ToolRuleStore;
+let db: () => BetterSqlite3.Database;
 
 // ---- shell on the git host ----------------------------------------------------------------------------------
 
@@ -67,6 +78,26 @@ export const runner = (ssh: SshApi | undefined): Run => (h, script, log, input) 
   if (!ssh) throw new Error('the ssh plugin is not loaded');
   return ssh.exec(h.sshHost, `sh -c ${q(script)}`, log, input ?? '');
 };
+type Spawn = (h: HostCfg, script: string, log: ScopedLogger) => Promise<Proc>;
+/** Like `runner`, with streaming binary stdin/stdout (git's wire protocol). */
+export const spawner = (ssh: SshApi | undefined): Spawn => async (h, script, log) => {
+  if (h.native) {
+    const p = spawn('sh', ['-c', script], { stdio: 'pipe' });
+    return { stdin: p.stdin, stdout: p.stdout, stderr: p.stderr, done: new Promise((r) => { p.on('close', r); p.on('error', () => r(127)); }), kill: () => p.kill('SIGKILL') };
+  }
+  if (!h.sshHost) throw new Error(`git host "${h.name}" has no SSH host and is not native`);
+  if (!ssh) throw new Error('the ssh plugin is not loaded');
+  return ssh.spawn(h.sshHost, `sh -c ${q(script)}`, log);
+};
+/** Feed `input`, collect stdout as bytes. */
+async function collect(p: Proc, input?: Buffer) {
+  const out: Buffer[] = []; let err = '';
+  p.stdout.on('data', (d: Buffer) => out.push(d)); p.stderr.on('data', (d: Buffer) => (err += d));
+  p.stdin.on('error', () => {}); p.stdin.end(input);
+  const code = await p.done;
+  return { out: Buffer.concat(out), err, code };
+}
+
 /** Run a script, return stdout; non-zero exit → error with its stderr. */
 async function sh(run: Run, h: HostCfg, script: string, log: ScopedLogger, input?: string): Promise<string> {
   const r = await run(h, script, log, input);
@@ -91,7 +122,14 @@ res() {
   c=$(g rev-parse -q --verify "$1^{commit}" 2>/dev/null) || return 1
   [ -n "$(g for-each-ref --contains "$c" --count=1 refs/remotes/origin refs/tags)" ] && echo "$c"
 }
-fetch() { g fetch -q --prune --tags --force origin; }
+# the bare mirror agents fetch from and push to (when someone used clone_url): origin's branches and tags only
+sv() { echo "$(g rev-parse --absolute-git-dir)/mcontrolprogram-serve.git"; }
+sync() {
+  S=$(sv); [ -d "$S" ] || return 0
+  g -C "$S" fetch -q --prune --force "$(pwd)" '+refs/remotes/origin/*:refs/heads/*' '^refs/remotes/origin/HEAD' '+refs/tags/*:refs/tags/*'
+  d=$(g symbolic-ref -q --short refs/remotes/origin/HEAD) && g -C "$S" symbolic-ref HEAD "refs/heads/\${d#origin/}" || true
+}
+fetch() { g fetch -q --prune --tags --force origin; sync; }
 `;
 
 // ponytail: one script at a time per repo (git locks refs); approval waits happen outside the lock
@@ -175,7 +213,57 @@ g diff --name-only -z "$base" "$sha"
 const push = (run: Run, r: Repo, x: Applied, branch: string, log: ScopedLogger) => locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
 g push -q --no-verify ${q(`--force-with-lease=refs/heads/${branch}:${x.previous ?? ''}`)} origin ${q(`${x.sha}:refs/heads/${branch}`)}
 g update-ref ${q(`refs/remotes/origin/${branch}`)} ${q(x.sha)}
+sync
 `, log));
+
+// ---- git smart HTTP (protocol v0 only: v2 hands out any object by sha) --------------------------------------
+
+export const pkt = (line: string | Buffer) => { const b = Buffer.from(line); return Buffer.concat([Buffer.from((b.length + 4).toString(16).padStart(4, '0')), b]); };
+/** pkt-lines up to the first flush; `rest` = what follows it (the pack). */
+export function readPkts(buf: Buffer): { lines: Buffer[]; rest: Buffer } {
+  const lines: Buffer[] = [];
+  for (let i = 0; i + 4 <= buf.length;) {
+    const n = parseInt(buf.subarray(i, i + 4).toString(), 16);
+    if (Number.isNaN(n) || (n > 0 && n < 4)) throw new Error('bad pkt-line');
+    if (n === 0) return { lines, rest: buf.subarray(i + 4) };
+    lines.push(buf.subarray(i + 4, i + n)); i += n;
+  }
+  return { lines, rest: Buffer.alloc(0) };
+}
+/** Drop capabilities from the first advertised ref (we parse plain report-status and forward ref by ref). */
+export function stripCaps(adv: Buffer, drop: string[]): Buffer {
+  const n = parseInt(adv.subarray(0, 4).toString(), 16);
+  if (!n) return adv;
+  const line = adv.subarray(4, n), z = line.indexOf(0);
+  if (z < 0) return adv;
+  const caps = line.subarray(z + 1).toString().trim().split(' ').filter((c) => !drop.includes(c.split('=')[0]));
+  return Buffer.concat([pkt(Buffer.concat([line.subarray(0, z + 1), Buffer.from(caps.join(' ') + '\n')])), adv.subarray(n)]);
+}
+const ZERO = /^0{40}$|^0{64}$/;
+const UPLOAD = '-c uploadpack.allowTipSHA1InWant=false -c uploadpack.allowReachableSHA1InWant=false -c uploadpack.allowAnySHA1InWant=false -c uploadpack.allowFilter=true';
+const RECEIVE = '-c receive.fsckObjects=true -c receive.denyDeletes=true -c receive.advertisePushOptions=false';
+
+const TOKEN_TTL_MS = 24 * 3600e3;
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+/** Per-agent git tokens (hashed): a principal on one instance, for every repo the instance exposes when used. */
+const tokens = {
+  init: (d: BetterSqlite3.Database) => d.exec('CREATE TABLE IF NOT EXISTS github_git_tokens (hash TEXT PRIMARY KEY, principal TEXT NOT NULL, instance_id TEXT NOT NULL, expires INTEGER NOT NULL)'),
+  mint(principal: string, instanceId: string) {
+    const t = `mcpgit_${randomBytes(24).toString('base64url')}`, expires = Date.now() + TOKEN_TTL_MS;
+    db().prepare('DELETE FROM github_git_tokens WHERE expires<?').run(Date.now());
+    db().prepare('INSERT INTO github_git_tokens(hash,principal,instance_id,expires) VALUES(?,?,?,?)').run(sha256(t), principal, instanceId, expires);
+    return { token: t, expires };
+  },
+  /** `Authorization: Bearer <t>`, or Basic with the token as password (or user). */
+  principal(auth: string | undefined, instanceId: string): string | undefined {
+    let t = /^Bearer\s+(\S+)$/i.exec(auth ?? '')?.[1];
+    const b = /^Basic\s+(\S+)$/i.exec(auth ?? '')?.[1];
+    if (b) { const [u, ...pw] = Buffer.from(b, 'base64').toString().split(':'); t = pw.join(':') || u; }
+    if (!t) return;
+    const r = db().prepare('SELECT principal FROM github_git_tokens WHERE hash=? AND instance_id=? AND expires>?').get(sha256(t), instanceId, Date.now()) as { principal: string } | undefined;
+    return r?.principal;
+  },
+};
 
 // ---- repo discovery and host setup --------------------------------------------------------------------------
 
@@ -307,11 +395,11 @@ const repoSchema = {
 const plugin: MControlProgramPlugin = {
   id: 'github',
   name: 'GitHub',
-  version: '0.2.0',
+  version: '0.3.0',
   navOrder: 35,
-  dependencies: { mcp: '^0.2.0', ssh: '^0.2.1' },
+  dependencies: { mcp: '^0.2.0', ssh: '^0.2.2' },
   description: 'Agents with a read-only clone sync to the same commit and submit patches; MControlProgram applies, commits and pushes them from clones on a git host (SSH or this machine) and opens PRs. Every tool and git feature is allow / ask / deny per repo.',
-  init(h) { rules = h.dep<McpApi>('mcp').toolRuleStore(() => h.db, 'github', { defaultPolicy: 'readonly' }); },
+  init(h) { rules = h.dep<McpApi>('mcp').toolRuleStore(() => h.db, 'github', { defaultPolicy: 'readonly' }); db = () => h.db; tokens.init(h.db); },
   globalConfigSchema: {
     type: 'object',
     properties: {
@@ -356,7 +444,11 @@ const plugin: MControlProgramPlugin = {
 
   create(ctx: PluginContext): PluginInstance {
     const cfg = ctx.config as Cfg, g = withDefaults(ctx.pluginConfig);
-    const run = runner(ctx.dep<SshApi>('ssh'));
+    const run = runner(ctx.dep<SshApi>('ssh')), spawnOn = spawner(ctx.dep<SshApi>('ssh'));
+    const prefix = ctx.instanceName.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const gitUrl = (r: Repo) => `${(ctx.serverUrl?.() ?? '').replace(/\/$/, '')}/plugins/${prefix}/git/${r.name}.git`;
+    /** Script start in the host clone, with S = its bare mirror for agents and W = the clone. */
+    const inServe = (r: Repo) => `${prelude(r.h)}cd ${qp(r.path)}\nW=$(pwd); S=$(sv)\n`;
     const exposed: Repo[] = g.repos.filter((r) => cfg.repos.includes(r.name) && !(cfg.reposDisabled ?? []).includes(r.name))
       .flatMap((r) => { const h = g.hosts.find((x) => x.name === r.host); if (!h) ctx.log.warn(`repo ${r.name}: git host "${r.host}" is not configured`); return h ? [{ ...r, h }] : []; });
     for (const r of g.repos) rules.seen(r.name, featureList);
@@ -420,6 +512,22 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           const refs = lines.filter(Boolean).map((l) => { const [n, o, peeled] = l.split('\t'); return { n, sha: peeled || o }; }).filter((x) => x.n !== 'refs/remotes/origin/HEAD');
           const under = (p: string) => Object.fromEntries(refs.filter((x) => x.n.startsWith(p)).map((x) => [x.n.slice(p.length), x.sha]));
           return { defaultBranch: first.replace(/^default=(origin\/)?/, '') || undefined, branches: under('refs/remotes/origin/'), tags: under('refs/tags/') };
+        }),
+      tool('clone_url', `A git remote on MControlProgram for the repo, with a token for you (valid 24h). It has origin's branches and tags, so after \`git fetch mcp\`, \`git log mcp/<base>..HEAD\` and \`git diff mcp/<base>\` show exactly what you have that MControlProgram doesn't. \`git push mcp HEAD:<branch prefix><name>\` sends your commits as they are; MControlProgram forwards them to that branch on GitHub (if the push says it awaits approval, run the same push again later). On 403 "expired git token", call this again and run \`refresh\`.`,
+        {},
+        async (r, _a, call, gate) => {
+          await gate(['clone_url'], 'git remote URL and token', {});
+          const url = gitUrl(r);
+          const { token, expires } = tokens.mint(call.principal ?? 'anonymous', ctx.instanceId);
+          const key = `http.${url}.extraHeader`, val = `Authorization: Bearer ${token}`;
+          return {
+            url, expires: new Date(expires).toISOString(), branchPrefix: r.branchPrefix,
+            addRemote: `git remote add mcp ${q(url)} && git config ${q(key)} ${q(val)}`,
+            refresh: `git config ${q(key)} ${q(val)}`,
+            clone: `git clone -o mcp -c ${q(`${key}=${val}`)} ${q(url)}`,
+            then: ['git fetch mcp', 'git log --oneline mcp/<base>..HEAD  # your commits MControlProgram lacks', `git push mcp HEAD:${r.branchPrefix}<name>`],
+            ...(/\/\/(localhost|127\.)/.test(url) ? { note: "This URL is the server's default; if you can't reach it, ask the admin to set the server's Public URL." } : {}),
+          };
         }),
       tool('submit_patch', 'Apply your change on `base` (the commit you started from, see resolve), commit it and push it to an agent branch. `patch` is `git format-patch --stdout <base>` output (keeps your commits and messages; preferred) or a plain `git diff` plus `message`. Pushing over a branch you pushed before needs it to fast-forward, else `force: true`. Returns the pushed sha: `git fetch origin <branch>` to sync. Binary files need `format-patch --binary`.',
         {
@@ -496,9 +604,133 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
         }),
     ];
 
+    /** One pushed ref, already in the mirror: check it like submit_patch, ask, then push it to origin. */
+    async function forward(r: Repo, c: { old: string; nu: string; ref: string }, call: Pick<ToolCallContext, 'ask'>, entry: LogEntry) {
+      const branch = c.ref.slice('refs/heads/'.length), prev = ZERO.test(c.old) ? '' : c.old;
+      const t0 = Date.now();
+      let allowedBy: string | undefined;
+      try {
+        const out = await locked(r, () => sh(run, r.h, `${inServe(r)}cd "$S"
+new=${q(c.nu)}; prev=${q(prev)}
+force=0; if [ -n "$prev" ] && ! g merge-base --is-ancestor "$prev" "$new"; then force=1; fi
+if [ -n "$prev" ] && [ $force = 0 ]; then base=$prev; else base=$(g merge-base "$new" HEAD 2>/dev/null || g hash-object -t tree /dev/null); fi
+printf 'force=%s\\ncommits=%s\\n--files--\\n' "$force" "$(g rev-list --count "$new" --not "$base" 2>/dev/null || g rev-list --count "$new")"
+g diff --name-only -z "$base" "$new"
+`, ctx.log));
+        const [head, list = ''] = out.split('--files--\n');
+        const kv = Object.fromEntries(head.trim().split('\n').map((l) => l.split('=')));
+        const force = kv.force === '1', files = list.split('\0').filter(Boolean);
+        const sensitive = files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
+        const features = ['git_push', ...(force ? ['force_push'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+        const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
+        try {
+          allowedBy = await rules.gate(call, entry, false, { feature: 'github_tool', summary: `${r.name}: ${what}`, subject: { upstream: r.name, tool: 'git_push', features, branch, sha: c.nu, force } },
+            features.map((f) => ({ tool: f, readOnly: RO[f] })));
+        } catch (e) { (e as any).gated = true; throw e; }
+        await locked(r, () => sh(run, r.h, `${inServe(r)}url=$(g remote get-url origin)
+g -C "$S" push -q --no-verify ${q(`--force-with-lease=refs/heads/${branch}:${prev}`)} "$url" ${q(`${c.nu}:refs/heads/${branch}`)}
+g -C "$S" push -q --no-verify "$W" ${q(`+${c.nu}:refs/remotes/origin/${branch}`)}
+`, ctx.log));
+        rules.record({ ...entry, args: { branch, sha: c.nu }, allowedBy, ms: Date.now() - t0 });
+        ctx.log.info(`${r.name}: ${what} (${c.nu.slice(0, 12)}) for ${entry.principal}, ${allowedBy}`);
+      } catch (e) {
+        if (!(e as any).gated) try { rules.record({ ...entry, args: { branch, sha: c.nu }, allowedBy, ms: Date.now() - t0, error: String((e as Error).message).slice(0, 500) }); } catch { /* logged below */ }
+        throw e;
+      }
+    }
+
+    /** git smart HTTP at `/git/<repo>.git`: fetch from the mirror, pushes forwarded ref by ref. */
+    async function http(req: IncomingMessage, res: ServerResponse, hc: HttpContext) {
+      const fail = (code: number, msg: string) => { if (!res.headersSent) res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end(`${msg}\n`); };
+      const m = /^\/git\/([^/?]+?)(?:\.git)?\/(info\/refs|git-upload-pack|git-receive-pack)(?:\?(.*))?$/.exec(req.url ?? '');
+      if (!m) return fail(404, 'not found');
+      const svc = m[2] === 'info/refs' ? new URLSearchParams(m[3] ?? '').get('service') : m[2];
+      if (svc !== 'git-upload-pack' && svc !== 'git-receive-pack') return fail(403, 'MControlProgram speaks git smart HTTP only');
+      if ((m[2] === 'info/refs') !== (req.method === 'GET')) return fail(405, 'method not allowed');
+      const principal = tokens.principal(req.headers.authorization, ctx.instanceId);
+      if (!principal) return fail(403, `missing or expired MControlProgram git token: call ${prefix}_clone_url and run its refresh command`);
+      const r = exposed.find((x) => x.name === m[1]);
+      if (!r) return fail(404, `no repo "${m[1]}" on this server`);
+      const push = svc === 'git-receive-pack', tool = push ? 'git_push' : 'clone_url';
+      const abort = new AbortController();
+      res.on('close', () => abort.abort());
+      const call = { ask: (spec: Parameters<HttpContext['ask']>[2]) => hc.ask(principal, `${prefix}_${tool}`, spec, abort.signal) };
+      const entry: LogEntry = { serverId: ctx.serverId, instance: ctx.instanceName, principal, upstream: r.name, tool, args: {} };
+      try {
+        if (m[2] === 'info/refs') {
+          if (push) { if (rules.verdict(r.name, 'git_push', false).action === 'deny') throw new Error(`${r.name}/git_push is disabled by the administrator. Tell the user if you need it.`); }
+          else await rules.gate(call, entry, true, { feature: 'github_tool', summary: `${r.name}: git fetch`, subject: { upstream: r.name, tool, features: [tool] } });
+          // ponytail: fetches origin on every advertisement (~1s); cache for a few seconds if agents fetch in loops
+          const out = await locked(r, async () => collect(await spawnOn(r.h, `${inServe(r)}[ -d "$S" ] || g init -q --bare "$S"
+fetch || true
+cd "$S"
+g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`, ctx.log)));
+          if (out.code !== 0) throw new Error(out.err.trim() || `exit ${out.code}`);
+          res.writeHead(200, { 'Content-Type': `application/x-${svc}-advertisement`, 'Cache-Control': 'no-cache' });
+          res.end(Buffer.concat([pkt(`# service=${svc}\n`), Buffer.from('0000'), push ? stripCaps(out.out, ['report-status-v2', 'side-band', 'side-band-64k', 'atomic', 'push-options', 'push-cert']) : out.out]));
+          return;
+        }
+        if (!push) {
+          if (rules.verdict(r.name, tool, true).action === 'deny') throw new Error(`${r.name}/${tool} is disabled by the administrator.`);
+          const p = await spawnOn(r.h, `${inServe(r)}cd "$S"\ng ${UPLOAD} upload-pack --stateless-rpc .`, ctx.log);
+          let err = '';
+          p.stderr.on('data', (d: Buffer) => (err += d));
+          p.stdin.on('error', () => {});
+          res.on('close', () => { if (!res.writableFinished) p.kill(); });
+          res.writeHead(200, { 'Content-Type': 'application/x-git-upload-pack-result', 'Cache-Control': 'no-cache' });
+          const body = req.headers['content-encoding'] === 'gzip' ? req.pipe(zlib.createGunzip()).on('error', () => p.kill()) : req;
+          body.pipe(p.stdin);
+          p.stdout.pipe(res);
+          const code = await p.done;
+          if (code) ctx.log.warn(`${r.name}: upload-pack for ${principal} exited ${code}: ${err.trim().slice(0, 300)}`);
+          return;
+        }
+        // push: read it all (bounded), check the ref updates, let receive-pack store it in the mirror, forward each ref
+        const max = r.maxPatchKB * 1024, chunks: Buffer[] = [];
+        let n = 0;
+        for await (const c of req) { n += c.length; if (n > max) return fail(413, `push is over ${r.maxPatchKB} KB (the repo's max patch size)`); chunks.push(c as Buffer); }
+        const body = req.headers['content-encoding'] === 'gzip' ? zlib.gunzipSync(Buffer.concat(chunks), { maxOutputLength: max }) : Buffer.concat(chunks);
+        const cmds = readPkts(body).lines.map((l) => l.toString('latin1').replace(/\n$/, '').split('\0')[0]).filter((l) => !l.startsWith('shallow '))
+          .map((l) => { const [old = '', nu = '', ref = ''] = l.split(' '); return { old, nu, ref }; });
+        const why = (c: (typeof cmds)[number]) => {
+          if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(c.old) || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(c.nu)) return 'malformed update';
+          if (!c.ref.startsWith('refs/heads/')) return 'only branches can be pushed';
+          if (ZERO.test(c.nu)) return 'deleting branches is not supported';
+          const b = c.ref.slice('refs/heads/'.length);
+          try { const a = agentBranch(r, b); return a === b ? '' : `push to an agent branch: git push mcp HEAD:${a}`; } catch (e) { return (e as Error).message; }
+        };
+        const report: string[] = [];
+        if (!cmds.length) throw new Error('empty push');
+        if (cmds.some(why)) report.push('unpack ok', ...cmds.map((c) => `ng ${c.ref} ${why(c) || 'not pushed: another ref in this push was refused'}`));
+        else {
+          const rp = await locked(r, async () => collect(await spawnOn(r.h, `${inServe(r)}cd "$S"\ng ${RECEIVE} receive-pack --stateless-rpc .`, ctx.log), body));
+          const status = readPkts(rp.out).lines.map((l) => l.toString().replace(/\n$/, ''));
+          if (!status[0]?.startsWith('unpack ')) throw new Error(rp.err.trim() || `receive-pack exited ${rp.code}`);
+          report.push(status[0]);
+          for (const c of cmds) {
+            const st = status.find((l) => l === `ok ${c.ref}` || l.startsWith(`ng ${c.ref} `));
+            if (!st?.startsWith('ok ')) { report.push(st ?? `ng ${c.ref} not received`); continue; }
+            try { await forward(r, c, call, entry); report.push(`ok ${c.ref}`); }
+            catch (e) {
+              const msg = String((e as Error).message).replace(/\s+/g, ' ').slice(0, 1000);
+              report.push(`ng ${c.ref} ${(e as any).status === 'pending' ? `${msg} Run the same git push again to check back.` : msg}`);
+            }
+          }
+          // refused or failed refs go back to origin's value
+          await locked(r, () => sh(run, r.h, `${inServe(r)}sync`, ctx.log)).catch((e) => ctx.log.warn(`${r.name}: mirror sync: ${(e as Error).message}`));
+        }
+        res.writeHead(200, { 'Content-Type': 'application/x-git-receive-pack-result', 'Cache-Control': 'no-cache' });
+        res.end(Buffer.concat([...report.map((l) => pkt(`${l}\n`)), Buffer.from('0000')]));
+      } catch (e) {
+        ctx.log.warn(`${r.name}: git ${push ? 'push' : 'fetch'} by ${principal}: ${(e as Error).message}`);
+        fail(403, (e as Error).message);
+      }
+    }
+
     return {
       tools,
-      instructions: 'Git via MControlProgram: your clone is read-only. {prefix}_resolve gives the sha to check out; make commits locally, then send `git format-patch --stdout <base>` with {prefix}_submit_patch (base = that sha), fetch the returned branch, and open a PR with {prefix}_create_pr.',
+      http,
+      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr.',
       status: () => ({ repos: exposed.map((r) => ({ name: r.name, host: r.host, origin: r.url })) }),
     };
   },

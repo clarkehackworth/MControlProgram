@@ -4,7 +4,8 @@
  */
 import ssh2, { type ConnectConfig, type ClientChannel, type SFTPWrapper } from 'ssh2';
 const { Client, utils: sshUtils } = ssh2;
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn as spawnLocal } from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 import { createHash, generateKeyPairSync } from 'node:crypto';
 import net from 'node:net';
 import fs from 'node:fs';
@@ -242,6 +243,21 @@ async function execOnce(host: HostCfg, g: { connectTimeoutMs: number; keepaliveS
   } finally { c.client.end(); }
 }
 
+/** A command whose stdin/stdout stream (binary-safe, with backpressure). */
+export interface Proc { stdin: Writable; stdout: Readable; stderr: Readable; done: Promise<number | null>; kill(): void }
+async function spawnOn(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log']): Promise<Proc> {
+  if (host.auth === 'native') {
+    const p = spawnLocal(cmd, { shell: true, stdio: 'pipe' });
+    return { stdin: p.stdin, stdout: p.stdout, stderr: p.stderr, done: new Promise((r) => { p.on('close', r); p.on('error', () => r(127)); }), kill: () => p.kill('SIGKILL') };
+  }
+  const c = await connect(host, g, log);
+  return new Promise((resolve, reject) => c.client.exec(cmd, (err, ch) => {
+    if (err) { c.client.end(); return reject(err); }
+    const done = new Promise<number | null>((r) => ch.on('close', (code: number | null) => { c.client.end(); r(code ?? null); }));
+    resolve({ stdin: ch, stdout: ch, stderr: ch.stderr, done, kill: () => { ch.close(); c.client.end(); } });
+  }));
+}
+
 const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max) + `\n…[truncated ${s.length - max} bytes]` : s);
 
 /**
@@ -252,6 +268,8 @@ export interface SshApi {
   hostNames(): string[];
   /** Run one command on a fresh connection; `input` is written to its stdin, then closed (since 0.2.1). */
   exec(host: string, cmd: string, log: PluginContext['log'], input?: string): Promise<{ stdout: string; stderr: string; code: number | null }>;
+  /** Run one command on a fresh connection with streaming stdin/stdout (since 0.2.2); the connection closes when it exits. */
+  spawn(host: string, cmd: string, log: PluginContext['log']): Promise<Proc>;
   /** `ssh -L` to remoteHost:remotePort as seen from `host`; see openTunnel. */
   openTunnel(host: string, remoteHost: string, remotePort: number, log: PluginContext['log']): Promise<{ port: number; close(): void }>;
 }
@@ -266,11 +284,12 @@ const pinnedHost = (name: string) => {
 const api: SshApi = {
   hostNames: () => ((host.config().hosts ?? []) as HostCfg[]).map((h) => h.name),
   exec: (name, cmd, log, input) => { const { h, g } = pinnedHost(name); return execOnce(h, g, cmd, log, input); },
+  spawn: (name, cmd, log) => { const { h, g } = pinnedHost(name); return spawnOn(h, g, cmd, log); },
   openTunnel: (name, rh, rp, log) => { const { h, g } = pinnedHost(name); return openTunnel(h, g, rh, rp, log); },
 };
 
 const plugin: MControlProgramPlugin = {
-  id: 'ssh', name: 'SSH', version: '0.2.1', navOrder: 10,
+  id: 'ssh', name: 'SSH', version: '0.2.2', navOrder: 10,
   api,
   init(h) { host = h; cmdRules.init(h); },
   description: 'Execute commands, run persistent shells, and transfer files over SSH on admin-configured hosts.',
