@@ -64,7 +64,11 @@ export const approvals = {
   },
 
   decide(id: string, status: 'approved' | 'denied', by: string): ApprovalRecord {
-    const r = getDb().prepare("UPDATE approvals SET status=?, decided_by=?, decided_at=? WHERE id=? AND status='pending'").run(status, by, Date.now(), id);
+    // an approval gets a fresh lifetime from now, so an agent whose call timed out can still retry and use it
+    // ponytail: reuses approvalTtlSec as the grace window; separate knob if they ever need to differ
+    const now = Date.now();
+    const exp = status === 'approved' ? now + getGlobalConfig().approvalTtlSec * 1000 : 0;
+    const r = getDb().prepare("UPDATE approvals SET status=?, decided_by=?, decided_at=?, expires_at=MAX(expires_at, ?) WHERE id=? AND status='pending'").run(status, by, now, exp, id);
     if (!r.changes) throw new Error('approval not pending');
     wake(id);
     const rec = row(getDb().prepare('SELECT * FROM approvals WHERE id=?').get(id) as Row);

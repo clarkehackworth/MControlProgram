@@ -83,9 +83,15 @@ test('deny and expire', async () => {
   assert.throws(() => approvals.reopen(pend.id, 'jeff'), /only an unexpired denial/);
 
   setGlobalConfig({ approvalTtlSec: 60 });
+  const { getDb } = await import('../src/core/db.js');
+  // approval near the end of the request's life: the grace window restarts, so a late retry still uses it
+  await approvals.gate(req({ cmd: 'uptime' }));
+  const late = approvals.list('pending').find((a) => a.args.cmd === 'uptime')!;
+  getDb().prepare('UPDATE approvals SET expires_at=? WHERE id=?').run(Date.now() + 1000, late.id);
+  assert.ok(approvals.decide(late.id, 'approved', 'jeff').expires_at > Date.now() + 50_000, 'approval extends expiry');
+
   const p2 = approvals.gate(req({ cmd: 'date' }));
   await new Promise((r) => setTimeout(r, 50));
-  const { getDb } = await import('../src/core/db.js');
   getDb().prepare("UPDATE approvals SET expires_at=0 WHERE status='pending'").run();
   approvals.expire();
   assert.equal((await p2 as any).status, 'expired');
