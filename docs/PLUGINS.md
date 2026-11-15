@@ -187,7 +187,7 @@ export default {
 - Built-in providers: `mcp@0.2.0` exposes `McpApi` (`toolRuleStore(db, prefix, { defaultPolicy })`: per-group, per-tool allow/ask/deny rules, a default policy, a call log and `gate()`, in the caller's own `<prefix>_rules` / `_tools` / `_policy` / `_calls` tables, with the admin actions; its UI exports the `ToolRules` panel). github uses it. `web@0.2.0` exposes `WebApi`, its URL rule engine (`ruleStore(db, prefix)` keeps a separate
   rule list in the caller's own `<prefix>_blocks` / `<prefix>_policy` tables, with the admin actions the rules
   UI uses, including `check` for server-side verdicts; plus `verdict`, `ruleMatches`, `normalizeBlock`).
-  browserpaw keeps its browser list this way. `ssh@0.2.0` exposes `SshApi` (`hostNames`, `exec`, `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
+  browserpaw keeps its browser list this way. `ssh@0.2.1` exposes `SshApi` (`hostNames`, `exec` (optional stdin `input` since 0.2.1), `openTunnel`). It only works with hosts that have a pinned host key. Hosts with auth `native` need no pin: they run on the MControlProgram machine itself (exec and shells via the local shell, SFTP via the local filesystem, `openTunnel` returns the port as is). Agents given a native host get this machine's privileges, including MControlProgram's own data, so restrict it with command patterns and an SFTP root. Shells have no pty.
 - An inventory field can offer another plugin's inventory as a dropdown with `'x-options-from': '<pluginId>:<key>'`, for example `'ssh:hosts'`.
 - The "Used by" column (server toggles + Pair server) appears only on inventories that an instance config selects from (`x-options-from`). An inventory that other inventory items point at by name can say so with `'x-referenced-by': { inventory, field, title }`; its table then lists those items instead (and the delete confirmation warns about them).
 - `x-no-column: true` on an inventory field keeps it in the edit form but out of the table.
@@ -321,14 +321,32 @@ The plugin page shows, for the host selected in the hosts table (click a row): t
 
 ## Built-in: github
 
-Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram keeps a bare mirror per repo (`data/github/<repo>.git`) and the write token. The token goes to git only through env-only config (`GIT_CONFIG_*`, scoped to the repo's origin), never argv, `.git/config` or tool output. Repo hooks never run (`core.hooksPath=/dev/null`).
+Lets an agent with a **read-only** clone get changes committed, pushed and turned into PRs. MControlProgram does the git work in clones on a **git host**: an SSH host from the ssh plugin (depends on `ssh@^0.2.1`, whose `exec` takes stdin) or this machine (**Native**). The push credential stays on that host: an ssh key that **Set up host** generates there (`~/.ssh/mcontrolprogram_git` by default). Agents never see it. Repo hooks never run (`core.hooksPath=/dev/null`). Pushes use `GIT_SSH_COMMAND` with that key, `IdentitiesOnly` and `StrictHostKeyChecking=accept-new`.
 
-**Repositories** (plugin-wide): HTTPS clone URL, fine-grained token (Contents and Pull requests: read & write), committer identity, **agent branch prefix** (default `agent/`; agents push only there), **base branches** (PR targets, never pushed to), **sensitive paths** (default `.github/`, `CODEOWNERS`), max patch size. **Check repo** fetches and reports the default branch and whether the token can push. Instances pick which repos they expose.
+**Git hosts:**
+
+- **Repos directory**: every clone directly under it is a repo.
+- **SSH key**
+- **Committer identity**
+- **GitHub token**: optional, kept by MControlProgram and used only for the REST API (PRs, checks, comments). It's never sent to the host.
+
+**Set up host** checks for git, creates the repos directory and the key, and returns the public key and what `ssh -T git@github.com` answers. Add the key to GitHub as a deploy key with write access (one repo) or to a machine user, then run it again. A native host inside the container should keep the repos directory and key on the data volume (`/data/github/...`).
+
+**Repos** are discovered:
+
+- **When they're scanned:** whenever the plugin page opens, on **Rescan**, and after **Set up host** or **Clone repo…** (`git clone` into the repos directory with the host's key).
+- **New clones** are added, named after their directory, or `<host>-<dir>` when that name is taken.
+- **Clones gone from a reachable host** are dropped.
+- **Settings you edited** are kept: agent branch prefix (default `agent/`), base branches (PR targets, never pushed to), sensitive paths (default `.github/`, `CODEOWNERS`), max patch size.
+
+Pair repos with servers like any inventory.
+
+The host's clone is only used through its object store and `origin`. Each patch is applied in a throwaway worktree under `.git/mcontrolprogram-work/`, so the clone's own checkout is never touched.
 
 Agent workflow:
 
-1. `resolve {ref}`: fetch, then give the sha to `git fetch && git checkout <sha>` (no `ref`: list branches and tags).
-2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is `git format-patch --stdout <base>` output (applied with `git am --3way`; keeps the agent's commits, messages and authorship) or a plain `git diff` plus `message` (one commit by the bot, with a `Submitted-by: <agent>` trailer). Each call applies in a throwaway worktree, then pushes with `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
+1. `resolve {ref}`: fetch, then give the sha to `git fetch && git checkout <sha>` (no `ref`: list branches and tags). Refs are resolved as remote branches, then tags, then a sha the remote has.
+2. Commit locally and send `submit_patch {base, patch, branch}`. `patch` is `git format-patch --stdout <base>` output (applied with `git am --3way`; keeps the agent's commits, messages and authorship) or a plain `git diff` plus `message` (one commit by the bot, with a `Submitted-by: <agent>` trailer). The push uses `--force-with-lease`. Rewriting a branch needs `force: true`. A base that isn't on the remote, or a patch that doesn't apply, returns an error that tells the agent to rebase.
 3. `create_pr` (returns the open PR if there is one), `pr` (list, or one PR with checks, reviews and comments) and `comment`.
 
 **Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools and two git features: `force_push` (a submit that isn't a fast-forward) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.

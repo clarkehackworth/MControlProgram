@@ -227,7 +227,7 @@ export async function openTunnel(host: HostCfg, g: { connectTimeoutMs: number; k
 }
 
 /** One-shot exec on a fresh connection (used by plugin-level actions). Also returns the presented host key. */
-async function execOnce(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log']) {
+async function execOnce(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log'], input?: string) {
   const c = await connect(host, g, log);
   try {
     return await new Promise<{ stdout: string; stderr: string; code: number | null; hostKey?: string }>((resolve, reject) => {
@@ -236,6 +236,7 @@ async function execOnce(host: HostCfg, g: { connectTimeoutMs: number; keepaliveS
         let out = '', errOut = '';
         ch.on('data', (d: Buffer) => (out += d.toString())); ch.stderr.on('data', (d: Buffer) => (errOut += d.toString()));
         ch.on('close', (code: number | null) => resolve({ stdout: out, stderr: errOut, code, hostKey: c.hostKey }));
+        if (input !== undefined) ch.end(input);
       });
     });
   } finally { c.client.end(); }
@@ -249,8 +250,8 @@ const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max) + `\n
  */
 export interface SshApi {
   hostNames(): string[];
-  /** Run one command on a fresh connection. */
-  exec(host: string, cmd: string, log: PluginContext['log']): Promise<{ stdout: string; stderr: string; code: number | null }>;
+  /** Run one command on a fresh connection; `input` is written to its stdin, then closed (since 0.2.1). */
+  exec(host: string, cmd: string, log: PluginContext['log'], input?: string): Promise<{ stdout: string; stderr: string; code: number | null }>;
   /** `ssh -L` to remoteHost:remotePort as seen from `host`; see openTunnel. */
   openTunnel(host: string, remoteHost: string, remotePort: number, log: PluginContext['log']): Promise<{ port: number; close(): void }>;
 }
@@ -264,12 +265,12 @@ const pinnedHost = (name: string) => {
 };
 const api: SshApi = {
   hostNames: () => ((host.config().hosts ?? []) as HostCfg[]).map((h) => h.name),
-  exec: (name, cmd, log) => { const { h, g } = pinnedHost(name); return execOnce(h, g, cmd, log); },
+  exec: (name, cmd, log, input) => { const { h, g } = pinnedHost(name); return execOnce(h, g, cmd, log, input); },
   openTunnel: (name, rh, rp, log) => { const { h, g } = pinnedHost(name); return openTunnel(h, g, rh, rp, log); },
 };
 
 const plugin: MControlProgramPlugin = {
-  id: 'ssh', name: 'SSH', version: '0.2.0', navOrder: 10,
+  id: 'ssh', name: 'SSH', version: '0.2.1', navOrder: 10,
   api,
   init(h) { host = h; cmdRules.init(h); },
   description: 'Execute commands, run persistent shells, and transfer files over SSH on admin-configured hosts.',

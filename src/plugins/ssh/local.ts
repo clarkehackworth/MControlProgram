@@ -16,6 +16,7 @@ class Chan extends EventEmitter {
     p.on('error', (e) => { this.stderr.emit('data', Buffer.from(String(e.message))); this.emit('close', 127); });
   }
   write(s: string) { return this.p.stdin!.write(s); }
+  end(s?: string) { this.p.stdin!.end(s); }
   close() { this.p.kill('SIGKILL'); }
 }
 
