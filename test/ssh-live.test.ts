@@ -169,3 +169,27 @@ test('mcp plugin: http upstream reached through an ssh host (sshHost) with a pin
     await assert.rejects(mcp.globalActions!.test_server!.run({ name: 'remote' }, { config: { servers }, setConfig: async () => {}, log: new ScopedLogger({}, () => 'off'), dep: () => undefined }), /host key mismatch/);
   } finally { up.kill(); }
 });
+
+test('plugin API: exec and spawn share one connection per host, reconnect after a drop', { skip }, async () => {
+  const { execPooled, spawnOn, closePool } = await import('../src/plugins/ssh/index.js');
+  let connects = 0;
+  const log: any = { connection: (m: string) => { if (/ssh connected/.test(m)) connects++; }, warn() {}, debug() {}, info() {} };
+  const h: any = { name: 'pool', host: '127.0.0.1', port, username: os.userInfo().username, auth: 'key', privateKey: fs.readFileSync(keyFile!, 'utf8') };
+  const g = { connectTimeoutMs: 5000, keepaliveSec: 0 };
+  try {
+    const rs = await Promise.all([1, 2, 3].map((i) => execPooled(h, g, `echo ${i}`, log)));
+    assert.deepEqual(rs.map((r) => r.stdout.trim()), ['1', '2', '3']);
+    assert.equal((await execPooled(h, g, 'cat', log, 'in')).stdout, 'in');
+    const p = await spawnOn(h, g, 'cat', log);
+    let out = ''; p.stdout.on('data', (d: Buffer) => (out += d));
+    p.stdin.end('streamed');
+    assert.equal(await p.done, 0);
+    assert.equal(out, 'streamed');
+    assert.equal(connects, 1, 'one connection for all of it');
+    closePool();
+    assert.equal((await execPooled(h, g, 'echo again', log)).stdout.trim(), 'again');
+    assert.equal(connects, 2, 'a closed connection is replaced');
+    assert.equal((await execPooled({ ...h, port: port }, { ...g, connectTimeoutMs: 4000 }, 'true', log)).code, 0);
+    assert.equal(connects, 3, 'changed settings: new connection');
+  } finally { closePool(); }
+});

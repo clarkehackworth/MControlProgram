@@ -40,7 +40,7 @@ test('loader drops plugins with unmet dependencies (transitively), resolves api'
   const ids = plugins.list().map((p) => p.id);
   assert.ok(ids.includes('dep-ok') && ids.includes('browserpaw') && ids.includes('ssh'));
   for (const id of ['dep-bad', 'dep-missing', 'dep-chain']) assert.ok(!ids.includes(id), id);
-  assert.ok(r.errors.some((e) => /dep-bad: unmet dependencies: ssh \^9\.0\.0 \(found 0\.2\.2\)/.test(e)));
+  assert.ok(r.errors.some((e) => /dep-bad: unmet dependencies: ssh \^9\.0\.0 \(found 0\.2\.3\)/.test(e)));
   assert.ok(r.errors.some((e) => /dep-missing: .*nope \* \(not loaded\)/.test(e)));
   assert.ok(r.errors.some((e) => /dep-chain: .*dep-bad/.test(e)));
   const dep = depResolver(plugins.get('browserpaw')!);

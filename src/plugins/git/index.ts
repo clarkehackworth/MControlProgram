@@ -53,6 +53,7 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'edit_pr', ro: false, description: 'Edit a pull request: title, body, base, close / reopen, draft, labels, assignees, reviewers' },
   { name: 'review_pr', ro: false, description: 'Review a pull request: approve, request changes or comment' },
   { name: 'base_push', ro: false, description: 'submit_patch or git push straight to a base branch, without a PR' },
+  { name: 'delete_branch', ro: false, description: 'Delete an agent branch on the remote (also merge_pr with delete_branch)' },
 ];
 const RO = Object.fromEntries(FEATURES.map((f) => [f.name, f.ro]));
 const featureList = FEATURES.map((f) => ({ name: f.name, description: f.description, annotations: { readOnlyHint: f.ro } }));
@@ -411,7 +412,7 @@ const plugin: MControlProgramPlugin = {
   name: 'Git',
   version: '0.4.0',
   navOrder: 35,
-  dependencies: { mcp: '^0.2.0', ssh: '^0.2.2' },
+  dependencies: { mcp: '^0.2.0', ssh: '^0.2.3' },
   description: 'Agents with a read-only clone fetch from and push to MControlProgram (or submit patches); it commits and pushes from clones on a git host (SSH or this machine) to any git server, and opens PRs on GitHub, GitLab or Gitea / Forgejo. Every tool and git feature is allow / ask / deny per repo.',
   init(h) {
     // was the `github` plugin: its tables become ours (core moved its config, instances and approvals)
@@ -521,12 +522,22 @@ const plugin: MControlProgramPlugin = {
     const prov = (r: Repo, call: ToolCallContext) => provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
     const checkBase = (r: Repo, base?: string) => { if (base && r.baseBranches.length && !r.baseBranches.includes(base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`); };
     const names = z.array(z.string()).optional();
+    /** `b` if it is an agent branch (never a base branch, even with an empty prefix). */
+    const deletable = async (r: Repo, b: string, log: ScopedLogger) => {
+      if (!b.startsWith(r.branchPrefix) || agentBranch(r, b) !== b || (await baseOf(r, log)).includes(b)) throw new Error(`"${b}" is not an agent branch; only those can be deleted here`);
+      return b;
+    };
+    const deleteBranch = (r: Repo, branch: string, log: ScopedLogger) => locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
+g push -q --no-verify origin --delete ${q(branch)}
+g update-ref -d ${q(`refs/remotes/origin/${branch}`)} || true`, log));
 
     const tools: ToolDefinition[] = [
       {
-        name: 'repos', description: 'Repos you can work on through MControlProgram: origin URL to clone read-only, agent branch prefix, PR base branches and sensitive paths.',
+        name: 'repos', description: 'Repos you can work on through MControlProgram: origin URL to clone read-only, agent branch prefix, base branches (PR targets; pushing straight to one needs approval) and sensitive paths.',
         inputSchema: {}, annotations: { readOnlyHint: true },
-        handler: () => text(JSON.stringify(exposed.map((r) => ({ name: r.name, origin: r.url, description: r.description, branchPrefix: r.branchPrefix, baseBranches: r.baseBranches, sensitivePaths: r.askPaths })), null, 2)),
+        // base branches: configured, else origin's default branch (what PRs target and base_push may push to)
+        handler: async () => text(JSON.stringify(await Promise.all(exposed.map(async (r) => ({ name: r.name, origin: r.url, description: r.description, branchPrefix: r.branchPrefix,
+          baseBranches: await baseOf(r, ctx.log).catch(() => r.baseBranches), sensitivePaths: r.askPaths }))), null, 2)),
       },
       tool('resolve', 'Fetch the repo, then give the commit sha of `ref` (branch, tag or sha) so you can `git fetch && git checkout <sha>` in your read-only clone and work on exactly what MControlProgram has. Without `ref`: list branches and tags with their shas and the default branch.',
         { ref: z.string().optional().describe('Branch, tag or commit sha') },
@@ -592,6 +603,14 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           ctx.log.info(`${r.name}: ${what} (${x.sha.slice(0, 12)}) for ${call.principal ?? 'agent'}, ${by}`);
           return { branch, sha: x.sha, base: x.base, commits: x.commits, files: x.files, forced: x.force, sync: `git fetch origin ${branch} && git checkout ${x.sha}` };
         }),
+      tool('delete_branch', 'Delete an agent branch on the remote (e.g. after its PR merged). Only branches with the repo prefix.',
+        { branch: z.string() },
+        async (r, a, call, gate) => {
+          const branch = await deletable(r, agentBranch(r, a.branch), call.log);
+          await gate(['delete_branch'], `delete ${branch}`, { branch });
+          await deleteBranch(r, branch, call.log);
+          return { deleted: branch };
+        }),
       ...(exposed.some((r) => r.h.provider !== 'none') ? [
         tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it.',
           {
@@ -624,11 +643,16 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
             number: z.number().int(), method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Default merge'),
             sha: z.string().optional().describe('Merge only if the head is still this commit'),
             title: z.string().optional().describe('Merge / squash commit title'), message: z.string().optional().describe('Merge / squash commit message'),
+            delete_branch: z.boolean().optional().describe('Then delete the head branch (agent branches only)'),
           },
           async (r, a, call, gate) => {
             const p = prov(r, call);
-            await gate(['merge_pr'], `merge #${a.number}${a.method ? ` (${a.method})` : ''}${a.sha ? ` at ${a.sha.slice(0, 12)}` : ''}`, { number: a.number, method: a.method, sha: a.sha });
-            return p.merge(a.number, a);
+            const head = a.delete_branch ? await deletable(r, (await p.get(a.number)).head, call.log) : undefined;
+            await gate(['merge_pr', ...(head ? ['delete_branch'] : [])], `merge #${a.number}${a.method ? ` (${a.method})` : ''}${a.sha ? ` at ${a.sha.slice(0, 12)}` : ''}${head ? `, delete ${head}` : ''}`,
+              { number: a.number, method: a.method, sha: a.sha, delete: head });
+            const m = await p.merge(a.number, a);
+            if (head && m.merged) await deleteBranch(r, head, call.log);
+            return { ...m, ...(head && m.merged ? { deleted: head } : {}) };
           }),
         tool('edit_pr', 'Edit a pull request: title, body, base, close / reopen, draft (not on GitHub), and add or remove labels, assignees and requested reviewers (usernames). Returns the PR as `pr` does.',
           {
@@ -752,7 +776,7 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
         const why = (c: (typeof cmds)[number]) => {
           if (!/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(c.old) || !/^[0-9a-f]{40}([0-9a-f]{24})?$/.test(c.nu)) return 'malformed update';
           if (!c.ref.startsWith('refs/heads/')) return 'only branches can be pushed';
-          if (ZERO.test(c.nu)) return 'deleting branches is not supported';
+          if (ZERO.test(c.nu)) return `delete agent branches with ${prefix}_delete_branch`;
           const b = c.ref.slice('refs/heads/'.length);
           if (bases.includes(b)) return '';
           try { const a = agentBranch(r, b); return a === b ? '' : `push to an agent branch: git push mcp HEAD:${a}${bases.length ? ` (or to a base branch, with approval: ${bases.join(', ')})` : ''}`; } catch (e) { return (e as Error).message; }
@@ -789,7 +813,7 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
     return {
       tools,
       http,
-      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr.',
+      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr; {prefix}_pr shows its checks and reviews, {prefix}_review_pr / {prefix}_edit_pr / {prefix}_merge_pr (with delete_branch) finish it, all through MControlProgram (merge with merge_pr rather than merging locally). Pushing straight to a base branch ({prefix}_repos lists them) works too but needs approval; if a push or call says it awaits approval, repeat it later.',
       status: () => ({ repos: exposed.map((r) => ({ name: r.name, host: r.host, origin: r.url })) }),
     };
   },

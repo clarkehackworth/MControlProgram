@@ -227,34 +227,94 @@ export async function openTunnel(host: HostCfg, g: { connectTimeoutMs: number; k
   };
 }
 
+const execOn = (c: Conn, cmd: string, input?: string) => new Promise<{ stdout: string; stderr: string; code: number | null; hostKey?: string }>((resolve, reject) => {
+  c.client.exec(cmd, (err, ch) => {
+    if (err) return reject(err);
+    let out = '', errOut = '';
+    ch.on('data', (d: Buffer) => (out += d.toString())); ch.stderr.on('data', (d: Buffer) => (errOut += d.toString()));
+    ch.on('close', (code: number | null) => resolve({ stdout: out, stderr: errOut, code, hostKey: c.hostKey }));
+    if (input !== undefined) ch.end(input);
+  });
+});
+
 /** One-shot exec on a fresh connection (used by plugin-level actions). Also returns the presented host key. */
 async function execOnce(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log'], input?: string) {
   const c = await connect(host, g, log);
-  try {
-    return await new Promise<{ stdout: string; stderr: string; code: number | null; hostKey?: string }>((resolve, reject) => {
-      c.client.exec(cmd, (err, ch) => {
-        if (err) return reject(err);
-        let out = '', errOut = '';
-        ch.on('data', (d: Buffer) => (out += d.toString())); ch.stderr.on('data', (d: Buffer) => (errOut += d.toString()));
-        ch.on('close', (code: number | null) => resolve({ stdout: out, stderr: errOut, code, hostKey: c.hostKey }));
-        if (input !== undefined) ch.end(input);
-      });
-    });
-  } finally { c.client.end(); }
+  try { return await execOn(c, cmd, input); } finally { c.client.end(); }
+}
+
+/**
+ * Plugin API calls share one connection per host, closed after POOL_IDLE_MS without a command running.
+ * A host whose settings change gets a new connection; a dropped one is replaced on the next call.
+ */
+// ponytail: sshd's MaxSessions (default 10) caps concurrent commands on one connection; a refused channel falls back to a fresh connection
+export const POOL_IDLE_MS = 60_000;
+type PoolEntry = { key: string; conn: Promise<Conn>; busy: number; timer?: NodeJS.Timeout };
+const pool = new Map<string, PoolEntry>();
+function drop(name: string, e: PoolEntry) {
+  if (pool.get(name) !== e) return;
+  pool.delete(name);
+  clearTimeout(e.timer);
+  void e.conn.then((c) => c.client.end(), () => {});
+}
+async function acquire(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, log: PluginContext['log']): Promise<{ c: Conn; release(): void }> {
+  const key = JSON.stringify([host, g.connectTimeoutMs, g.keepaliveSec]);
+  let e = pool.get(host.name);
+  if (e && e.key !== key) { const old = e; old.busy ? pool.delete(host.name) : drop(host.name, old); e = undefined; } // busy: ends when released
+  if (!e) {
+    const ne: PoolEntry = (e = { key, conn: connect(host, g, log), busy: 0 });
+    pool.set(host.name, ne);
+    ne.conn.then((c) => c.client.on('close', () => { if (pool.get(host.name) === ne) pool.delete(host.name); }), () => { if (pool.get(host.name) === ne) pool.delete(host.name); });
+  }
+  const entry = e;
+  clearTimeout(entry.timer);
+  entry.busy++;
+  let c: Conn;
+  try { c = await entry.conn; } catch (err) { entry.busy--; throw err; }
+  if (!c.ready) { entry.busy--; drop(host.name, entry); return acquire(host, g, log); }
+  let released = false;
+  return {
+    c,
+    release() {
+      if (released) return;
+      released = true;
+      if (--entry.busy) return;
+      if (pool.get(host.name) !== entry) { c.client.end(); return; } // replaced while busy
+      entry.timer = setTimeout(() => drop(host.name, entry), POOL_IDLE_MS);
+      entry.timer.unref?.();
+    },
+  };
+}
+/** Closes every pooled connection (tests, shutdown). */
+export function closePool() { for (const [n, e] of [...pool]) drop(n, e); }
+const channelRefused = (e: unknown) => /channel open failure|open failed|administratively prohibited/i.test(String((e as Error)?.message ?? e));
+export async function execPooled(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log'], input?: string) {
+  const { c, release } = await acquire(host, g, log);
+  try { return await execOn(c, cmd, input); }
+  catch (e) { if (channelRefused(e)) return execOnce(host, g, cmd, log, input); throw e; }
+  finally { release(); }
 }
 
 /** A command whose stdin/stdout stream (binary-safe, with backpressure). */
 export interface Proc { stdin: Writable; stdout: Readable; stderr: Readable; done: Promise<number | null>; kill(): void }
-async function spawnOn(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log']): Promise<Proc> {
+export async function spawnOn(host: HostCfg, g: { connectTimeoutMs: number; keepaliveSec: number }, cmd: string, log: PluginContext['log']): Promise<Proc> {
   if (host.auth === 'native') {
     const p = spawnLocal(cmd, { shell: true, stdio: 'pipe' });
     return { stdin: p.stdin, stdout: p.stdout, stderr: p.stderr, done: new Promise((r) => { p.on('close', r); p.on('error', () => r(127)); }), kill: () => p.kill('SIGKILL') };
   }
-  const c = await connect(host, g, log);
+  const { c, release } = await acquire(host, g, log);
   return new Promise((resolve, reject) => c.client.exec(cmd, (err, ch) => {
-    if (err) { c.client.end(); return reject(err); }
-    const done = new Promise<number | null>((r) => ch.on('close', (code: number | null) => { c.client.end(); r(code ?? null); }));
-    resolve({ stdin: ch, stdout: ch, stderr: ch.stderr, done, kill: () => { ch.close(); c.client.end(); } });
+    if (err) {
+      release();
+      if (!channelRefused(err)) return reject(err);
+      // fresh connection, closed when the command exits
+      return connect(host, g, log).then((fc) => fc.client.exec(cmd, (e2, ch2) => {
+        if (e2) { fc.client.end(); return reject(e2); }
+        resolve({ stdin: ch2, stdout: ch2, stderr: ch2.stderr, done: new Promise((r) => ch2.on('close', (code: number | null) => { fc.client.end(); r(code ?? null); })), kill: () => { ch2.close(); fc.client.end(); } });
+      }), reject);
+    }
+    const done = new Promise<number | null>((r) => ch.on('close', (code: number | null) => { release(); r(code ?? null); }));
+    resolve({ stdin: ch, stdout: ch, stderr: ch.stderr, done, kill: () => ch.close() });
   }));
 }
 
@@ -266,9 +326,9 @@ const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max) + `\n
  */
 export interface SshApi {
   hostNames(): string[];
-  /** Run one command on a fresh connection; `input` is written to its stdin, then closed (since 0.2.1). */
+  /** Run one command; `input` is written to its stdin, then closed (since 0.2.1). Connections are shared per host and closed when idle (since 0.2.3). */
   exec(host: string, cmd: string, log: PluginContext['log'], input?: string): Promise<{ stdout: string; stderr: string; code: number | null }>;
-  /** Run one command on a fresh connection with streaming stdin/stdout (since 0.2.2); the connection closes when it exits. */
+  /** Run one command with streaming stdin/stdout (since 0.2.2), on the host's shared connection. */
   spawn(host: string, cmd: string, log: PluginContext['log']): Promise<Proc>;
   /** `ssh -L` to remoteHost:remotePort as seen from `host`; see openTunnel. */
   openTunnel(host: string, remoteHost: string, remotePort: number, log: PluginContext['log']): Promise<{ port: number; close(): void }>;
@@ -283,13 +343,13 @@ const pinnedHost = (name: string) => {
 };
 const api: SshApi = {
   hostNames: () => ((host.config().hosts ?? []) as HostCfg[]).map((h) => h.name),
-  exec: (name, cmd, log, input) => { const { h, g } = pinnedHost(name); return execOnce(h, g, cmd, log, input); },
+  exec: (name, cmd, log, input) => { const { h, g } = pinnedHost(name); return execPooled(h, g, cmd, log, input); },
   spawn: (name, cmd, log) => { const { h, g } = pinnedHost(name); return spawnOn(h, g, cmd, log); },
   openTunnel: (name, rh, rp, log) => { const { h, g } = pinnedHost(name); return openTunnel(h, g, rh, rp, log); },
 };
 
 const plugin: MControlProgramPlugin = {
-  id: 'ssh', name: 'SSH', version: '0.2.2', navOrder: 10,
+  id: 'ssh', name: 'SSH', version: '0.2.3', navOrder: 10,
   api,
   init(h) { host = h; cmdRules.init(h); },
   description: 'Execute commands, run persistent shells, and transfer files over SSH on admin-configured hosts.',

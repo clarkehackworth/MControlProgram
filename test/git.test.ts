@@ -104,6 +104,15 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   assert.match(asks.at(-1).summary, /as Ada Lovelace <ada@example\.com>/);
 
   assert.equal(sh(origin, 'rev-parse', 'refs/heads/main'), main, 'base branch untouched');
+  // repos: the default branch counts as a base branch when none are configured
+  assert.deepEqual(json(await inst.tools.find((x: any) => x.name === 'repos').handler({}, call))[0].baseBranches, ['main']);
+  // delete_branch: agent branches only
+  sh(clone, 'push', '-q', 'origin', `${main}:refs/heads/agent/old`);
+  await assert.rejects(t('delete_branch').handler({ branch: 'main' }, call), /agent\/main.*does not exist/s, 'prefixed, so never main');
+  assert.equal(sh(origin, 'rev-parse', 'main'), main);
+  assert.deepEqual(json(await t('delete_branch').handler({ branch: 'old' }, call)), { deleted: 'agent/old' });
+  assert.deepEqual(asks.at(-1).subject.features, ['delete_branch']);
+  assert.throws(() => sh(origin, 'rev-parse', '--verify', '-q', 'refs/heads/agent/old'));
   await assert.rejects(t('submit_patch').handler({ base: 'deadbeef', patch: diff, branch: 'x', message: 'm' }, call), /not on the remote/);
   await assert.rejects(t('submit_patch').handler({ base: main, patch: 'diff --git a/nope b/nope\n--- a/nope\n+++ b/nope\n@@ -1 +1 @@\n-a\n+b\n', branch: 'x', message: 'm' }, call), /does not apply/);
   assert.equal(fs.readdirSync(path.join(tmp, 'repos/demo/.git/mcontrolprogram-work')).length, 0, 'worktrees cleaned up');
