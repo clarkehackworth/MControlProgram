@@ -104,11 +104,21 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   assert.match(asks.at(-1).summary, /as Ada Lovelace <ada@example\.com>/);
 
   assert.equal(sh(origin, 'rev-parse', 'refs/heads/main'), main, 'base branch untouched');
+  // a base branch by its exact name: pushed there (base_push), fast-forward only
+  fs.writeFileSync(path.join(clone, 'README.md'), 'to main\n');
+  const toMain = sh(clone, 'diff', 'README.md') + '\n';
+  const rm = json(await t('submit_patch').handler({ base: main, patch: toMain, branch: 'main', message: 'readme: to main' }, call));
+  assert.equal(rm.branch, 'main');
+  assert.equal(sh(origin, 'rev-parse', 'refs/heads/main'), rm.sha);
+  assert.deepEqual(asks.at(-1).subject.features, ['submit_patch', 'base_push']);
+  await assert.rejects(t('submit_patch').handler({ base: main, patch: toMain, branch: 'main', message: 'again', force: true }, call), /never rewritten/);
+  assert.equal(sh(origin, 'rev-parse', 'refs/heads/main'), rm.sha);
+  sh(origin, 'update-ref', 'refs/heads/main', main); // back, for the tests below
   // repos: the default branch counts as a base branch when none are configured
   assert.deepEqual(json(await inst.tools.find((x: any) => x.name === 'repos').handler({}, call))[0].baseBranches, ['main']);
   // delete_branch: agent branches only
   sh(clone, 'push', '-q', 'origin', `${main}:refs/heads/agent/old`);
-  await assert.rejects(t('delete_branch').handler({ branch: 'main' }, call), /agent\/main.*does not exist/s, 'prefixed, so never main');
+  await assert.rejects(t('delete_branch').handler({ branch: 'main' }, call), /is a base branch/);
   assert.equal(sh(origin, 'rev-parse', 'main'), main);
   assert.deepEqual(json(await t('delete_branch').handler({ branch: 'old' }, call)), { deleted: 'agent/old' });
   assert.deepEqual(asks.at(-1).subject.features, ['delete_branch']);
@@ -193,6 +203,8 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
     await act('set_tool_rule', { upstream: 'demo', tool: 'base_push', action: '' });
     await run(a2, 'git push -q mcp HEAD:main');
     assert.deepEqual(asks.at(-1).subject.features, ['git_push', 'base_push']);
+    assert.equal(sh(origin, 'rev-parse', 'main'), mine);
+    await refused(run(a2, 'git push -f mcp HEAD~1:main'), /never rewritten/);
     assert.equal(sh(origin, 'rev-parse', 'main'), mine);
 
     // rewrite: force needs force_push, and touching CI asks for sensitive_paths

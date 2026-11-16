@@ -575,28 +575,28 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
             ...(/\/\/(localhost|127\.)/.test(url) ? { note: "This URL is the server's default; if you can't reach it, ask the admin to set the server's Public URL." } : {}),
           };
         }),
-      tool('submit_patch', 'Apply your change on `base` (the commit you started from, see resolve), commit it and push it to an agent branch. `patch` is `git format-patch --stdout <base>` output (keeps your commits and messages; preferred) or a plain `git diff` plus `message`. Pushing over a branch you pushed before needs it to fast-forward, else `force: true`. Commits are authored and committed by the git identity of MControlProgram, with an Assisted-by trailer naming you (`assisted_by`), so they get new shas: returns the pushed sha, `git fetch origin <branch>` to sync. Binary files need `format-patch --binary`.',
+      tool('submit_patch', 'Apply your change on `base` (the commit you started from, see resolve), commit it and push it to an agent branch, or to a base branch when \`branch\` names one exactly (see repos; needs approval, never rewritten). `patch` is `git format-patch --stdout <base>` output (keeps your commits and messages; preferred) or a plain `git diff` plus `message`. Pushing over a branch you pushed before needs it to fast-forward, else `force: true`. Commits are authored and committed by the git identity of MControlProgram, with an Assisted-by trailer naming you (`assisted_by`), so they get new shas: returns the pushed sha, `git fetch origin <branch>` to sync. Binary files need `format-patch --binary`.',
         {
           base: z.string().describe('Commit sha (or branch/tag) the patch was made on'),
           patch: z.string().describe('git format-patch --stdout output, or a unified git diff'),
-          branch: z.string().describe('Agent branch to push to; the repo prefix is added if missing'),
+          branch: z.string().describe('Agent branch to push to (the repo prefix is added if missing), or a base branch by its exact name'),
           message: z.string().optional().describe('Commit message, required for a plain diff'),
           force: z.boolean().optional().describe('Allow rewriting the branch (not a fast-forward)'),
-          to_base: z.boolean().optional().describe('`branch` is a base branch (see repos): push straight to it, no PR. Needs approval.'),
           assisted_by: z.string().optional().describe('Who made the change, for the Assisted-by trailer, e.g. "Claude Code (claude-opus-5-5)". Default: your MCP client name and version.'),
           committer_name: z.string().optional().describe("Author and committer name (with committer_email) instead of MControlProgram's git identity"),
           committer_email: z.string().optional().describe('Committer email, with committer_name'),
         },
         async (r, a, call, gate) => {
           if (Buffer.byteLength(a.patch) > r.maxPatchKB * 1024) throw new Error(`patch is over ${r.maxPatchKB} KB`);
-          if (a.to_base && !(await baseOf(r, call.log)).includes(a.branch)) throw new Error(`"${a.branch}" is not a base branch`);
-          const branch = a.to_base ? a.branch : agentBranch(r, a.branch);
+          const toBase = (await baseOf(r, call.log)).includes(a.branch);
+          const branch = toBase ? a.branch : agentBranch(r, a.branch);
           const ident = identity(a.committer_name, a.committer_email);
           const assisted = assistTrailer(r.assistTrailer, a.assisted_by, call.client);
           const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal, ident, assisted }, call.log);
+          if (toBase && x.force) throw new Error(`${branch} is a base branch and is never rewritten: your commits don't build on its current ${x.previous}. Rebase onto it (resolve ${branch}) and submit again.`);
           if (x.force && !a.force) throw new Error(`${branch} is at ${x.previous}, which your commits don't build on. Rebase onto it (resolve ${branch}), or pass force: true to replace it.`);
           const sensitive = x.files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
-          const features = ['submit_patch', ...(a.to_base ? ['base_push'] : []), ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+          const features = ['submit_patch', ...(toBase ? ['base_push'] : []), ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
           const what = `${x.force ? 'force-push' : 'push'} ${x.commits} commit(s) to ${branch}: ${x.files.length} file(s)${ident ? `, as ${ident.name} <${ident.email}>` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
           const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force, ident, assisted });
           await push(run, r, x, branch, call.log);
@@ -606,6 +606,7 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
       tool('delete_branch', 'Delete an agent branch on the remote (e.g. after its PR merged). Only branches with the repo prefix.',
         { branch: z.string() },
         async (r, a, call, gate) => {
+          if ((await baseOf(r, call.log)).includes(a.branch)) throw new Error(`"${a.branch}" is a base branch; only agent branches can be deleted`);
           const branch = await deletable(r, agentBranch(r, a.branch), call.log);
           await gate(['delete_branch'], `delete ${branch}`, { branch });
           await deleteBranch(r, branch, call.log);
@@ -702,6 +703,7 @@ g diff --name-only -z "$base" "$new"
         const sensitive = files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
         // commits are expected under the host's identity (clone_url sets it up); anyone else is custom_identity
         const others = (kv.ids ?? '').split('\t').filter((x) => x && x !== `${r.h.committerName} <${r.h.committerEmail}>`);
+        if (base && force) throw new Error(`${branch} is a base branch and is never rewritten: fetch, rebase onto mcp/${branch} and push again`);
         const features = ['git_push', ...(base ? ['base_push'] : []), ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
         const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${others.length ? `, as ${others.slice(0, 3).join(', ')}` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
         try {
@@ -813,7 +815,7 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
     return {
       tools,
       http,
-      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr; {prefix}_pr shows its checks and reviews, {prefix}_review_pr / {prefix}_edit_pr / {prefix}_merge_pr (with delete_branch) finish it, all through MControlProgram (merge with merge_pr rather than merging locally). Pushing straight to a base branch ({prefix}_repos lists them) works too but needs approval; if a push or call says it awaits approval, repeat it later.',
+      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr; {prefix}_pr shows its checks and reviews, {prefix}_review_pr / {prefix}_edit_pr / {prefix}_merge_pr (with delete_branch) finish it, all through MControlProgram (merge with merge_pr rather than merging locally). Pushing straight to a base branch ({prefix}_repos lists them) works too, by its exact name (git push mcp HEAD:main, or submit_patch with branch "main"), but needs approval and must fast-forward; if a push or call says it awaits approval, repeat it later.',
       status: () => ({ repos: exposed.map((r) => ({ name: r.name, host: r.host, origin: r.url })) }),
     };
   },
