@@ -359,7 +359,7 @@ This plugin used to be called `github`. On startup MControlProgram moves the old
 
 Pair repos with servers like any inventory.
 
-The host's clone is only used through its object store and `origin`. Each patch is applied in a throwaway worktree under `.git/mcontrolprogram-work/`, so the clone's own checkout is never touched.
+Each patch is applied in a throwaway worktree under `.git/mcontrolprogram-work/`, so `submit_patch` and `git push mcp` never touch the clone's own checkout. Only the `git`, `write_file` and `push` tools (below) work in it.
 
 Agent workflow:
 
@@ -385,4 +385,18 @@ Agent workflow:
   - Refused, failed or pending refs show as `! [remote rejected]` with the reason, and the mirror goes back to origin's value. While an ask is pending, re-running the same push checks back.
   - Pushes over the repo's max patch size get a 413. Objects are fsck'ed. Hooks never run.
 
-**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools (`clone_url` also covers fetching over HTTP), `git_push`, and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own name and email, or pushed commits by anyone but the host's identity) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.
+**Working in the host clone.** Agents without a clone of their own (or that shouldn't fetch from the git server) can do the git work in MControlProgram's clone:
+
+- **`git {command, args}`** runs one git subcommand there and returns its output and exit code. A conflict doesn't throw: it exits non-zero and lists the files.
+  - Read-only, under the `workdir_read` rule: `status`, `log`, `diff`, `show`, `ls-files`, `rev-parse`, `merge-base`, `describe`, `shortlog`.
+  - Changing, under `workdir`: `pull`, `fetch`, `switch`, `checkout`, `restore`, `branch`, `stash`, `merge`, `rebase`, `cherry-pick`, `revert`, `reset`, `add`, `rm`, `mv`, `commit`, `clean`.
+  - No `push` (see below), `config`, `remote`, `submodule` or `am`. Options that run commands or read or write outside the clone are refused, under any abbreviation: `--exec`, `--upload-pack`, `--receive-pack`, `--output`, `--no-index`, `--pathspec-from-file`, `--file`, `--template`, `--contents`, `--recurse-submodules`, `--ignore-revs-file`, plus `-F`/`-t` on commit, `-F` on merge, `-x` on rebase. `pull` and `fetch` take only `origin` as remote. Give option values as `--opt=value`, messages as `--message=` (`-mFix` reads as `-F`).
+  - Editors and pagers are off (`commit --no-edit` takes the merge message), hooks never run, and commits are by the host's identity. Output is capped at 100 KB.
+- **`write_file {path, content}`** writes a file and stages it, which resolves a conflict. It goes through the index (`hash-object` + `update-index` + `checkout-index`), so git refuses paths in `.git` and replaces symlinks on the way: nothing lands outside the clone. Rule `workdir`; content up to the max patch size.
+- **`push {branch, source?, force?}`** pushes `source` (default `HEAD`) to an agent branch, or to a base branch by its exact name. Checks: `push`, plus `base_push`, `force_push`, `custom_identity` and `sensitive_paths` as for `git push mcp`. Base branches are never rewritten; rewriting an agent branch needs `force: true`. Pushing what the branch already has returns `unchanged`.
+
+A conflict, start to finish: `git pull --no-rebase origin main` → exit 1, `CONFLICT … README.md`; `git show :1:README.md` / `:2:` / `:3:` for base, ours and theirs; `write_file README.md`; `git commit --no-edit` (or `rebase --continue`, `cherry-pick --continue`; `merge --abort` to give up); `push {branch: "fix"}`.
+
+The clone is shared by every agent with the repo: calls run one at a time per repo, but nothing stops two agents switching branches under each other. Its local branches, stashes and commits are never served by the mirror.
+
+**Access rules.** The plugin page has the same per-tool panel as the MCP pass-through, grouped by repo, with its own tables and a call log. A new install starts at *allow read-only, ask the rest*. The rules cover the tools (`clone_url` also covers fetching over HTTP), `git_push`, `push`, `workdir_read` / `workdir` (the host clone tools), and three git features: `force_push` (a submit that isn't a fast-forward), `custom_identity` (a submit with the agent's own name and email, or pushed commits by anyone but the host's identity) and `sensitive_paths` (a submit touching the repo's sensitive paths; CI workflows can read repository secrets). A call checks every feature it touches. Any deny refuses the call, and any ask produces **one** ask for the whole call, since an approval is used by a single execution. Enable/Disable on that ask sets the rule for each of those features. The server's own Tool rules still apply on top.
