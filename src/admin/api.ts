@@ -2,7 +2,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { readFileSync } from 'node:fs';
 import { z } from 'zod';
-import { servers, instances, bearerTokens, admins, logs, pluginConfig, propagateRenames } from '../core/store.js';
+import { servers, instances, bearerTokens, admins, logs, pluginConfig, propagateRenames, apiKeys, API_PERMISSIONS, type ApiPermission } from '../core/store.js';
 import { approvals } from '../core/approvals.js';
 import { plugins, loadPlugins, depResolver } from '../core/plugin-loader.js';
 import { manager } from '../mcp/manager.js';
@@ -11,7 +11,7 @@ import { throttle } from '../core/http-guard.js';
 import { hashPassword, verifyPassword } from '../core/crypto.js';
 import { SERVER_LOG_LEVELS, ScopedLogger, log, onLog } from '../core/logger.js';
 import { setting } from '../core/db.js';
-import { getGlobalConfig, setGlobalConfig, GLOBAL_DEFAULTS } from '../core/global-config.js';
+import { getGlobalConfig, setGlobalConfig, GLOBAL_DEFAULTS, APPROVAL_CHANNELS } from '../core/global-config.js';
 
 const DUMMY_HASH = hashPassword('dummy-for-constant-time');
 const COOKIE = 'mcontrolprogram_session';
@@ -224,6 +224,18 @@ export function adminApi() {
   r.delete('/oauth/clients/:cid', wrap((req) => { oauthClients.delete(req.params.cid as string); }));
   r.get('/servers/:id/oauth/tokens', wrap((req) => oauthClients.tokens(req.params.id as string)));
 
+  // ---- admin API keys (external apps; used on /api/v1) ----
+  const perms = z.array(z.enum(API_PERMISSIONS));
+  r.get('/api-keys', wrap(() => ({ keys: apiKeys.list(), permissions: API_PERMISSIONS })));
+  r.post('/api-keys', wrap((req) => {
+    const { name, permissions } = z.object({ name: z.string().min(1).max(64), permissions: perms }).parse(req.body);
+    const k = apiKeys.create(name, permissions);
+    log({ level: 'info', category: 'auth', message: `API key "${name}" (${permissions.join(', ') || 'no permissions'}) created by ${(req as any).admin.username}` });
+    return k; // plaintext key returned once
+  }));
+  r.put('/api-keys/:kid', wrap((req) => { apiKeys.setPermissions(req.params.kid as string, z.object({ permissions: perms }).parse(req.body).permissions); }));
+  r.delete('/api-keys/:kid', wrap((req) => { apiKeys.delete(req.params.kid as string); log({ level: 'info', category: 'auth', message: `API key ${req.params.kid} deleted by ${(req as any).admin.username}` }); }));
+
   // ---- logs ----
   r.get('/logs', wrap((req) => logs.query({
     serverId: req.query.server as string | undefined, category: req.query.category as string | undefined, level: req.query.level as string | undefined,
@@ -243,9 +255,39 @@ export function adminApi() {
     servers: manager.all().length, plugins: plugins.list().length, global: getGlobalConfig(), globalDefaults: GLOBAL_DEFAULTS })));
   r.put('/system', wrap((req) => {
     setGlobalConfig(z.object({ stateIdleSec: z.number().int().min(60).optional(), connectionIdleSec: z.number().int().min(10).optional(), logRetentionDays: z.number().int().min(1).optional(),
-      approvalWaitSec: z.number().int().min(1).max(600).optional(), approvalMaxAttempts: z.number().int().min(1).optional(), approvalTtlSec: z.number().int().min(60).optional() }).parse(req.body));
+      approvalWaitSec: z.number().int().min(1).max(600).optional(), approvalMaxAttempts: z.number().int().min(1).optional(), approvalTtlSec: z.number().int().min(60).optional(),
+      approvalChannel: z.enum(APPROVAL_CHANNELS).optional(), approvalClientWaitSec: z.number().int().min(5).max(3600).optional() }).parse(req.body));
     return getGlobalConfig();
   }));
 
+  return r;
+}
+
+/**
+ * `/api/v1`: the API-key API for external apps (Control Tower in Hermes Desktop, scripts). Bearer `mcpk_…` keys only, never the
+ * admin cookie, so CORS can be open: a page elsewhere can't use it without a key. Each route needs a key permission.
+ */
+export function keyApi() {
+  const r = Router();
+  r.use((req, res, next) => {
+    res.set({ 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Max-Age': '600' });
+    if (req.method === 'OPTIONS') { res.status(204).end(); return; }
+    const m = /^Bearer\s+(mcpk_\S+)$/i.exec(req.headers.authorization ?? '');
+    // no login throttle: keys are 256-bit random, and a misconfigured poller would lock the admin's own IP out of login
+    const key = m ? apiKeys.verify(m[1]!) : undefined;
+    if (!key) { res.status(401).json({ error: 'missing or invalid API key' }); return; }
+    (req as any).apiKey = key;
+    next();
+  });
+  const need = (p: ApiPermission) => (req: Request, res: Response, next: NextFunction) => {
+    if (!(req as any).apiKey.permissions.includes(p)) { res.status(403).json({ error: `this API key lacks the "${p}" permission` }); return; }
+    if (p === 'approvals' && getGlobalConfig().approvalChannel !== 'api') { res.status(403).json({ error: 'API approvals are off: set Settings → Approval channel to "API keys" in MControlProgram' }); return; }
+    next();
+  };
+  r.get('/me', wrap((req) => { const k = (req as any).apiKey; return { name: k.name, permissions: k.permissions, approvalChannel: getGlobalConfig().approvalChannel, version: VERSION }; }));
+  r.get('/approvals', need('approvals'), wrap(() => ({ pending: approvals.list('pending'), recent: approvals.list('decided', { limit: 20 }) })));
+  r.post('/approvals/:id/:decision', need('approvals'), wrap((req) =>
+    approvals.decide(req.params.id as string, z.enum(['approved', 'denied']).parse(req.params.decision), `apikey:${(req as any).apiKey.name}`)));
+  r.use((_req, res) => { res.status(404).json({ error: 'not found' }); });
   return r;
 }

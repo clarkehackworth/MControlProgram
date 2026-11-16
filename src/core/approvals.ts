@@ -30,6 +30,8 @@ export interface AskRequest {
   feature: string; summary?: string; reason?: string;
   /** Identity of the ask: identical subjects are the same request. Defaults to args. */
   subject?: unknown;
+  /** Set by the runtime when the 'client' channel is on and the client supports elicitation: asks the client's user directly. */
+  elicit?: (message: string, signal: AbortSignal) => Promise<'accept' | 'decline' | 'cancel'>;
 }
 export type GateResult = { ok: true; by: string } | { ok: false; status: string; message: string };
 
@@ -38,7 +40,25 @@ export class ApprovalError extends Error { constructor(public status: string, me
 
 // in-memory waiters: a decision wakes the blocked call immediately instead of at the deadline
 const waiters = new Map<string, Set<() => void>>();
-const wake = (id: string) => { for (const w of waiters.get(id) ?? []) w(); waiters.delete(id); };
+const wake = (id: string) => { for (const w of waiters.get(id) ?? []) w(); waiters.delete(id); asking.get(id)?.ac.abort(); };
+
+// one open client prompt per request: identical retries wait on it instead of prompting again
+const asking = new Map<string, { done: Promise<void>; ac: AbortController }>();
+function askClient(id: string, req: AskRequest, what: string): Promise<void> {
+  const open = asking.get(id);
+  if (open) return open.done;
+  const ac = new AbortController();
+  const signal = req.signal ? AbortSignal.any([ac.signal, req.signal]) : ac.signal;
+  const args = JSON.stringify(req.args ?? {});
+  const message = [`MControlProgram: ${req.principal} wants ${what}`, req.reason && `Why it asks: ${req.reason}`, args !== '{}' && `Arguments: ${args.length > 500 ? args.slice(0, 500) + '…' : args}`].filter(Boolean).join('\n');
+  const done = req.elicit!(message, signal).then((a) => {
+    // 'cancel' = nobody answered: leave it pending for the Approvals page / a later retry
+    if (a !== 'cancel') try { approvals.decide(id, a === 'accept' ? 'approved' : 'denied', `${req.principal} via client`); } catch { /* decided elsewhere first */ }
+  }, (e) => { if (!signal.aborted) log({ level: 'warn', category: 'approval', serverId: req.serverId, message: `client approval prompt failed: ${String(e)}` }); })
+    .finally(() => asking.delete(id));
+  asking.set(id, { done, ac });
+  return done;
+}
 
 /** Canonical JSON so {a:1,b:2} and {b:2,a:1} are the same request. */
 const canon = (v: any): string => Array.isArray(v) ? `[${v.map(canon).join(',')}]`
@@ -127,9 +147,11 @@ export const approvals = {
     const attempts = (db.prepare('SELECT attempts FROM approvals WHERE id=?').get(id) as Row).attempts as number; // calls including this one
 
     if (rec!.status === 'pending') {
-      // block briefly in case the admin is watching
+      // block briefly in case the admin is watching; with a client prompt, until the client's user answers
+      const prompt = req.elicit ? askClient(id, req, what) : undefined;
       await new Promise<void>((resolve) => {
-        const t = setTimeout(done, g.approvalWaitSec * 1000);
+        const t = setTimeout(done, (prompt ? Math.max(g.approvalClientWaitSec, g.approvalWaitSec) : g.approvalWaitSec) * 1000);
+        void prompt?.then(done);
         function done() { clearTimeout(t); waiters.get(id)?.delete(done); req.signal?.removeEventListener('abort', done); resolve(); }
         (waiters.get(id) ?? waiters.set(id, new Set()).get(id)!).add(done);
         req.signal?.addEventListener('abort', done);

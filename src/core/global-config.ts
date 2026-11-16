@@ -17,6 +17,13 @@ export interface GlobalConfig {
   approvalMaxAttempts: number;
   /** Pending approval requests older than this expire. */
   approvalTtlSec: number;
+  /**
+   * Where asks are answered besides the Approvals page: 'ui' = only there; 'client' = also prompt the agent's own MCP client
+   * (elicitation, e.g. Hermes approval prompts); 'api' = also API keys with the `approvals` permission (e.g. Control Tower).
+   */
+  approvalChannel: 'ui' | 'client' | 'api';
+  /** With the client channel: how long a call waits on the client's prompt. Keep under the client's tool timeout (Hermes: 300s). */
+  approvalClientWaitSec: number;
 }
 
 export const GLOBAL_DEFAULTS: GlobalConfig = {
@@ -26,13 +33,18 @@ export const GLOBAL_DEFAULTS: GlobalConfig = {
   approvalWaitSec: 30,
   approvalMaxAttempts: 3,
   approvalTtlSec: 86400,
+  approvalChannel: 'ui',
+  approvalClientWaitSec: 240,
 };
+export const APPROVAL_CHANNELS = ['ui', 'client', 'api'] as const;
 
 export function getGlobalConfig(): GlobalConfig {
   const out = { ...GLOBAL_DEFAULTS };
   for (const k of Object.keys(out) as (keyof GlobalConfig)[]) {
     const v = setting.get(`global.${k}`);
-    if (v !== undefined && !isNaN(Number(v))) out[k] = Number(v);
+    if (v === undefined) continue;
+    if (typeof out[k] === 'string') (out as any)[k] = v;
+    else if (!isNaN(Number(v))) (out as any)[k] = Number(v);
   }
   return out;
 }

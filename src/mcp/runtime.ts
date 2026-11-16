@@ -15,7 +15,7 @@ import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { MControlProgramOAuthProvider } from './oauth.js';
 import { servers as serverStore, instances as instanceStore, bearerTokens, pluginConfig, type ServerRecord, type PluginInstanceRecord } from '../core/store.js';
-import { approvals, ApprovalError } from '../core/approvals.js';
+import { approvals, ApprovalError, type AskRequest } from '../core/approvals.js';
 import { plugins, depResolver } from '../core/plugin-loader.js';
 import { ScopedLogger, log } from '../core/logger.js';
 import { getGlobalConfig } from '../core/global-config.js';
@@ -258,7 +258,7 @@ export class RunningServer {
     session.calls++; session.lastSeen = t0;
     const lvl = this.record.log_level;
     try {
-      const base = { serverId: this.record.id, instanceId: li.record.id, instanceName: li.record.name, pluginId: li.plugin.id, tool: fullName, principal: session.principal, sessionId: session.id, args: args ?? {}, signal: extra.signal };
+      const base = { serverId: this.record.id, instanceId: li.record.id, instanceName: li.record.name, pluginId: li.plugin.id, tool: fullName, principal: session.principal, sessionId: session.id, args: args ?? {}, signal: extra.signal, elicit: this.elicitFor(session, extra) };
       const refuse = (status: string, message: string) => {
         if (lvl === 'tools' || lvl === 'full') log({ level: 'info', category: 'tool', serverId: this.record.id, pluginInstanceId: li.record.id, sessionId: session.id, message: `${fullName} by ${session.principal} ${status}` });
         return { content: [{ type: 'text' as const, text: message }], isError: true };
@@ -288,6 +288,14 @@ export class RunningServer {
         message: `${fullName} by ${session.principal} THREW ${Date.now() - t0}ms: ${msg}`, data: lvl === 'full' ? { args } : undefined });
       return { content: [{ type: 'text', text: msg }], isError: true };
     }
+  }
+
+  /** The 'client' approval channel: ask the client's own user via form elicitation (yes/no, no fields), tied to this tool call's stream. */
+  private elicitFor(session: Session, extra: any): AskRequest['elicit'] {
+    const g = getGlobalConfig();
+    if (g.approvalChannel !== 'client' || !session.mcp.server.getClientCapabilities()?.elicitation?.form) return undefined;
+    return async (message, signal) => (await session.mcp.server.elicitInput({ mode: 'form', message, requestedSchema: { type: 'object', properties: {} } },
+      { signal, timeout: g.approvalClientWaitSec * 1000, relatedRequestId: extra.requestId })).action;
   }
 
   // ---------- status ----------

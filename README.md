@@ -160,6 +160,23 @@ to the same request rather than creating duplicates. After *max attempts* (defau
 the agent to pause and ask the user. An approval is consumed by exactly one execution; a denial sticks
 for the request's lifetime (default 1 day). All three knobs live in Settings.
 
+### Answering asks outside MControlProgram
+
+**Settings → Approval channel** picks where else an ask can be answered (the Approvals page always works):
+
+- **MControlProgram only** (default).
+- **MCP client prompt**: if the agent's MCP client supports form elicitation, the gate asks the client's user directly
+  (Hermes shows it as its normal approval prompt) and the call waits up to *client prompt wait* seconds (default 240,
+  under Hermes' 300 s tool timeout). Accept = allow once, decline = deny once, no answer = stays pending. Recorded as
+  `decided_by = "<principal> via client"`. The client answers for itself, so use this only when the client process runs
+  outside the agent's sandbox.
+- **API keys**: external apps answer through `/api/v1` with an API key that has the `approvals` permission, e.g.
+  [Control Tower](https://github.com/clarkehackworth/control-tower) for Hermes Desktop. Create keys under **Settings → API keys**
+  (shown once, revocable, permissions editable). Endpoints, all `Authorization: Bearer mcpk_…`, CORS open since no cookie
+  is involved: `GET /api/v1/me`, `GET /api/v1/approvals` (`{pending, recent}`), `POST /api/v1/approvals/:id/approved|denied`.
+
+Asks from plugin HTTP bridges (BrowserPaw) have no MCP session to prompt, so they never use the client channel.
+
 BrowserPaw can only ask about URLs agents pass to browser tools: the browser can't pause a page load,
 so in the browser ask rules act as allow rules and *ask by default* acts as allow.
 

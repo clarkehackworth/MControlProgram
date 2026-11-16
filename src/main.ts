@@ -9,7 +9,7 @@ import { getGlobalConfig } from './core/global-config.js';
 import { admins } from './core/store.js';
 import { loadPlugins } from './core/plugin-loader.js';
 import { manager } from './mcp/manager.js';
-import { adminApi } from './admin/api.js';
+import { adminApi, keyApi } from './admin/api.js';
 import { log, pruneLogs } from './core/logger.js';
 import { approvals } from './core/approvals.js';
 import { guard } from './core/http-guard.js';
@@ -29,6 +29,7 @@ async function main() {
   app.use(guard(config.adminHost, config.publicUrl));
   app.use(express.json({ limit: '4mb' }));
   app.use(cookieParser());
+  app.use('/api/v1', keyApi());
   app.use('/api', adminApi());
   app.use('/api', (_req, res) => res.status(404).json({ error: 'not found' }));
 

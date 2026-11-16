@@ -138,6 +138,32 @@ export const pluginConfig = {
   },
 };
 
+/** What an admin API key may do. ponytail: one permission so far; add more here as external apps need them. */
+export const API_PERMISSIONS = ['approvals'] as const;
+export type ApiPermission = typeof API_PERMISSIONS[number];
+const keyRow = (r: Row) => ({ ...r, permissions: JSON.parse(r.permissions) as ApiPermission[] });
+
+/** Admin API keys for external apps (e.g. Control Tower in Hermes Desktop). Not MCP tokens: these reach /api/v1, never tools. */
+export const apiKeys = {
+  list: () => (getDb().prepare('SELECT id,name,prefix,permissions,created_at,last_used_at FROM api_keys ORDER BY created_at').all() as Row[]).map(keyRow),
+  /** Returns the plaintext key exactly once. */
+  create(name: string, permissions: ApiPermission[]) {
+    if (getDb().prepare('SELECT 1 FROM api_keys WHERE name=?').get(name)) throw new Error(`an API key named "${name}" already exists`);
+    const key = 'mcpk_' + randomToken(32);
+    const id = randomUUID();
+    getDb().prepare('INSERT INTO api_keys(id,name,token_hash,prefix,permissions) VALUES(?,?,?,?,?)').run(id, name, sha256(key), key.slice(0, 10), JSON.stringify(permissions));
+    return { id, key };
+  },
+  verify(key: string): { id: string; name: string; permissions: ApiPermission[] } | undefined {
+    const r = getDb().prepare('SELECT id,name,permissions FROM api_keys WHERE token_hash=?').get(sha256(key)) as Row | undefined;
+    if (!r) return undefined;
+    getDb().prepare(`UPDATE api_keys SET last_used_at=datetime('now') WHERE id=?`).run(r.id);
+    return keyRow(r) as any;
+  },
+  setPermissions: (id: string, permissions: ApiPermission[]) => getDb().prepare('UPDATE api_keys SET permissions=? WHERE id=?').run(JSON.stringify(permissions), id),
+  delete: (id: string) => getDb().prepare('DELETE FROM api_keys WHERE id=?').run(id),
+};
+
 export const bearerTokens = {
   list: (serverId: string) =>
     getDb().prepare('SELECT id,name,prefix,created_at,last_used_at,expires_at FROM bearer_tokens WHERE server_id=? ORDER BY created_at').all(serverId) as Row[],

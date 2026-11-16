@@ -69,6 +69,11 @@ function migrate(db: Database.Database) {
       name TEXT NOT NULL, token_hash TEXT UNIQUE NOT NULL, prefix TEXT NOT NULL,
       created_at TEXT DEFAULT (datetime('now')), last_used_at TEXT, expires_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY, name TEXT UNIQUE NOT NULL, token_hash TEXT UNIQUE NOT NULL, prefix TEXT NOT NULL,
+      permissions TEXT NOT NULL DEFAULT '[]',         -- JSON array of API_PERMISSIONS
+      created_at TEXT DEFAULT (datetime('now')), last_used_at TEXT
+    );
     CREATE TABLE IF NOT EXISTS oauth_clients (
       client_id TEXT PRIMARY KEY, server_id TEXT NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
       client_secret TEXT, info TEXT NOT NULL, approved INTEGER NOT NULL DEFAULT 0,

@@ -97,3 +97,63 @@ test('deny and expire', async () => {
   assert.equal((await p2 as any).status, 'expired');
   assert.equal(approvals.list('pending').length, 0);
 });
+
+test('client channel: the client prompt decides; retries share one open prompt; cancel leaves it pending', async () => {
+  const prompts: string[] = [];
+  let answer!: (a: 'accept' | 'decline' | 'cancel') => void;
+  const elicit = (m: string) => { prompts.push(m); return new Promise<'accept' | 'decline' | 'cancel'>((r) => { answer = r; }); };
+  const ask = (cmd: string) => approvals.gate({ ...req({ cmd }), reason: 'default: ask', elicit });
+  const p = ask('reboot');
+  await new Promise((r) => setTimeout(r, 20));
+  const again = ask('reboot'); // identical retry while the prompt is open
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(prompts.length, 1, 'one prompt per request');
+  assert.match(prompts[0]!, /token:a wants ssh_exec/); assert.match(prompts[0]!, /reboot/);
+  answer('accept');
+  const results = await Promise.all([p, again]);
+  assert.equal(results.filter((x) => x.ok).length, 1, 'the approval is consumed by exactly one call');
+  assert.equal(approvals.list('decided').find((a) => a.args.cmd === 'reboot')!.decided_by, 'token:a via client');
+
+  const d = ask('halt'); await new Promise((r) => setTimeout(r, 20)); answer('decline');
+  assert.equal((await d as any).status, 'denied');
+
+  const c = ask('shutdown'); await new Promise((r) => setTimeout(r, 20)); answer('cancel');
+  assert.equal((await c as any).status, 'pending', 'no answer is not a refusal');
+  assert.ok(approvals.list('pending').some((a) => a.args.cmd === 'shutdown'));
+
+  // the Approvals page answering first withdraws the client prompt
+  let aborted = false;
+  const p4 = approvals.gate({ ...req({ cmd: 'sync' }), elicit: (_m, signal) => new Promise((_r, rej) => signal.addEventListener('abort', () => { aborted = true; rej(new Error('aborted')); })) });
+  await new Promise((r) => setTimeout(r, 20));
+  approvals.decide(approvals.list('pending').find((a) => a.args.cmd === 'sync')!.id, 'approved', 'jeff');
+  assert.equal((await p4).ok, true); assert.ok(aborted);
+});
+
+test('API keys: /api/v1 needs a key with the permission and the api channel; decides as apikey:<name>', async () => {
+  const express = (await import('express')).default;
+  const { keyApi } = await import('../src/admin/api.js');
+  const { apiKeys } = await import('../src/core/store.js');
+  const app = express(); app.use(express.json()); app.use('/api/v1', keyApi());
+  const srv = app.listen(0, '127.0.0.1'); await new Promise((r) => srv.once('listening', r));
+  const base = `http://127.0.0.1:${(srv.address() as any).port}/api/v1`;
+  const call = (path: string, key?: string, method = 'GET') => fetch(base + path, { method, headers: key ? { authorization: `Bearer ${key}` } : {} });
+  try {
+    const { key } = apiKeys.create('tower', ['approvals']);
+    const { key: none } = apiKeys.create('readonly', []);
+    assert.equal((await call('/approvals')).status, 401);
+    assert.equal((await call('/approvals', 'mcpk_wrong')).status, 401);
+    assert.equal((await call('/approvals', none)).status, 403);
+    setGlobalConfig({ approvalChannel: 'ui' });
+    assert.match((await (await call('/approvals', key)).json()).error, /Approval channel/);
+    setGlobalConfig({ approvalChannel: 'api' });
+    const pre = await fetch(base + '/approvals', { method: 'OPTIONS' });
+    assert.equal(pre.status, 204); assert.equal(pre.headers.get('access-control-allow-origin'), '*');
+    const g = approvals.gate(req({ cmd: 'id' }));
+    await new Promise((r) => setTimeout(r, 20));
+    const { pending } = await (await call('/approvals', key)).json();
+    const id = pending.find((a: any) => a.args.cmd === 'id').id;
+    assert.equal((await call(`/approvals/${id}/approved`, key, 'POST')).status, 200);
+    assert.deepEqual(await g, { ok: true, by: 'approved by apikey:tower' });
+    assert.equal((await (await call('/me', key)).json()).approvalChannel, 'api');
+  } finally { srv.close(); setGlobalConfig({ approvalChannel: 'ui' }); }
+});
