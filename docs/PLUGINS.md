@@ -347,6 +347,9 @@ This plugin used to be called `github`. On startup MControlProgram moves the old
 `create_pr`, `pr` and `comment` give the same result shapes on every provider, and only appear when an exposed repo's host has a provider. Differences:
 - **GitLab**: `number` is the merge request's iid. Checks are its pipelines and reviews are its approvals. Comments go on merge requests only.
 - **Gitea / Forgejo**: checks come from commit statuses. Drafts are opened with a `WIP:` title.
+- **GitHub** (`github` and `gh`): `edit_pr {draft}` flips draft / ready for review through GraphQL (REST can't), so the token or `gh` login needs the same access it uses for PRs. GraphQL is `api.github.com/graphql`, or `https://host/api/graphql` for Enterprise.
+
+`create_pr` also takes `labels`, `assignees` and `reviewers`, added to a PR it opens (an already-open PR is returned unchanged). They need the `edit_pr` approval as well as `create_pr`'s. If they fail after the PR is open, the PR comes back with a `warning`. `pr` lists the latest 50 PRs in a state; `search` keeps those whose title, branch or author contains every word (e.g. a ticket id).
 
 **Set up host** checks for git, creates the repos directory and the key, and returns the public key and what `ssh -T git@<forge>` answers. The forge is the API URL's host, or github.com / gitlab.com for those providers; with no provider the key isn't checked. Add the key to the git server as a deploy key with write access (one repo) or to a machine user, then run it again. A native host inside the container should keep the repos directory and key on the data volume (`/data/git/...`).
 

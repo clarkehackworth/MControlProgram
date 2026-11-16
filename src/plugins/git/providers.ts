@@ -56,19 +56,33 @@ export function apiBase(p: ProviderName, h: ProviderHost, host: string) {
 
 const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 /** `gh api` on the host: same calls as the github provider, gh's login instead of a token. */
-function ghApi(h: ProviderHost, host: string, path: string, run: HostRun): Api {
+function ghCall(h: ProviderHost, host: string, run: HostRun) {
   const hostname = h.apiUrl ? (() => { try { return new URL(h.apiUrl!).hostname.replace(/^api\./, ''); } catch { return host; } })() : host;
-  return async (method, p, body) => {
+  return async (method: string, endpoint: string, label: string, body: unknown): Promise<any> => {
     const script = `command -v gh >/dev/null || { echo "gh is not installed on git host ${h.name.replace(/[^\w.-]/g, '')}" >&2; exit 127; }
-GH_PROMPT_DISABLED=1 NO_COLOR=1 gh api ${hostname === 'github.com' ? '' : `--hostname ${sq(hostname)} `}-X ${method} -H 'X-GitHub-Api-Version: 2022-11-28' ${sq(`repos/${path}${p}`)}${body === undefined ? '' : ' --input -'}`;
+GH_PROMPT_DISABLED=1 NO_COLOR=1 gh api ${hostname === 'github.com' ? '' : `--hostname ${sq(hostname)} `}-X ${method} -H 'X-GitHub-Api-Version: 2022-11-28' ${sq(endpoint)}${body === undefined ? '' : ' --input -'}`;
     const r = await run(script, body === undefined ? undefined : JSON.stringify(body));
     const j: any = (() => { try { return JSON.parse(r.stdout); } catch { return null; } })();
     if (r.code !== 0) {
       const status = Number(/\(HTTP (\d{3})\)/.exec(r.stderr)?.[1] ?? 0);
-      throw Object.assign(new Error(`gh ${method} ${p}: ${(r.stderr.trim() || j?.message || `exit ${r.code}`).split('\n')[0]}${j?.errors ? ' ' + JSON.stringify(j.errors) : ''}`), { status, body: j });
+      throw Object.assign(new Error(`gh ${method} ${label}: ${(r.stderr.trim() || j?.message || `exit ${r.code}`).split('\n')[0]}${j?.errors ? ' ' + JSON.stringify(j.errors) : ''}`), { status, body: j });
     }
     return j;
   };
+}
+function ghApi(h: ProviderHost, host: string, path: string, run: HostRun): Api {
+  const call = ghCall(h, host, run);
+  return (method, p, body) => call(method, `repos/${path}${p}`, p, body);
+}
+/** GitHub GraphQL through `gh api graphql`. */
+function ghGraphql(h: ProviderHost, host: string, run: HostRun): Graphql {
+  const call = ghCall(h, host, run);
+  return async (query, variables) => graphqlData(await call('POST', 'graphql', 'graphql', { query, variables }));
+}
+/** The `data` of a GraphQL answer; its `errors` (sent with a 200) throw. */
+function graphqlData(j: any) {
+  if (j?.errors?.length) throw new Error(`graphql: ${j.errors.map((e: any) => e.message).join('; ')}`);
+  return j?.data;
 }
 
 export function provider(h: ProviderHost, r: { name: string; url?: string }, signal?: AbortSignal, run?: HostRun): Provider {
@@ -77,7 +91,7 @@ export function provider(h: ProviderHost, r: { name: string; url?: string }, sig
   if (p === 'gh') {
     if (!run) throw new Error('the gh provider needs the git host');
     const o = origin(r);
-    return githubLike(ghApi(h, o.host, o.path, run), false);
+    return githubLike(ghApi(h, o.host, o.path, run), false, ghGraphql(h, o.host, run));
   }
   if (!h.token) throw new Error(`git host "${h.name}" has no API token; PRs and comments need one`);
   const o = origin(r);
@@ -97,13 +111,22 @@ export function provider(h: ProviderHost, r: { name: string; url?: string }, sig
     }
     return j;
   };
-  return p === 'gitlab' ? gitlab(api) : githubLike(api, p === 'gitea');
+  // GitHub's REST API can't change draft status: GraphQL can. github.com: api.github.com/graphql; Enterprise: https://host/api/graphql
+  const gqlUrl = h.apiUrl ? `${h.apiUrl.replace(/\/$/, '').replace(/\/v3$/, '')}/graphql` : o.host === 'github.com' ? 'https://api.github.com/graphql' : `https://${o.host}/api/graphql`;
+  const graphql: Graphql = async (query, variables) => {
+    const res = await fetch(gqlUrl, { method: 'POST', signal, body: JSON.stringify({ query, variables }), headers: { ...auth, 'User-Agent': 'MControlProgram', 'Content-Type': 'application/json' } });
+    const j: any = await res.json().catch(() => null);
+    if (!res.ok) throw new Error(`github graphql: ${res.status} ${j?.message ?? res.statusText}`.split(token).join('***'));
+    try { return graphqlData(j); } catch (e: any) { throw new Error(String(e.message).split(token).join('***')); }
+  };
+  return p === 'gitlab' ? gitlab(api) : githubLike(api, p === 'gitea', p === 'github' ? graphql : undefined);
 }
 
 type Api = (method: string, path: string, body?: unknown) => Promise<any>;
+type Graphql = (query: string, variables: Record<string, unknown>) => Promise<any>;
 
 /** GitHub, and Gitea / Forgejo, whose API copies it (no check runs or inline comments; draft = "WIP:" title). */
-function githubLike(api: Api, gitea: boolean): Provider {
+function githubLike(api: Api, gitea: boolean, graphql?: Graphql): Provider {
   const pr = (p: any): Pr => ({ number: p.number, title: p.title, state: p.merged || p.merged_at ? 'merged' : p.state, draft: p.draft ?? (gitea ? /^(WIP|\[WIP\]|Draft):?/i.test(p.title) : undefined),
     head: p.head?.ref, base: p.base?.ref, url: p.html_url, user: p.user?.login, updated: p.updated_at });
   return {
@@ -153,9 +176,12 @@ function githubLike(api: Api, gitea: boolean): Provider {
       const cur = e.draft !== undefined || (gitea && e.assignees) ? await api('GET', `/pulls/${n}`) : undefined;
       const patch: Record<string, unknown> = { title: e.title, body: e.body, base: e.base, state: e.state };
       if (e.draft !== undefined) {
-        // ponytail: GitHub's REST API can't flip draft (GraphQL only); add it when an agent needs it
-        if (!gitea) { if (!!cur.draft !== e.draft) throw new Error('GitHub can only change draft status in its web UI or GraphQL API'); }
-        else patch.title = draftTitle(e.title ?? cur.title, e.draft, 'WIP');
+        if (!gitea) {
+          if (!!cur.draft !== e.draft) {
+            if (!graphql) throw new Error('changing draft status needs GraphQL, which this provider has no access to');
+            await graphql(`mutation($id: ID!) { ${e.draft ? 'convertPullRequestToDraft' : 'markPullRequestReadyForReview'}(input: { pullRequestId: $id }) { pullRequest { id } } }`, { id: cur.node_id });
+          }
+        } else patch.title = draftTitle(e.title ?? cur.title, e.draft, 'WIP');
       }
       // Gitea sets assignees as a whole list
       if (gitea && e.assignees) patch.assignees = delta((cur.assignees ?? []).map((x: any) => x.login), e.assignees);

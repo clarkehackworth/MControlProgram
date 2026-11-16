@@ -719,25 +719,39 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
           return { branch, sha: kv.sha, commits: Number(kv.commits), files, forced: force };
         }),
       ...(exposed.some((r) => r.h.provider !== 'none') ? [
-        tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it.',
+        tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it unchanged. `labels`, `assignees` and `reviewers` are added to a PR this call opens (as edit_pr would).',
           {
             branch: z.string().describe('Agent branch (head)'),
             base: z.string().optional().describe('Target branch; default: the first base branch, else the default branch'),
             title: z.string(), body: z.string().optional(), draft: z.boolean().optional(),
+            labels: names, assignees: names, reviewers: names,
           },
           async (r, a, call, gate) => {
             const head = agentBranch(r, a.branch);
             checkBase(r, a.base);
             const p = prov(r, call);
-            await gate(['create_pr'], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}`, { head, base: a.base, title: a.title });
-            return p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
+            const extras = !!(a.labels?.length || a.assignees?.length || a.reviewers?.length);
+            await gate(['create_pr', ...(extras ? ['edit_pr'] : [])], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}${extras ? ` (+ ${[a.labels?.length && 'labels', a.assignees?.length && 'assignees', a.reviewers?.length && 'reviewers'].filter(Boolean).join(', ')})` : ''}`,
+              { head, base: a.base, title: a.title, labels: a.labels, assignees: a.assignees, reviewers: a.reviewers });
+            const pr = await p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
+            if (pr.existing || !extras) return pr;
+            // the PR is open now: if the extras fail, say so rather than hide the PR
+            try {
+              const d = await p.edit(pr.number, { labels: a.labels?.length ? { add: a.labels } : undefined, assignees: a.assignees?.length ? { add: a.assignees } : undefined, reviewers: a.reviewers?.length ? { add: a.reviewers } : undefined });
+              return { ...pr, labels: d.labels, assignees: d.assignees, reviewers_requested: d.reviewers_requested };
+            } catch (e) { return { ...pr, warning: `PR opened, but labels / assignees / reviewers were not all applied: ${(e as Error).message}. Use edit_pr.` }; }
           }),
-        tool('pr', 'Without `number`: list pull requests (GitLab: merge requests). With `number`: the PR with its checks, reviews and comments.',
-          { number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open') },
+        tool('pr', 'Without `number`: list pull requests (GitLab: merge requests), the latest 50 in the state; `search` keeps those matching it. With `number`: the PR with its checks, reviews and comments.',
+          {
+            number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open'),
+            search: z.string().optional().describe('For the list: words that must all appear in the PR title, branch or author (case-insensitive), e.g. a ticket id'),
+          },
           async (r, a, call, gate) => {
             const p = prov(r, call);
             await gate(['pr'], a.number ? `read PR #${a.number}` : 'list PRs', { number: a.number });
-            return a.number ? p.get(a.number) : p.list(a.state ?? 'open');
+            if (a.number) return p.get(a.number);
+            const words: string[] = (a.search ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+            return (await p.list(a.state ?? 'open')).filter((x) => { const hay = `${x.title} ${x.head} ${x.user ?? ''}`.toLowerCase(); return words.every((w: string) => hay.includes(w)); });
           }),
         tool('comment', 'Comment on a pull request (GitHub, Gitea: or an issue; GitLab: a merge request).', { number: z.number().int(), body: z.string() },
           async (r, a, call, gate) => {
@@ -761,7 +775,7 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
             if (head && m.merged) await deleteBranch(r, head, call.log);
             return { ...m, ...(head && m.merged ? { deleted: head } : {}) };
           }),
-        tool('edit_pr', 'Edit a pull request: title, body, base, close / reopen, draft (not on GitHub), and add or remove labels, assignees and requested reviewers (usernames). Returns the PR as `pr` does.',
+        tool('edit_pr', 'Edit a pull request: title, body, base, close / reopen, draft / ready for review, and add or remove labels, assignees and requested reviewers (usernames). Returns the PR as `pr` does.',
           {
             number: z.number().int(), title: z.string().optional(), body: z.string().optional(), base: z.string().optional().describe('New target branch'),
             state: z.enum(['open', 'closed']).optional(), draft: z.boolean().optional(),

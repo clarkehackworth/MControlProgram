@@ -147,6 +147,38 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
     const pr = json(await t('create_pr').handler({ branch: 'feat', title: 't' }, call));
     assert.deepEqual([pr.number, pr.existing], [7, true]);
     assert.match(seen[0], /^POST https:\/\/api\.github\.com\/repos\/o\/demo\/pulls Bearer SECRET123$/);
+
+    // labels / assignees / reviewers go on a PR this call opens (through edit_pr's calls), and need edit_pr's approval too
+    seen.length = 0;
+    const open8 = { number: 8, title: 't8', state: 'open', draft: false, head: { ref: 'agent/feat', sha: 'abc' }, base: { ref: 'main' }, html_url: 'u8', labels: [{ name: 'bug' }], assignees: [], requested_reviewers: [] };
+    globalThis.fetch = (async (url: string, o: any) => {
+      const u = new URL(url); seen.push(`${o.method} ${u.pathname} ${o.body ?? ''}`);
+      if (o.method === 'POST' && u.pathname.endsWith('/pulls')) return new Response(JSON.stringify(open8), { status: 201 });
+      if (u.pathname.endsWith('/pulls/8')) return new Response(JSON.stringify(open8));
+      if (u.pathname.endsWith('/check-runs')) return new Response(JSON.stringify({ check_runs: [] }));
+      if (u.pathname.endsWith('/status')) return new Response(JSON.stringify({ statuses: [] }));
+      return new Response(JSON.stringify([]));
+    }) as any;
+    const n0 = asks.length;
+    const pr8 = json(await t('create_pr').handler({ branch: 'feat', title: 't8', labels: ['bug'], reviewers: ['cy'] }, call));
+    assert.equal(pr8.number, 8); assert.deepEqual(pr8.labels, ['bug']); assert.equal(pr8.warning, undefined);
+    assert.ok(seen.includes('POST /repos/o/demo/issues/8/labels {"labels":["bug"]}'), seen.join('\n'));
+    assert.ok(seen.includes('POST /repos/o/demo/pulls/8/requested_reviewers {"reviewers":["cy"]}'), seen.join('\n'));
+    assert.deepEqual(asks.slice(n0).at(-1)?.subject.features ?? asks.at(-1).subject.features, ['create_pr', 'edit_pr']);
+    // without extras: no edit calls, and an existing PR is never modified
+    seen.length = 0;
+    await t('create_pr').handler({ branch: 'feat', title: 't' }, call);
+    assert.deepEqual(seen, ['POST /repos/o/demo/pulls ' + seen[0].split(' ').slice(2).join(' ')]);
+
+    // pr list: `search` keeps PRs whose title, branch or author has every word
+    globalThis.fetch = (async () => new Response(JSON.stringify([
+      { number: 1, title: 'Fix login timeout', state: 'open', head: { ref: 'agent/a' }, base: { ref: 'main' }, html_url: 'u1', user: { login: 'ann' } },
+      { number: 2, title: 'Add CSV export', state: 'open', head: { ref: 'agent/b' }, base: { ref: 'main' }, html_url: 'u2', user: { login: 'bob' } },
+    ]))) as any;
+    assert.deepEqual(json(await t('pr').handler({}, call)).map((x: any) => x.number), [1, 2]);
+    assert.deepEqual(json(await t('pr').handler({ search: 'csv' }, call)).map((x: any) => x.number), [2]);
+    assert.deepEqual(json(await t('pr').handler({ search: 'agent/a ann' }, call)).map((x: any) => x.number), [1]);
+    assert.deepEqual(json(await t('pr').handler({ search: 'login bob' }, call)), []);
   } finally { globalThis.fetch = real; }
 });
 
@@ -263,7 +295,17 @@ test('PR providers: GitLab merge requests, Gitea, none', async () => {
     assert.deepEqual(d.labels, ['bug']);
     assert.deepEqual(gh.slice(0, 6), ['PATCH /repos/o/r/pulls/3 {"state":"closed"}', 'POST /repos/o/r/issues/3/labels {"labels":["x"]}', 'DELETE /repos/o/r/issues/3/labels/bug ',
       'POST /repos/o/r/issues/3/assignees {"assignees":["bob"]}', 'POST /repos/o/r/pulls/3/requested_reviewers {"reviewers":["cy"]}', 'DELETE /repos/o/r/pulls/3/requested_reviewers {"reviewers":["dee"]}']);
-    await assert.rejects(p.edit(3, { draft: true }), /draft/);
+    // GitHub's REST API can't change draft status: GraphQL does, by the PR's node id
+    gh.length = 0;
+    globalThis.fetch = fake(gh, (m, u) => (/graphql$/.test(u) ? { data: { convertPullRequestToDraft: {} } } : /\/pulls\/3$/.test(u) ? { ...ghPr, node_id: 'PR_x' } : /check-runs/.test(u) ? { check_runs: [] } : /status$/.test(u) ? { statuses: [] } : []));
+    await p.edit(3, { draft: true });
+    const gq = gh.find((x) => x.startsWith('POST /graphql'))!;
+    assert.match(gq, /convertPullRequestToDraft.*"variables":\{"id":"PR_x"\}/);
+    gh.length = 0; await p.edit(3, { draft: false });
+    assert.ok(!gh.some((x) => x.includes('graphql')), 'already ready: nothing to do');
+    globalThis.fetch = fake(gh, (m, u) => (/graphql$/.test(u) ? { errors: [{ message: 'Resource not accessible' }] } : /\/pulls\/3$/.test(u) ? { ...ghPr, node_id: 'PR_x' } : []));
+    await assert.rejects(p.edit(3, { draft: true }), /Resource not accessible/);
+    globalThis.fetch = fake(gh, (m, u) => (m === 'PUT' ? { merged: true, sha: 'm1' } : /\/pulls\/3$/.test(u) ? ghPr : /check-runs/.test(u) ? { check_runs: [] } : /status$/.test(u) ? { statuses: [] } : []));
     gh.length = 0; await p.review(3, { event: 'approve' });
     assert.equal(gh[0], 'POST /repos/o/r/pulls/3/reviews {"event":"APPROVE","body":""}');
 
@@ -322,6 +364,21 @@ esac
     assert.ok(lines.includes("api -X POST -H X-GitHub-Api-Version: 2022-11-28 repos/o/demo/pulls --input -"), lines.join('\n'));
     assert.ok(lines.some((l) => l.includes('"head":"agent/feat"')), 'body on stdin');
   } finally { process.env.PATH = oldPath; }
+});
+
+test('gh provider: draft status through gh api graphql', async () => {
+  const { provider } = await import('../src/plugins/git/providers.js');
+  const scripts: { script: string; input?: string }[] = [];
+  const run = async (script: string, input?: string) => {
+    scripts.push({ script, input });
+    const out = / 'graphql'/.test(script) ? { data: {} } : /pulls\/5'/.test(script) ? { number: 5, title: 't', state: 'open', draft: true, node_id: 'N5', head: { ref: 'agent/x', sha: 's' }, base: { ref: 'main' }, html_url: 'u' } : /check-runs/.test(script) ? { check_runs: [] } : /status'/.test(script) ? { statuses: [] } : [];
+    return { stdout: JSON.stringify(out), stderr: '', code: 0 };
+  };
+  const p = provider({ name: 'h', provider: 'gh' }, { name: 'r', url: 'git@github.com:o/r.git' }, undefined, run);
+  await p.edit(5, { draft: false });
+  const g = scripts.find((x) => / 'graphql'/.test(x.script))!;
+  assert.match(g.script, /gh api -X POST -H 'X-GitHub-Api-Version: 2022-11-28' 'graphql' --input -$/);
+  assert.match(g.input!, /markPullRequestReadyForReview.*"variables":\{"id":"N5"\}/);
 });
 
 test('working in the host clone: pull with a conflict, resolve, commit, push; risky git refused', async () => {
