@@ -523,6 +523,10 @@ test('a host-only repo (no origin) is its own origin', async () => {
   assert.equal(sh(solo, 'rev-parse', 'refs/heads/agent/work'), p.sha);
   // fast-forward the checked-out base branch: worktree follows (after switching back, main is checked out and clean)
   assert.match(await run('git', { command: 'switch', args: ['main'] }), /exit 0$/);
+  // a half-done setup (origin there, config and default branch missing) gets repaired on the next call
+  sh(solo, 'config', '--unset', 'receive.denyCurrentBranch'); sh(solo, 'remote', 'set-head', 'origin', '-d');
+  assert.deepEqual(JSON.parse(await run('repos', {}))[0].baseBranches, ['main']);
+  assert.equal(sh(solo, 'config', '--get', 'receive.denyCurrentBranch'), 'updateInstead');
   assert.equal(JSON.parse(await run('push', { branch: 'main', source: 'work' })).sha, sh(solo, 'rev-parse', 'main'));
   assert.equal(fs.readFileSync(path.join(solo, 'a.txt'), 'utf8'), 'b\n');
   fs.rmSync(solo, { recursive: true });

@@ -147,11 +147,13 @@ sync() {
   d=$(g symbolic-ref -q --short refs/remotes/origin/HEAD) && g -C "$S" symbolic-ref HEAD "refs/heads/\${d#origin/}" || true
 }
 # host-only repo (no origin): it becomes its own origin, so its branches are what agents see and pushes update
-# them (the checked-out one too, while its worktree is clean)
+# them (the checked-out one too, while its worktree is clean). Checked every time, so a half-done setup gets repaired;
+# failing config is an error (else pushes to the checked-out branch get refused), the default branch is best effort.
 own() {
-  g remote get-url origin >/dev/null 2>&1 && return
-  g remote add origin "$(pwd)" && g config receive.denyCurrentBranch updateInstead
-  g fetch -q origin && g remote set-head origin -a >/dev/null 2>&1 || true
+  u=$(g remote get-url origin 2>/dev/null) || { g remote add origin "$(pwd)"; u=$(pwd); }
+  [ "$u" = "$(pwd)" ] || [ "$u" = "$(pwd -P)" ] || return 0
+  [ "$(g config --get receive.denyCurrentBranch || true)" = updateInstead ] || g config receive.denyCurrentBranch updateInstead
+  g symbolic-ref -q refs/remotes/origin/HEAD >/dev/null || { g fetch -q origin && g remote set-head origin -a >/dev/null; } || true
 }
 fetch() { own; g fetch -q --prune --tags --force origin; sync; }
 `;
@@ -575,7 +577,7 @@ const plugin: MControlProgramPlugin = {
     /** Branches agents may push to directly with base_push: the repo's base branches, else origin's default branch. */
     const baseOf = async (r: Repo, log: ScopedLogger): Promise<string[]> => {
       if (r.baseBranches.length) return r.baseBranches;
-      const d = (await sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}\ng symbolic-ref -q --short refs/remotes/origin/HEAD || { g remote set-head origin -a >/dev/null 2>&1 && g symbolic-ref -q --short refs/remotes/origin/HEAD; } || true`, log)).trim().replace(/^origin\//, '');
+      const d = (await sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}\nown\ng symbolic-ref -q --short refs/remotes/origin/HEAD || { g remote set-head origin -a >/dev/null 2>&1 && g symbolic-ref -q --short refs/remotes/origin/HEAD; } || true`, log)).trim().replace(/^origin\//, '');
       return d ? [d] : [];
     };
     const prov = (r: Repo, call: ToolCallContext) => provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
