@@ -49,6 +49,10 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'create_pr', ro: false, description: 'Open a pull request (GitLab: merge request) from an agent branch' },
   { name: 'pr', ro: true, description: 'List pull requests, or read one: state, checks, reviews and comments' },
   { name: 'comment', ro: false, description: 'Comment on a pull request (GitHub, Gitea: or an issue)' },
+  { name: 'merge_pr', ro: false, description: 'Merge a pull request (merge, squash or rebase)' },
+  { name: 'edit_pr', ro: false, description: 'Edit a pull request: title, body, base, close / reopen, draft, labels, assignees, reviewers' },
+  { name: 'review_pr', ro: false, description: 'Review a pull request: approve, request changes or comment' },
+  { name: 'base_push', ro: false, description: 'submit_patch or git push straight to a base branch, without a PR' },
 ];
 const RO = Object.fromEntries(FEATURES.map((f) => [f.name, f.ro]));
 const featureList = FEATURES.map((f) => ({ name: f.name, description: f.description, annotations: { readOnlyHint: f.ro } }));
@@ -214,7 +218,9 @@ g diff --name-only -z "$base" "$sha"
 `;
   const res = await locked(r, () => run(r.h, script, log, a.patch));
   if (res.code === 3) throw new Error(`base "${a.base}" is not on the remote. Base the patch on a pushed commit (see resolve) and include every commit since then.`);
-  if (res.code === 4) throw new Error(`the patch does not apply: ${res.stderr.trim()}\nresolve the base branch's current commit, rebase onto it and submit again`);
+  if (res.code === 4) throw new Error(`the patch does not apply: ${res.stderr.trim()}\n${/blobs recorded in its index|lacks necessary blobs/.test(res.stderr)
+    ? `the patch's starting content isn't in ${a.base}: it was made from something else (uncommitted changes, or commits since ${a.base} not in the patch). Commit everything, then send \`git format-patch --stdout ${a.base}\`.`
+    : "resolve the base branch's current commit, rebase onto it and submit again"}`);
   if (res.code !== 0) throw new Error(res.stderr.trim() || `exit ${res.code}`);
   const [head, files = ''] = res.stdout.split('--files--\n');
   const kv = Object.fromEntries(head.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
@@ -506,6 +512,16 @@ const plugin: MControlProgramPlugin = {
       },
     });
 
+    /** Branches agents may push to directly with base_push: the repo's base branches, else origin's default branch. */
+    const baseOf = async (r: Repo, log: ScopedLogger): Promise<string[]> => {
+      if (r.baseBranches.length) return r.baseBranches;
+      const d = (await sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}\ng symbolic-ref -q --short refs/remotes/origin/HEAD || { g remote set-head origin -a >/dev/null 2>&1 && g symbolic-ref -q --short refs/remotes/origin/HEAD; } || true`, log)).trim().replace(/^origin\//, '');
+      return d ? [d] : [];
+    };
+    const prov = (r: Repo, call: ToolCallContext) => provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
+    const checkBase = (r: Repo, base?: string) => { if (base && r.baseBranches.length && !r.baseBranches.includes(base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`); };
+    const names = z.array(z.string()).optional();
+
     const tools: ToolDefinition[] = [
       {
         name: 'repos', description: 'Repos you can work on through MControlProgram: origin URL to clone read-only, agent branch prefix, PR base branches and sensitive paths.',
@@ -555,19 +571,21 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           branch: z.string().describe('Agent branch to push to; the repo prefix is added if missing'),
           message: z.string().optional().describe('Commit message, required for a plain diff'),
           force: z.boolean().optional().describe('Allow rewriting the branch (not a fast-forward)'),
+          to_base: z.boolean().optional().describe('`branch` is a base branch (see repos): push straight to it, no PR. Needs approval.'),
           assisted_by: z.string().optional().describe('Who made the change, for the Assisted-by trailer, e.g. "Claude Code (claude-opus-5-5)". Default: your MCP client name and version.'),
           committer_name: z.string().optional().describe("Author and committer name (with committer_email) instead of MControlProgram's git identity"),
           committer_email: z.string().optional().describe('Committer email, with committer_name'),
         },
         async (r, a, call, gate) => {
           if (Buffer.byteLength(a.patch) > r.maxPatchKB * 1024) throw new Error(`patch is over ${r.maxPatchKB} KB`);
-          const branch = agentBranch(r, a.branch);
+          if (a.to_base && !(await baseOf(r, call.log)).includes(a.branch)) throw new Error(`"${a.branch}" is not a base branch`);
+          const branch = a.to_base ? a.branch : agentBranch(r, a.branch);
           const ident = identity(a.committer_name, a.committer_email);
           const assisted = assistTrailer(r.assistTrailer, a.assisted_by, call.client);
           const x = await apply(run, r, { base: a.base, patch: a.patch, branch, message: a.message, principal: call.principal, ident, assisted }, call.log);
           if (x.force && !a.force) throw new Error(`${branch} is at ${x.previous}, which your commits don't build on. Rebase onto it (resolve ${branch}), or pass force: true to replace it.`);
           const sensitive = x.files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
-          const features = ['submit_patch', ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+          const features = ['submit_patch', ...(a.to_base ? ['base_push'] : []), ...(x.force ? ['force_push'] : []), ...(ident ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
           const what = `${x.force ? 'force-push' : 'push'} ${x.commits} commit(s) to ${branch}: ${x.files.length} file(s)${ident ? `, as ${ident.name} <${ident.email}>` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
           const by = await gate(features, what, { branch, base: x.base, patch: createHash('sha256').update(a.patch).digest('hex').slice(0, 16), force: x.force, ident, assisted });
           await push(run, r, x, branch, call.log);
@@ -583,29 +601,65 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           },
           async (r, a, call, gate) => {
             const head = agentBranch(r, a.branch);
-            if (a.base && r.baseBranches.length && !r.baseBranches.includes(a.base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`);
-            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
+            checkBase(r, a.base);
+            const p = prov(r, call);
             await gate(['create_pr'], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}`, { head, base: a.base, title: a.title });
             return p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
           }),
         tool('pr', 'Without `number`: list pull requests (GitLab: merge requests). With `number`: the PR with its checks, reviews and comments.',
           { number: z.number().int().optional(), state: z.enum(['open', 'closed', 'all']).optional().describe('For the list; default open') },
           async (r, a, call, gate) => {
-            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
+            const p = prov(r, call);
             await gate(['pr'], a.number ? `read PR #${a.number}` : 'list PRs', { number: a.number });
             return a.number ? p.get(a.number) : p.list(a.state ?? 'open');
           }),
         tool('comment', 'Comment on a pull request (GitHub, Gitea: or an issue; GitLab: a merge request).', { number: z.number().int(), body: z.string() },
           async (r, a, call, gate) => {
-            const p = provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
+            const p = prov(r, call);
             await gate(['comment'], `comment on #${a.number}`, { number: a.number, body: a.body });
             return p.comment(a.number, a.body);
+          }),
+        tool('merge_pr', 'Merge a pull request (GitLab: merge request). Pass `sha` (the head you checked, see pr) so it only merges that. GitLab: no rebase method (the project picks merge commit or fast-forward).',
+          {
+            number: z.number().int(), method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Default merge'),
+            sha: z.string().optional().describe('Merge only if the head is still this commit'),
+            title: z.string().optional().describe('Merge / squash commit title'), message: z.string().optional().describe('Merge / squash commit message'),
+          },
+          async (r, a, call, gate) => {
+            const p = prov(r, call);
+            await gate(['merge_pr'], `merge #${a.number}${a.method ? ` (${a.method})` : ''}${a.sha ? ` at ${a.sha.slice(0, 12)}` : ''}`, { number: a.number, method: a.method, sha: a.sha });
+            return p.merge(a.number, a);
+          }),
+        tool('edit_pr', 'Edit a pull request: title, body, base, close / reopen, draft (not on GitHub), and add or remove labels, assignees and requested reviewers (usernames). Returns the PR as `pr` does.',
+          {
+            number: z.number().int(), title: z.string().optional(), body: z.string().optional(), base: z.string().optional().describe('New target branch'),
+            state: z.enum(['open', 'closed']).optional(), draft: z.boolean().optional(),
+            add_labels: names, remove_labels: names, add_assignees: names, remove_assignees: names, add_reviewers: names, remove_reviewers: names,
+          },
+          async (r, a, call, gate) => {
+            checkBase(r, a.base);
+            const d = (add?: string[], remove?: string[]) => (add?.length || remove?.length ? { add, remove } : undefined);
+            const e = { title: a.title, body: a.body, base: a.base, state: a.state, draft: a.draft,
+              labels: d(a.add_labels, a.remove_labels), assignees: d(a.add_assignees, a.remove_assignees), reviewers: d(a.add_reviewers, a.remove_reviewers) };
+            const changed = Object.entries(e).filter(([, v]) => v !== undefined).map(([k]) => k);
+            if (!changed.length) throw new Error('nothing to change');
+            const p = prov(r, call);
+            await gate(['edit_pr'], `edit #${a.number}: ${changed.join(', ')}${a.state ? ` (${a.state === 'closed' ? 'close' : 'reopen'})` : ''}`, { number: a.number, ...e });
+            return p.edit(a.number, e);
+          }),
+        tool('review_pr', 'Review a pull request: approve, request changes or comment (the last two need `body`). Forges refuse approving a PR opened with the same account. GitLab: approve and comment only.',
+          { number: z.number().int(), event: z.enum(['approve', 'request_changes', 'comment']), body: z.string().optional() },
+          async (r, a, call, gate) => {
+            if (a.event !== 'approve' && !a.body) throw new Error(`${a.event} needs a body`);
+            const p = prov(r, call);
+            await gate(['review_pr'], `${a.event.replace('_', ' ')} #${a.number}`, { number: a.number, event: a.event, body: a.body });
+            return p.review(a.number, a);
           }),
       ] : []),
     ];
 
     /** One pushed ref, already in the mirror: check it like submit_patch, ask, then push it to origin. */
-    async function forward(r: Repo, c: { old: string; nu: string; ref: string }, call: Pick<ToolCallContext, 'ask'>, entry: LogEntry) {
+    async function forward(r: Repo, c: { old: string; nu: string; ref: string }, call: Pick<ToolCallContext, 'ask'>, entry: LogEntry, base: boolean) {
       const branch = c.ref.slice('refs/heads/'.length), prev = ZERO.test(c.old) ? '' : c.old;
       const t0 = Date.now();
       let allowedBy: string | undefined;
@@ -624,7 +678,7 @@ g diff --name-only -z "$base" "$new"
         const sensitive = files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
         // commits are expected under the host's identity (clone_url sets it up); anyone else is custom_identity
         const others = (kv.ids ?? '').split('\t').filter((x) => x && x !== `${r.h.committerName} <${r.h.committerEmail}>`);
-        const features = ['git_push', ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+        const features = ['git_push', ...(base ? ['base_push'] : []), ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
         const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${others.length ? `, as ${others.slice(0, 3).join(', ')}` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
         try {
           allowedBy = await rules.gate(call, entry, false, { feature: 'git_tool', summary: `${r.name}: ${what}`, subject: { upstream: r.name, tool: 'git_push', features, branch, sha: c.nu, force } },
@@ -700,10 +754,12 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
           if (!c.ref.startsWith('refs/heads/')) return 'only branches can be pushed';
           if (ZERO.test(c.nu)) return 'deleting branches is not supported';
           const b = c.ref.slice('refs/heads/'.length);
-          try { const a = agentBranch(r, b); return a === b ? '' : `push to an agent branch: git push mcp HEAD:${a}`; } catch (e) { return (e as Error).message; }
+          if (bases.includes(b)) return '';
+          try { const a = agentBranch(r, b); return a === b ? '' : `push to an agent branch: git push mcp HEAD:${a}${bases.length ? ` (or to a base branch, with approval: ${bases.join(', ')})` : ''}`; } catch (e) { return (e as Error).message; }
         };
         const report: string[] = [];
         if (!cmds.length) throw new Error('empty push');
+        const bases = await baseOf(r, ctx.log);
         if (cmds.some(why)) report.push('unpack ok', ...cmds.map((c) => `ng ${c.ref} ${why(c) || 'not pushed: another ref in this push was refused'}`));
         else {
           const rp = await locked(r, async () => collect(await spawnOn(r.h, `${inServe(r)}cd "$S"\ng ${RECEIVE} receive-pack --stateless-rpc .`, ctx.log), body));
@@ -713,7 +769,7 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
           for (const c of cmds) {
             const st = status.find((l) => l === `ok ${c.ref}` || l.startsWith(`ng ${c.ref} `));
             if (!st?.startsWith('ok ')) { report.push(st ?? `ng ${c.ref} not received`); continue; }
-            try { await forward(r, c, call, entry); report.push(`ok ${c.ref}`); }
+            try { await forward(r, c, call, entry, bases.includes(c.ref.slice('refs/heads/'.length))); report.push(`ok ${c.ref}`); }
             catch (e) {
               const msg = String((e as Error).message).replace(/\s+/g, ' ').slice(0, 1000);
               report.push(`ng ${c.ref} ${(e as any).status === 'pending' ? `${msg} Run the same git push again to check back.` : msg}`);

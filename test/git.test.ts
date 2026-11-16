@@ -176,8 +176,15 @@ test('git remote over HTTP: clone, hidden local work, push forwarded with rules'
     assert.deepEqual(asks.at(-1).subject.features, ['git_push']);
     await run(a2, 'git fetch -q mcp');
     assert.equal(sh(a2, 'rev-parse', 'mcp/agent/http'), mine);
-    await refused(run(a2, 'git push mcp HEAD:main'), /agent branch: git push mcp HEAD:agent\/main/);
+    await refused(run(a2, 'git push mcp HEAD:other'), /agent branch: git push mcp HEAD:agent\/other/);
+    // the default branch: base_push, which a rule can deny
+    await act('set_tool_rule', { upstream: 'demo', tool: 'base_push', action: 'deny' });
+    await refused(run(a2, 'git push mcp HEAD:main'), /base_push|disabled/);
     assert.equal(sh(origin, 'rev-parse', 'main'), main);
+    await act('set_tool_rule', { upstream: 'demo', tool: 'base_push', action: '' });
+    await run(a2, 'git push -q mcp HEAD:main');
+    assert.deepEqual(asks.at(-1).subject.features, ['git_push', 'base_push']);
+    assert.equal(sh(origin, 'rev-parse', 'main'), mine);
 
     // rewrite: force needs force_push, and touching CI asks for sensitive_paths
     fs.writeFileSync(path.join(a2, '.github/workflows/ci.yml'), 'on: [push]\n'); await run(a2, 'git -c user.name=agent -c user.email=a@x commit -qa --amend --reset-author -m "ci too"');
@@ -220,6 +227,48 @@ test('PR providers: GitLab merge requests, Gitea, none', async () => {
     const gt = provider({ name: 'h', provider: 'gitea', token: 'T', apiUrl: 'https://forge.example/api/v1/' }, { name: 'r', url: 'https://forge.example/o/r.git' });
     assert.equal((await gt.create({ head: 'agent/x', base: 'main', title: 't', body: '', draft: true })).draft, true);
     assert.equal(seen[0], 'POST https://forge.example/api/v1/repos/o/r/pulls token T');
+  } finally { globalThis.fetch = real; }
+  // merge / edit / review: the calls each forge gets
+  try {
+    const gh: string[] = [], gl: string[] = [], gt: string[] = [];
+    const fake = (log: string[], res: (m: string, u: string) => unknown) => (async (url: string, o: any) => { log.push(`${o.method} ${new URL(url).pathname}${new URL(url).search} ${o.body ?? ''}`); return reply(200, res(o.method, url)); }) as any;
+    const ghPr = { number: 3, title: 't', state: 'open', draft: false, head: { ref: 'agent/x', sha: 'abc' }, base: { ref: 'main' }, html_url: 'u', labels: [{ name: 'bug' }], assignees: [{ login: 'ann' }], requested_reviewers: [] };
+    globalThis.fetch = fake(gh, (m, u) => (m === 'PUT' ? { merged: true, sha: 'm1' } : /\/pulls\/3$/.test(u) ? ghPr : /check-runs/.test(u) ? { check_runs: [] } : /status$/.test(u) ? { statuses: [] } : []));
+    const p = provider({ name: 'h', provider: 'github', token: 'T' }, { name: 'r', url: 'git@github.com:o/r.git' });
+    assert.deepEqual(await p.merge(3, { method: 'squash', sha: 'abc' }), { merged: true, sha: 'm1', message: undefined });
+    assert.equal(gh[0], 'PUT /repos/o/r/pulls/3/merge {"merge_method":"squash","sha":"abc"}');
+    gh.length = 0;
+    const d = await p.edit(3, { state: 'closed', labels: { add: ['x'], remove: ['bug'] }, assignees: { add: ['bob'] }, reviewers: { add: ['cy'], remove: ['dee'] } });
+    assert.deepEqual(d.labels, ['bug']);
+    assert.deepEqual(gh.slice(0, 6), ['PATCH /repos/o/r/pulls/3 {"state":"closed"}', 'POST /repos/o/r/issues/3/labels {"labels":["x"]}', 'DELETE /repos/o/r/issues/3/labels/bug ',
+      'POST /repos/o/r/issues/3/assignees {"assignees":["bob"]}', 'POST /repos/o/r/pulls/3/requested_reviewers {"reviewers":["cy"]}', 'DELETE /repos/o/r/pulls/3/requested_reviewers {"reviewers":["dee"]}']);
+    await assert.rejects(p.edit(3, { draft: true }), /draft/);
+    gh.length = 0; await p.review(3, { event: 'approve' });
+    assert.equal(gh[0], 'POST /repos/o/r/pulls/3/reviews {"event":"APPROVE","body":""}');
+
+    globalThis.fetch = fake(gt, (m, u) => (/\/labels\?/.test(u) ? [{ id: 7, name: 'bug' }] : m === 'GET' && /\/pulls\/3$/.test(u) ? { ...ghPr, title: 'WIP: t', merged: true, merge_commit_sha: 'm2' } : /\/pulls\/3\/merge/.test(u) ? null : /check-runs|status$/.test(u) ? {} : []));
+    const g = provider({ name: 'h', provider: 'gitea', token: 'T', apiUrl: 'https://forge.example/api/v1' }, { name: 'r', url: 'https://forge.example/o/r.git' });
+    assert.deepEqual(await g.merge(3, { method: 'rebase' }), { merged: true, sha: 'm2' });
+    assert.equal(gt[0], 'POST /api/v1/repos/o/r/pulls/3/merge {"Do":"rebase"}');
+    gt.length = 0;
+    await g.edit(3, { draft: false, assignees: { remove: ['ann'], add: ['bob'] }, labels: { remove: ['bug'] } }).catch(() => {});
+    assert.equal(gt[1], 'PATCH /api/v1/repos/o/r/pulls/3 {"title":"t","assignees":["bob"]}');
+    assert.equal(gt[3], 'DELETE /api/v1/repos/o/r/issues/3/labels/7 ');
+    gt.length = 0; await g.review(3, { event: 'approve' });
+    assert.match(gt[0], /"event":"APPROVED"/);
+
+    const mr = { iid: 4, title: 'Draft: t', state: 'opened', source_branch: 'agent/x', target_branch: 'main', assignees: [{ username: 'ann' }], reviewers: [], labels: ['bug'] };
+    globalThis.fetch = fake(gl, (m, u) => (/merge$/.test(u) ? { state: 'merged', merge_commit_sha: 'm3' } : /members/.test(u) ? [{ id: 9, username: 'bob' }] : /\/merge_requests\/4$/.test(u) ? mr : /approvals$/.test(u) ? {} : m === 'POST' ? { id: 1 } : []));
+    const l = provider({ name: 'h', provider: 'gitlab', token: 'T' }, { name: 'r', url: 'git@gitlab.example:g/r.git' });
+    assert.deepEqual(await l.merge(4, { title: 'T', message: 'M' }), { merged: true, sha: 'm3' });
+    assert.equal(gl[0], 'PUT /api/v4/projects/g%2Fr/merge_requests/4/merge {"squash":false,"merge_commit_message":"T\\n\\nM"}');
+    await assert.rejects(l.merge(4, { method: 'rebase' }), /merge method/);
+    gl.length = 0;
+    await l.edit(4, { draft: false, state: 'open', labels: { add: ['a', 'b'] }, assignees: { add: ['bob'], remove: ['ann'] } });
+    assert.equal(gl.find((x) => x.startsWith('PUT')), 'PUT /api/v4/projects/g%2Fr/merge_requests/4 {"title":"t","state_event":"reopen","add_labels":"a,b","assignee_ids":[9]}');
+    gl.length = 0; await l.review(4, { event: 'approve', body: 'lgtm' });
+    assert.deepEqual(gl.slice(0, 2).map((x) => x.split(' ').slice(0, 2).join(' ')), ['POST /api/v4/projects/g%2Fr/merge_requests/4/approve', 'POST /api/v4/projects/g%2Fr/merge_requests/4/notes']);
+    await assert.rejects(l.review(4, { event: 'request_changes', body: 'x' }), /request-changes/);
   } finally { globalThis.fetch = real; }
   assert.throws(() => provider({ name: 'h', provider: 'none' }, { name: 'r', url: 'git@x:o/r' }), /no PR provider/);
   // a host without a provider: git tools only

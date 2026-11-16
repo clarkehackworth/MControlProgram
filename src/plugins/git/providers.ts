@@ -1,5 +1,5 @@
 /**
- * PR providers: the REST calls behind create_pr / pr / comment, per git host. Each returns the same shapes, so the
+ * PR providers: the REST calls behind create_pr / pr / comment / merge_pr / edit_pr / review_pr, per git host. Each returns the same shapes, so the
  * tools and agents don't care which forge is behind a repo. The token stays here: never on the git host or agents.
  */
 /** `gh` = GitHub through the `gh` CLI on the git host, with its own login (`gh auth login` there): no token in MControlProgram. */
@@ -8,7 +8,7 @@ export type ProviderName = (typeof PROVIDERS)[number];
 
 export interface Pr { number: number; title: string; state: 'open' | 'closed' | 'merged'; draft?: boolean; head: string; base: string; url: string; user?: string; updated?: string }
 export interface PrDetail extends Pr {
-  headSha: string; mergeable?: boolean | null; body?: string;
+  headSha: string; mergeable?: boolean | null; body?: string; labels: string[]; assignees: string[]; reviewers_requested: string[];
   checks: { name: string; status: string; conclusion?: string | null; url?: string }[];
   reviews: { user?: string; state: string; body?: string }[];
   comments: { user?: string; at?: string; body: string }[];
@@ -21,7 +21,17 @@ export interface Provider {
   list(state: 'open' | 'closed' | 'all'): Promise<Pr[]>;
   get(n: number): Promise<PrDetail>;
   comment(n: number, body: string): Promise<{ url?: string }>;
+  /** `sha`: merge only if the head is still this commit. */
+  merge(n: number, a: { method?: 'merge' | 'squash' | 'rebase'; sha?: string; title?: string; message?: string }): Promise<{ merged: boolean; sha?: string; message?: string }>;
+  edit(n: number, e: PrEdit): Promise<PrDetail>;
+  review(n: number, a: { event: 'approve' | 'request_changes' | 'comment'; body?: string }): Promise<{ url?: string }>;
 }
+export interface Delta { add?: string[]; remove?: string[] }
+export interface PrEdit { title?: string; body?: string; base?: string; state?: 'open' | 'closed'; draft?: boolean; labels?: Delta; assignees?: Delta; reviewers?: Delta }
+/** `cur` with `d` applied. */
+export const delta = (cur: string[], d: Delta) => [...new Set([...cur.filter((x) => !d.remove?.includes(x)), ...(d.add ?? [])])];
+const DRAFT = /^\s*(WIP|\[WIP\]|Draft)\s*:?\s*/i;
+const draftTitle = (t: string, draft: boolean, mark: string) => (draft ? `${mark}: ` : '') + t.replace(DRAFT, '');
 export interface ProviderHost { name: string; provider?: ProviderName; token?: string; apiUrl?: string }
 /** Runs a script on the git host (for `gh`). */
 export type HostRun = (script: string, input?: string) => Promise<{ stdout: string; stderr: string; code: number | null }>;
@@ -121,6 +131,7 @@ function githubLike(api: Api, gitea: boolean): Provider {
       ]);
       return {
         ...pr(p), headSha: sha, mergeable: p.mergeable, body: p.body,
+        labels: (p.labels ?? []).map((x: any) => x.name), assignees: (p.assignees ?? []).map((x: any) => x.login), reviewers_requested: (p.requested_reviewers ?? []).map((x: any) => x.login),
         checks: [...checks.check_runs.map((c: any) => ({ name: c.name, status: c.status, conclusion: c.conclusion, url: c.html_url })),
           ...(status.statuses ?? []).map((c: any) => ({ name: c.context, status: 'completed', conclusion: c.state ?? c.status, url: c.target_url }))],
         reviews: reviews.map((x: any) => ({ user: x.user?.login, state: x.state, body: x.body })),
@@ -129,6 +140,41 @@ function githubLike(api: Api, gitea: boolean): Provider {
       };
     },
     comment: async (n, body) => ({ url: (await api('POST', `/issues/${n}/comments`, { body })).html_url }),
+    async merge(n, a) {
+      if (!gitea) {
+        const r = await api('PUT', `/pulls/${n}/merge`, { merge_method: a.method ?? 'merge', sha: a.sha, commit_title: a.title, commit_message: a.message });
+        return { merged: !!r.merged, sha: r.sha, message: r.message };
+      }
+      await api('POST', `/pulls/${n}/merge`, { Do: a.method ?? 'merge', head_commit_id: a.sha, MergeTitleField: a.title, MergeMessageField: a.message });
+      const p = await api('GET', `/pulls/${n}`);
+      return { merged: !!p.merged, sha: p.merge_commit_sha };
+    },
+    async edit(n, e) {
+      const cur = e.draft !== undefined || (gitea && e.assignees) ? await api('GET', `/pulls/${n}`) : undefined;
+      const patch: Record<string, unknown> = { title: e.title, body: e.body, base: e.base, state: e.state };
+      if (e.draft !== undefined) {
+        // ponytail: GitHub's REST API can't flip draft (GraphQL only); add it when an agent needs it
+        if (!gitea) { if (!!cur.draft !== e.draft) throw new Error('GitHub can only change draft status in its web UI or GraphQL API'); }
+        else patch.title = draftTitle(e.title ?? cur.title, e.draft, 'WIP');
+      }
+      // Gitea sets assignees as a whole list
+      if (gitea && e.assignees) patch.assignees = delta((cur.assignees ?? []).map((x: any) => x.login), e.assignees);
+      if (Object.values(patch).some((v) => v !== undefined)) await api('PATCH', `/pulls/${n}`, patch);
+      // Gitea labels are ids
+      const ids = async (names: string[]) => {
+        if (!gitea) return names;
+        const all: any[] = await api('GET', '/labels?limit=50');
+        return names.map((l) => all.find((x) => x.name === l)?.id ?? (() => { throw new Error(`no label "${l}" in the repo`); })());
+      };
+      if (e.labels?.add?.length) await api('POST', `/issues/${n}/labels`, { labels: await ids(e.labels.add) });
+      for (const l of e.labels?.remove?.length ? await ids(e.labels.remove) : []) await api('DELETE', `/issues/${n}/labels/${encodeURIComponent(l)}`);
+      if (!gitea && e.assignees?.add?.length) await api('POST', `/issues/${n}/assignees`, { assignees: e.assignees.add });
+      if (!gitea && e.assignees?.remove?.length) await api('DELETE', `/issues/${n}/assignees`, { assignees: e.assignees.remove });
+      if (e.reviewers?.add?.length) await api('POST', `/pulls/${n}/requested_reviewers`, { reviewers: e.reviewers.add });
+      if (e.reviewers?.remove?.length) await api('DELETE', `/pulls/${n}/requested_reviewers`, { reviewers: e.reviewers.remove });
+      return this.get(n);
+    },
+    review: async (n, a) => ({ url: (await api('POST', `/pulls/${n}/reviews`, { event: a.event === 'approve' ? (gitea ? 'APPROVED' : 'APPROVE') : a.event.toUpperCase(), body: a.body ?? '' })).html_url }),
   };
 }
 
@@ -159,6 +205,7 @@ function gitlab(api: Api): Provider {
       const human = notes.filter((x: any) => !x.system);
       return {
         ...pr(m), headSha: m.sha, mergeable: m.merge_status ? m.merge_status === 'can_be_merged' : null, body: m.description,
+        labels: m.labels ?? [], assignees: (m.assignees ?? []).map((x: any) => x.username), reviewers_requested: (m.reviewers ?? []).map((x: any) => x.username),
         checks: pipelines.map((x: any) => ({ name: `pipeline #${x.id}`, status: x.status, conclusion: x.status, url: x.web_url })),
         reviews: (approvals.approved_by ?? []).map((x: any) => ({ user: x.user?.username, state: 'APPROVED' })),
         comments: human.filter((x: any) => !x.position).map((x: any) => ({ user: x.author?.username, at: x.created_at, body: x.body })),
@@ -169,6 +216,34 @@ function gitlab(api: Api): Provider {
       const note = await api('POST', `/merge_requests/${n}/notes`, { body });
       const m = await api('GET', `/merge_requests/${n}`).catch(() => null);
       return { url: m?.web_url ? `${m.web_url}#note_${note.id}` : undefined };
+    },
+    async merge(n, a) {
+      if (a.method === 'rebase') throw new Error("GitLab: merge commit vs fast-forward is the project's merge method; use merge or squash");
+      const msg = [a.title, a.message].filter(Boolean).join('\n\n') || undefined;
+      const m = await api('PUT', `/merge_requests/${n}/merge`, { squash: a.method === 'squash', sha: a.sha, ...(a.method === 'squash' ? { squash_commit_message: msg } : { merge_commit_message: msg }) });
+      return { merged: m.state === 'merged', sha: m.merge_commit_sha ?? m.squash_commit_sha ?? undefined };
+    },
+    async edit(n, e) {
+      const m = await api('GET', `/merge_requests/${n}`);
+      // GitLab takes user ids: look them up among the project's members
+      const ids = (names: string[]) => Promise.all(names.map(async (u) => {
+        const x = (await api('GET', `/members/all?query=${encodeURIComponent(u)}`)).find((y: any) => y.username === u);
+        if (!x) throw new Error(`no member "${u}" in the project`);
+        return x.id;
+      }));
+      await api('PUT', `/merge_requests/${n}`, {
+        title: e.draft === undefined ? e.title : draftTitle(e.title ?? m.title, e.draft, 'Draft'), description: e.body, target_branch: e.base,
+        state_event: e.state && (e.state === 'closed' ? 'close' : 'reopen'), add_labels: e.labels?.add?.join(','), remove_labels: e.labels?.remove?.join(','),
+        assignee_ids: e.assignees && await ids(delta((m.assignees ?? []).map((x: any) => x.username), e.assignees)),
+        reviewer_ids: e.reviewers && await ids(delta((m.reviewers ?? []).map((x: any) => x.username), e.reviewers)),
+      });
+      return this.get(n);
+    },
+    async review(n, a) {
+      // ponytail: GitLab's REST API has no request-changes review; approve + comment cover it
+      if (a.event === 'request_changes') throw new Error('GitLab has no request-changes review: comment instead');
+      if (a.event === 'approve') await api('POST', `/merge_requests/${n}/approve`, {});
+      return a.body ? this.comment(n, a.body) : {};
     },
   };
 }
