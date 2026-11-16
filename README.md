@@ -167,42 +167,50 @@ A plugin is an ES module that adds tools to an MCP server. It runs in-process an
 Full reference: [docs/PLUGINS.md](docs/PLUGINS.md); a working copy of the example below lives in
 [examples/echo-plugin](examples/echo-plugin).
 
-**1. Create the plugin** at `data/plugins/hello/index.js` (with Docker, `data/` is the `/data` volume):
+**1. Create the plugin** at `data/plugins/echo/index.js` (with Docker, `data/` is the `/data` volume):
 
 ```js
+// Minimal external MControlProgram plugin. Copy this directory to data/plugins/echo (or point
+// MCONTROLPROGRAM_PLUGIN_DIRS at its parent) and click "Reload plugins" in the UI.
 import { z } from 'zod';
 
 export default {
-  id: 'hello',                      // [a-z][a-z0-9_-]*
-  name: 'Hello',
+  id: 'echo',
+  name: 'Echo',
   version: '0.1.0',
-  description: 'Greets people.',
-  // JSON Schema -> the per-instance config form in the UI.
-  // "x-secret": true fields are encrypted at rest and never shown again.
+  description: 'Example plugin: echoes input, demonstrates config, secrets, status and actions.',
   configSchema: {
     type: 'object',
     properties: {
-      greeting: { type: 'string', title: 'Greeting', default: 'Hello' },
-      apiKey: { type: 'string', title: 'API key', 'x-secret': true },
+      prefix: { type: 'string', title: 'Prefix', default: '> ' },
+      apiKey: { type: 'string', title: 'Example secret', 'x-secret': true, description: 'Encrypted at rest, never shown to agents' },
+      uppercase: { type: 'boolean', title: 'Uppercase output', default: false },
     },
   },
-  defaultConfig: { greeting: 'Hello' },
+  defaultConfig: { prefix: '> ', uppercase: false },
 
-  // Called once per plugin instance (this plugin added to one MCP server).
-  create(ctx) {                     // ctx.config = decrypted instance config, ctx.log = logger
+  create(ctx) {
+    let calls = 0;
     return {
-      start() {},                   // open pools, timers
-      stop() {},                    // MUST release everything; runs on reconfigure/stop
-      status: () => ({ ok: true }), // shown in the UI
-      tools: [{
-        name: 'greet',              // exposed to agents as `<instance name>_greet`
-        description: 'Greet someone by name.',
-        inputSchema: { name: z.string() },          // zod raw shape
-        annotations: { readOnlyHint: true },        // lets the approval policy skip it
-        async handler({ name }, call) {             // call: { sessionId, principal, signal, log, ask }
-          return { content: [{ type: 'text', text: `${ctx.config.greeting}, ${name}!` }] };
+      start() { ctx.log.info('echo plugin started'); },
+      stop() { ctx.log.info('echo plugin stopped'); },
+      // MControlProgram-wide defaults are available via ctx.global() (e.g. ctx.global().stateIdleSec for your own reaper)
+      status: () => ({ calls, hasApiKey: !!ctx.config.apiKey, stateIdleSec: ctx.global().stateIdleSec }),
+      actions: { reset: { title: 'Reset counter', async run() { calls = 0; return { calls }; } } },
+      tools: [
+        {
+          name: 'say',
+          description: 'Echo a message back.',
+          inputSchema: { message: z.string() },
+          annotations: { readOnlyHint: true },
+          async handler({ message }, call) {
+            calls++;
+            call.log.debug('say called', { message });
+            const out = ctx.config.prefix + message;
+            return { content: [{ type: 'text', text: ctx.config.uppercase ? out.toUpperCase() : out }] };
+          },
         },
-      }],
+      ],
     };
   },
 };
@@ -213,7 +221,7 @@ built-ins (`src/plugins`), `data/plugins/<dir>/` (a `package.json` with `main`, 
 directories in `MCONTROLPROGRAM_PLUGIN_DIRS` (colon separated), and npm package names listed under
 **Plugins → npm packages**.
 
-**3. Use it.** On a server's **Plugins** tab choose **Add plugin → hello**, fill in the config and
+**3. Use it.** On a server's **Plugins** tab choose **Add plugin → echo**, fill in the config and
 save. The instance starts immediately and connected agents get a `tools/list_changed`.
 
 Things worth knowing before you write a real one:
