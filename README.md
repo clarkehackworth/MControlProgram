@@ -48,13 +48,13 @@ BrowserPaw has its own URL access rules (allow, ask or deny by default), pushed 
                        │ tokens / OAuth, logging      │◀ ok  │ approvals, logs  │
                        │ allow / ask / deny rules     │      └──────────────────┘
                        └───────────────┬──────────────┘
-       ┌───────────────┬───────────────┼───────────────┬───────────────┐
+       ┌───────────────┬───────────────┬───────────────┬───────────────┬───────────────┬─┐
        ▼               ▼               ▼               ▼               ▼
-┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
-│    ssh     │  │    web     │  │    mcp     │  │ browserpaw │  │ docker sbx │
-└──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
-       ▼               ▼               ▼               ▼               ▼
-   SSH hosts      APIs / sites    upstream MCP      Chromium      sbx microVMs
+┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐
+│    ssh     │  │    web     │  │    mcp     │  │ browserpaw │  │    git     │  │docker sbx  │
+└──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘  └──────┬─────┘
+       ▼               ▼               ▼               ▼               ▼               ▼
+   SSH hosts      APIs / sites    upstream MCP      Chromium        git hosts     sbx microVMs
                                     servers         profiles     (ssh / native)
 ```
 
@@ -70,7 +70,9 @@ BrowserPaw has its own URL access rules (allow, ask or deny by default), pushed 
   blocking, server-side credential injection, isolated cookie jars, request log),
   `mcp` (proxy other MCP servers with per-tool allow/ask/deny), `browserpaw` (agent-driven
   Chromium profiles on SSH, native or manual hosts, with a managed URL policy and per-agent request
-  log) and `sandbox` (Docker Sandboxes via `sbx` over SSH or on this machine: create, exec, files,
+  log), `git` (agents push and submit patches from clones on a git host to any git server, and open
+  PRs on GitHub/GitLab/Gitea/Forgejo, with allow/ask/deny per repo and per tool) and `sandbox`
+  (Docker Sandboxes via `sbx` over SSH or on this machine: create, exec, files,
   ports, network policy).
 - **Secrets encrypted at rest** (AES-256-GCM, key in `MCONTROLPROGRAM_MASTER_KEY` or `data/master.key`);
   the UI never returns a stored secret.
@@ -245,7 +247,7 @@ Things worth knowing before you write a real one:
 ```
 src/core      config, sqlite, crypto, logger, secrets, plugin API + loader, store
 src/mcp       runtime (one Express app + MCP sessions per server), OAuth provider, manager
-src/plugins   built-in ssh, web, mcp and browserpaw plugins
+src/plugins   built-in ssh, web, mcp, browserpaw, git and sandbox plugins
 src/admin     REST API for the UI
 web/          Vite + React admin UI
 test/         node:test unit tests (npm test); npm run test:ssh runs live ssh tests against a throwaway sshd
