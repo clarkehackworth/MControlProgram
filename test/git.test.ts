@@ -505,6 +505,30 @@ test('working in the host clone: pull with a conflict, resolve, commit, push; ri
   await assert.rejects(run('write_file', { path: '../x', content: 'x' }), /invalid path/);
 });
 
+test('a host-only repo (no origin) is its own origin', async () => {
+  const solo = path.join(tmp, 'repos/solo');
+  sh(tmp, 'init', '-q', '-b', 'main', solo);
+  fs.writeFileSync(path.join(solo, 'a.txt'), 'a\n'); sh(solo, 'add', '-A'); sh(solo, 'commit', '-qm', 'a');
+  const head = sh(solo, 'rev-parse', 'HEAD');
+  assert.deepEqual((await act('scan', { name: 'local' })).added, ['solo']);
+  const inst: any = await plugin.create({ instanceId: 'i5', instanceName: 'git', serverId: 's', config: { repos: ['solo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined } as any);
+  const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async () => 'approved by test' };
+  const run = async (n: string, a: any) => (await inst.tools.find((x: any) => x.name === n).handler(a, call)).content[0].text as string;
+  assert.deepEqual(JSON.parse(await run('resolve', {})).branches, { main: head });
+  assert.equal(JSON.parse(await run('resolve', {})).defaultBranch, 'main');
+  assert.match(await run('git', { command: 'switch', args: ['-c', 'work'] }), /exit 0$/);
+  await run('write_file', { path: 'a.txt', content: 'b\n' });
+  assert.match(await run('git', { command: 'commit', args: ['--message=b'] }), /exit 0$/);
+  const p = JSON.parse(await run('push', { branch: 'work' }));
+  assert.equal(sh(solo, 'rev-parse', 'refs/heads/agent/work'), p.sha);
+  // fast-forward the checked-out base branch: worktree follows (after switching back, main is checked out and clean)
+  assert.match(await run('git', { command: 'switch', args: ['main'] }), /exit 0$/);
+  assert.equal(JSON.parse(await run('push', { branch: 'main', source: 'work' })).sha, sh(solo, 'rev-parse', 'main'));
+  assert.equal(fs.readFileSync(path.join(solo, 'a.txt'), 'utf8'), 'b\n');
+  fs.rmSync(solo, { recursive: true });
+  assert.deepEqual((await act('scan', { name: 'local' })).removed, ['solo']);
+});
+
 test('a clone removed from the host drops out of the inventory', async () => {
   fs.rmSync(path.join(tmp, 'repos/demo'), { recursive: true });
   assert.deepEqual((await act('scan', { name: 'local' })).removed, ['demo']);

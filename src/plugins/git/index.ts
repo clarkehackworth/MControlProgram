@@ -146,7 +146,14 @@ sync() {
   g -C "$S" fetch -q --prune --force "$(pwd)" '+refs/remotes/origin/*:refs/heads/*' '^refs/remotes/origin/HEAD' '+refs/tags/*:refs/tags/*'
   d=$(g symbolic-ref -q --short refs/remotes/origin/HEAD) && g -C "$S" symbolic-ref HEAD "refs/heads/\${d#origin/}" || true
 }
-fetch() { g fetch -q --prune --tags --force origin; sync; }
+# host-only repo (no origin): it becomes its own origin, so its branches are what agents see and pushes update
+# them (the checked-out one too, while its worktree is clean)
+own() {
+  g remote get-url origin >/dev/null 2>&1 && return
+  g remote add origin "$(pwd)" && g config receive.denyCurrentBranch updateInstead
+  g fetch -q origin && g remote set-head origin -a >/dev/null 2>&1 || true
+}
+fetch() { own; g fetch -q --prune --tags --force origin; sync; }
 `;
 
 // ponytail: one script at a time per repo (git locks refs); approval waits happen outside the lock
@@ -695,6 +702,7 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           await gate([write ? 'workdir' : 'workdir_read'], `git ${[a.command, ...args].join(' ')}`.slice(0, 300), { command: a.command, args });
           const out = await locked(r, () => run(r.h, `${prelude(r.h)}cd ${qp(r.path)}
 export GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true GIT_MERGE_AUTOEDIT=no GIT_PAGER=cat PAGER=cat
+own
 set +e
 g -c color.ui=never ${[a.command, ...args].map(q).join(' ')} 2>&1
 c=$?
