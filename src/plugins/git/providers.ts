@@ -20,7 +20,8 @@ export interface Stack { number: number; url?: string; open: boolean; base?: str
 export interface StackMerge { status: string; uuid?: string; method?: string; action?: string; message?: string; sha?: string }
 /** GitHub's stacked PRs (REST `/stacks`): only the `github` and `gh` providers have them. */
 export interface Stacks {
-  list(): Promise<Stack[]>;
+  /** Newest first: up to `limit`, only open ones if `open`. */
+  list(a: { open: boolean; limit: number }): Promise<Stack[]>;
   get(n: number): Promise<Stack>;
   /** The stack holding PR `pr`, or null. */
   forPr(pr: number): Promise<Stack | null>;
@@ -161,14 +162,15 @@ function githubLike(api: Api, gitea: boolean, graphql?: Graphql): Provider {
     }
   };
   const stacks: Stacks = {
-    async list() {
+    // ponytail: the API has no state filter, so open ones are picked here; scans at most 500 stacks
+    async list(a) {
       const all: Stack[] = [];
-      for (let page = 1; page <= 5; page++) {
+      for (let page = 1; page <= 5 && all.length < a.limit; page++) {
         const batch: any[] = await stackCall('GET', `/stacks?per_page=100&page=${page}`);
-        all.push(...batch.map(stack));
+        all.push(...batch.map(stack).filter((x) => !a.open || x.open));
         if (batch.length < 100) break;
       }
-      return all;
+      return all.slice(0, a.limit);
     },
     get: async (n) => stack(await stackCall('GET', `/stacks/${n}`)),
     async forPr(n) { const [x] = await stackCall('GET', `/stacks?pull_request=${n}`); return x ? stack(x) : null; },

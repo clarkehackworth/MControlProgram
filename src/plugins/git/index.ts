@@ -827,12 +827,16 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
             await gate(['review_pr'], `${a.event.replace('_', ' ')} #${a.number}`, { number: a.number, event: a.event, body: a.body });
             return p.review(a.number, a);
           }),
-        tool('stack', 'GitHub stacked PRs. Without arguments: the repo\'s stacks. With `number`: that stack. With `pr`: the stack holding that PR (null when none). A stack lists its PRs from the bottom (merges first) to the top.',
-          { number: z.number().int().optional().describe('Stack number'), pr: z.number().int().optional().describe('PR number') },
+        tool('stack', 'GitHub stacked PRs. Without `number` or `pr`: the repo\'s stacks, newest first (open ones only unless `open_only: false`, up to `limit`). With `number`: that stack. With `pr`: the stack holding that PR (null when none). A stack lists its PRs from the bottom (merges first) to the top.',
+          {
+            number: z.number().int().optional().describe('Stack number'), pr: z.number().int().optional().describe('PR number'),
+            open_only: z.boolean().optional().describe('For the list: only open stacks (default true)'),
+            limit: z.number().int().min(1).max(100).optional().describe('For the list: at most this many (default 20)'),
+          },
           async (r, a, call, gate) => {
             const st = stacksOf(prov(r, call));
             await gate(['stack'], a.number ? `read stack #${a.number}` : a.pr ? `find the stack of PR #${a.pr}` : 'list stacks', { number: a.number, pr: a.pr });
-            return a.number ? st.get(a.number) : a.pr ? st.forPr(a.pr) : st.list();
+            return a.number ? st.get(a.number) : a.pr ? st.forPr(a.pr) : st.list({ open: a.open_only !== false, limit: a.limit ?? 20 });
           }),
         tool('stack_submit', 'Open a chain of PRs from agent branches that are already pushed, and link them into a GitHub stack (like `gh stack submit`). `layers` go bottom to top: the first is based on `base` (default: the repo\'s base branch), each next one on the branch below it. A layer that already has an open PR is reused, and its base is corrected if it differs. New PRs are drafts unless `draft: false`. Safe to run again after a failure: it carries on from where it stopped.',
           {

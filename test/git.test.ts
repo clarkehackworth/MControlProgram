@@ -419,6 +419,11 @@ test('GitHub stacks: REST /stacks through the provider; Gitea has none', async (
     const s = await p.stacks!.get(1);
     assert.deepEqual(s.prs.map((x) => [x.number, x.merged, x.head]), [[1, true, 'agent/a'], [2, false, 'agent/b']]);
     assert.equal(s.base, 'main');
+    // list: newest first, closed ones dropped unless asked for, cut at the limit
+    body = [st(3), { ...st(2), open: false }, st(1)];
+    assert.deepEqual((await p.stacks!.list({ open: true, limit: 20 })).map((x) => x.number), [3, 1]);
+    assert.deepEqual((await p.stacks!.list({ open: false, limit: 2 })).map((x) => x.number), [3, 2]);
+    assert.equal(log.at(-1), 'GET /repos/o/r/stacks?per_page=100&page=1 ');
     body = [st()]; assert.equal((await p.stacks!.forPr(2))?.number, 1);
     assert.equal(log.at(-1), 'GET /repos/o/r/stacks?pull_request=2 ');
     body = []; assert.equal(await p.stacks!.forPr(9), null);

@@ -353,7 +353,7 @@ This plugin used to be called `github`. On startup MControlProgram moves the old
 
 **Stacked PRs** (GitHub, `github` and `gh` providers; the REST `/stacks` API, which must be enabled for the repo):
 - `create_pr` and `edit_pr` accept an agent branch (with its prefix) as `base`, to build on the layer below.
-- `stack` lists stacks, reads one by `number`, or finds the one holding a `pr`. A stack lists its PRs bottom (merges first) to top.
+- `stack` lists stacks (newest first, open ones only unless `open_only: false`, at most `limit`, default 20), reads one by `number`, or finds the one holding a `pr`. A stack lists its PRs bottom (merges first) to top.
 - `stack_submit {layers}` opens a PR per already-pushed agent branch (each based on the one below, drafts by default) and links them into a stack. It is safe to repeat: existing PRs are reused and a wrong base is corrected (needs `edit_pr` approval).
 - `stack_link {prs, stack?}` makes a stack from existing PRs, or adds to the top of one. It never removes PRs.
 - `unstack {number}` dissolves the grouping only; PRs and branches stay.
