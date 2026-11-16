@@ -134,7 +134,7 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   const { rows } = await act('calls', { since: 0 });
   assert.ok(rows.some((r: any) => r.tool === 'submit_patch' && r.blocked === 'tool rule: deny'));
   const { tools } = await act('tool_rules', {});
-  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['clone_url', 'pr', 'resolve', 'workdir_read']);
+  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['clone_url', 'pr', 'resolve', 'stack', 'workdir_read']);
 
   // PRs go to the API with the host's token; an existing PR for the branch is returned
   const real = globalThis.fetch; const seen: string[] = [];
@@ -159,16 +159,15 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
       if (u.pathname.endsWith('/status')) return new Response(JSON.stringify({ statuses: [] }));
       return new Response(JSON.stringify([]));
     }) as any;
-    const n0 = asks.length;
     const pr8 = json(await t('create_pr').handler({ branch: 'feat', title: 't8', labels: ['bug'], reviewers: ['cy'] }, call));
     assert.equal(pr8.number, 8); assert.deepEqual(pr8.labels, ['bug']); assert.equal(pr8.warning, undefined);
     assert.ok(seen.includes('POST /repos/o/demo/issues/8/labels {"labels":["bug"]}'), seen.join('\n'));
     assert.ok(seen.includes('POST /repos/o/demo/pulls/8/requested_reviewers {"reviewers":["cy"]}'), seen.join('\n'));
-    assert.deepEqual(asks.slice(n0).at(-1)?.subject.features ?? asks.at(-1).subject.features, ['create_pr', 'edit_pr']);
+    assert.deepEqual(asks.at(-1).subject.features, ['create_pr', 'edit_pr']);
     // without extras: no edit calls, and an existing PR is never modified
     seen.length = 0;
     await t('create_pr').handler({ branch: 'feat', title: 't' }, call);
-    assert.deepEqual(seen, ['POST /repos/o/demo/pulls ' + seen[0].split(' ').slice(2).join(' ')]);
+    assert.equal(seen.length, 1, seen.join('\n'));
 
     // pr list: `search` keeps PRs whose title, branch or author has every word
     globalThis.fetch = (async () => new Response(JSON.stringify([
@@ -179,6 +178,49 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
     assert.deepEqual(json(await t('pr').handler({ search: 'csv' }, call)).map((x: any) => x.number), [2]);
     assert.deepEqual(json(await t('pr').handler({ search: 'agent/a ann' }, call)).map((x: any) => x.number), [1]);
     assert.deepEqual(json(await t('pr').handler({ search: 'login bob' }, call)), []);
+
+    // stacked PRs: stack_submit opens a chain (each on the branch below), then links them
+    const nums: Record<string, number> = { 'agent/a': 21, 'agent/b': 22 };
+    const stk = (extra: any = {}) => ({ number: 5, url: 'su', open: true, base: { ref: 'main' }, pull_requests: [21, 22].map((n) => ({ number: n, state: 'open', draft: true, merged_at: null, head: { ref: `agent/${n === 21 ? 'a' : 'b'}` } })), ...extra });
+    let open: any[] = [], held = false;
+    seen.length = 0;
+    globalThis.fetch = (async (url: string, o: any) => {
+      const u = new URL(url); seen.push(`${o.method} ${u.pathname}${u.search} ${o.body ?? ''}`);
+      if (o.method === 'POST' && u.pathname.endsWith('/pulls')) { const b = JSON.parse(o.body); return new Response(JSON.stringify({ number: nums[b.head], title: b.title, state: 'open', draft: b.draft, head: { ref: b.head, sha: 's' }, base: { ref: b.base }, html_url: 'u' }), { status: 201 }); }
+      if (u.pathname.endsWith('/pulls') && o.method === 'GET') return new Response(JSON.stringify(open));
+      const one = u.pathname.match(/\/pulls\/(\d+)$/); if (one) return new Response(JSON.stringify({ ...open.find((x) => x.number === +one[1]), ...(o.method === 'PATCH' ? { base: { ref: JSON.parse(o.body).base } } : {}) }));
+      if (/\/(check-runs|status)$/.test(u.pathname)) return new Response(JSON.stringify(u.pathname.endsWith('status') ? { statuses: [] } : { check_runs: [] }));
+      if (u.pathname.endsWith('/stacks') && o.method === 'GET') return new Response(JSON.stringify(held ? [stk()] : []));
+      if (u.pathname.endsWith('/stacks') && o.method === 'POST') { held = true; return new Response(JSON.stringify(stk()), { status: 201 }); }
+      if (u.pathname.endsWith('/merge-async') && o.method === 'PUT') return new Response(JSON.stringify({ status: 'pending', details: { uuid: 'U1', merge_method: 'squash' } }), { status: 202 });
+      if (u.pathname.endsWith('/merge-async/U1')) return new Response(JSON.stringify({ status: 'merged', details: { uuid: 'U1', sha: 'ms' } }));
+      return new Response(JSON.stringify([]));
+    }) as any;
+    const sub = json(await t('stack_submit').handler({ layers: [{ branch: 'a', title: 'a' }, { branch: 'b', title: 'b' }] }, call));
+    assert.deepEqual(sub.prs.map((x: any) => [x.branch, x.number, x.action]), [['agent/a', 21, 'create'], ['agent/b', 22, 'create']]);
+    assert.equal(sub.created, true);
+    const posts = seen.filter((x) => x.startsWith('POST') && x.includes('/pulls '));
+    assert.match(posts[0], /"head":"agent\/a","base":"main".*"draft":true/);
+    assert.match(posts[1], /"head":"agent\/b","base":"agent\/a"/);
+    assert.ok(seen.includes('POST /repos/o/demo/stacks {"pull_requests":[21,22]}'), seen.join('\n'));
+    assert.deepEqual(asks.at(-1).subject.features, ['stack_submit', 'create_pr']);
+    // again: the PRs exist and are already stacked, so nothing changes (a wrong base is corrected, with edit_pr's approval)
+    open = [21, 22].map((n, k) => ({ number: n, title: 't', state: 'open', draft: true, head: { ref: `agent/${k ? 'b' : 'a'}`, sha: 's' }, base: { ref: 'main' }, html_url: 'u' }));
+    seen.length = 0;
+    const again = json(await t('stack_submit').handler({ layers: [{ branch: 'a', title: 'x' }, { branch: 'b', title: 'x' }] }, call));
+    assert.deepEqual(again.prs.map((x: any) => x.action), ['reuse', 'rebase']);
+    assert.ok(seen.some((x) => x.startsWith('PATCH /repos/o/demo/pulls/22 {"base":"agent/a"}')), seen.join('\n'));
+    assert.equal(again.unchanged, true);
+    assert.deepEqual(asks.at(-1).subject.features, ['stack_submit', 'create_pr', 'edit_pr']);
+    await assert.rejects(t('stack_submit').handler({ layers: [{ branch: 'a', title: 'x' }, { branch: 'a', title: 'x' }] }, call), /listed twice/);
+    await assert.rejects(t('stack_submit').handler({ layers: [{ branch: 'a', title: 'x' }], base: 'feature/x' }, call), /base must be one of/);
+    // stack read, link, merge (pending, then the result)
+    assert.equal(json(await t('stack').handler({ pr: 21 }, call)).number, 5);
+    assert.deepEqual(json(await t('stack').handler({ pr: 21 }, call)).prs.map((x: any) => x.number), [21, 22]);
+    assert.equal(json(await t('stack_link').handler({ prs: [21, 22] }, call)).unchanged, true);
+    const mg = json(await t('merge_stack').handler({ number: 22, method: 'squash' }, call));
+    assert.deepEqual([mg.status, mg.sha], ['merged', 'ms']);
+    assert.deepEqual(asks.at(-1).subject.features, ['merge_stack', 'merge_pr']);
   } finally { globalThis.fetch = real; }
 });
 
@@ -364,6 +406,35 @@ esac
     assert.ok(lines.includes("api -X POST -H X-GitHub-Api-Version: 2022-11-28 repos/o/demo/pulls --input -"), lines.join('\n'));
     assert.ok(lines.some((l) => l.includes('"head":"agent/feat"')), 'body on stdin');
   } finally { process.env.PATH = oldPath; }
+});
+
+test('GitHub stacks: REST /stacks through the provider; Gitea has none', async () => {
+  const { provider } = await import('../src/plugins/git/providers.js');
+  const real = globalThis.fetch; const log: string[] = [];
+  const st = (n = 1) => ({ number: n, url: 'u', open: true, base: { ref: 'main' }, pull_requests: [{ number: 1, state: 'open', draft: false, merged_at: '2026-01-01', head: { ref: 'agent/a' } }, { number: 2, state: 'open', draft: true, merged_at: null, head: { ref: 'agent/b' } }] });
+  let status = 200, body: any = st();
+  globalThis.fetch = (async (url: string, o: any) => { const u = new URL(url); log.push(`${o.method} ${u.pathname}${u.search} ${o.body ?? ''}`); return new Response(status === 204 ? null : JSON.stringify(body), { status }); }) as any;
+  try {
+    const p = provider({ name: 'h', provider: 'github', token: 'T' }, { name: 'r', url: 'git@github.com:o/r.git' });
+    const s = await p.stacks!.get(1);
+    assert.deepEqual(s.prs.map((x) => [x.number, x.merged, x.head]), [[1, true, 'agent/a'], [2, false, 'agent/b']]);
+    assert.equal(s.base, 'main');
+    body = [st()]; assert.equal((await p.stacks!.forPr(2))?.number, 1);
+    assert.equal(log.at(-1), 'GET /repos/o/r/stacks?pull_request=2 ');
+    body = []; assert.equal(await p.stacks!.forPr(9), null);
+    body = st(); await p.stacks!.create([1, 2]); assert.equal(log.at(-1), 'POST /repos/o/r/stacks {"pull_requests":[1,2]}');
+    await p.stacks!.add(1, [3]); assert.equal(log.at(-1), 'POST /repos/o/r/stacks/1/add {"pull_requests":[3]}');
+    body = null; status = 204; assert.deepEqual(await p.stacks!.unstack(1), { dissolved: true });
+    assert.equal(log.at(-1), 'POST /repos/o/r/stacks/1/unstack ');
+    status = 200; body = { status: 'pending', details: { uuid: 'U', merge_method: 'squash', merge_action: 'default' } };
+    assert.deepEqual(await p.stacks!.merge(2, { method: 'squash' }), { status: 'pending', uuid: 'U', method: 'squash', action: 'default', message: undefined, sha: undefined });
+    assert.equal(log.at(-1), 'PUT /repos/o/r/pulls/2/merge-async {"merge_method":"squash","merge_action":"default"}');
+    status = 404; body = { message: 'Not Found' };
+    await assert.rejects(p.stacks!.get(1), /not enabled/);
+    await assert.rejects(p.stacks!.merge(2, {}), /not available/);
+    status = 409; await assert.rejects(p.stacks!.merge(2, {}), /already exists/);
+    assert.equal(provider({ name: 'h', provider: 'gitea', token: 'T', apiUrl: 'https://g.example/api/v1' }, { name: 'r', url: 'https://g.example/o/r.git' }).stacks, undefined);
+  } finally { globalThis.fetch = real; }
 });
 
 test('gh provider: draft status through gh api graphql', async () => {

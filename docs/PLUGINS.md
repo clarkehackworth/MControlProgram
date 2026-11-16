@@ -351,6 +351,14 @@ This plugin used to be called `github`. On startup MControlProgram moves the old
 
 `create_pr` also takes `labels`, `assignees` and `reviewers`, added to a PR it opens (an already-open PR is returned unchanged). They need the `edit_pr` approval as well as `create_pr`'s. If they fail after the PR is open, the PR comes back with a `warning`. `pr` lists the latest 50 PRs in a state; `search` keeps those whose title, branch or author contains every word (e.g. a ticket id).
 
+**Stacked PRs** (GitHub, `github` and `gh` providers; the REST `/stacks` API, which must be enabled for the repo):
+- `create_pr` and `edit_pr` accept an agent branch (with its prefix) as `base`, to build on the layer below.
+- `stack` lists stacks, reads one by `number`, or finds the one holding a `pr`. A stack lists its PRs bottom (merges first) to top.
+- `stack_submit {layers}` opens a PR per already-pushed agent branch (each based on the one below, drafts by default) and links them into a stack. It is safe to repeat: existing PRs are reused and a wrong base is corrected (needs `edit_pr` approval).
+- `stack_link {prs, stack?}` makes a stack from existing PRs, or adds to the top of one. It never removes PRs.
+- `unstack {number}` dissolves the grouping only; PRs and branches stay.
+- `merge_stack {number, method?}` merges that PR and every unmerged PR below it. GitHub does this in the background, so the answer is `merged`, `enqueued` (merge queue), `failed` or `pending`; for `pending`, call again with `uuid`. Needs `merge_stack` and `merge_pr` approval.
+
 **Set up host** checks for git, creates the repos directory and the key, and returns the public key and what `ssh -T git@<forge>` answers. The forge is the API URL's host, or github.com / gitlab.com for those providers; with no provider the key isn't checked. Add the key to the git server as a deploy key with write access (one repo) or to a machine user, then run it again. A native host inside the container should keep the repos directory and key on the data volume (`/data/git/...`).
 
 **Repos** are discovered:

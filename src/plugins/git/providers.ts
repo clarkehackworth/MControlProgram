@@ -14,8 +14,30 @@ export interface PrDetail extends Pr {
   comments: { user?: string; at?: string; body: string }[];
   inline: { user?: string; path?: string; line?: number; body: string }[];
 }
+/** A GitHub stack: PRs chained base-to-head, listed from the bottom (merges first) to the top. */
+export interface Stack { number: number; url?: string; open: boolean; base?: string; prs: { number: number; head?: string; state?: string; draft?: boolean; merged: boolean }[] }
+/** A stack merge, which GitHub runs in the background: `pending` until it is `merged`, `enqueued` (merge queue) or `failed`. */
+export interface StackMerge { status: string; uuid?: string; method?: string; action?: string; message?: string; sha?: string }
+/** GitHub's stacked PRs (REST `/stacks`): only the `github` and `gh` providers have them. */
+export interface Stacks {
+  list(): Promise<Stack[]>;
+  get(n: number): Promise<Stack>;
+  /** The stack holding PR `pr`, or null. */
+  forPr(pr: number): Promise<Stack | null>;
+  /** `prs`: at least two, bottom to top, each based on the previous one's branch. */
+  create(prs: number[]): Promise<Stack>;
+  /** `prs`: only the new ones, from the current top upward. */
+  add(n: number, prs: number[]): Promise<Stack>;
+  /** Removes the grouping only: PRs and branches stay. `dissolved`: nothing was left in it. */
+  unstack(n: number): Promise<{ dissolved: boolean; stack?: Stack }>;
+  /** Merges PR `pr` and every unmerged PR below it. */
+  merge(pr: number, a: { method?: 'merge' | 'squash' | 'rebase'; action?: 'default' | 'direct_merge' | 'merge_queue' }): Promise<StackMerge>;
+  mergeStatus(pr: number, uuid: string): Promise<StackMerge>;
+}
 export interface Provider {
   defaultBranch(): Promise<string>;
+  /** Stacked PRs (GitHub only). */
+  stacks?: Stacks;
   /** Open a PR; if one is already open for `head`, that one with `existing: true`. */
   create(a: { head: string; base: string; title: string; body: string; draft: boolean }): Promise<Pr & { existing?: boolean }>;
   list(state: 'open' | 'closed' | 'all'): Promise<Pr[]>;
@@ -129,7 +151,45 @@ type Graphql = (query: string, variables: Record<string, unknown>) => Promise<an
 function githubLike(api: Api, gitea: boolean, graphql?: Graphql): Provider {
   const pr = (p: any): Pr => ({ number: p.number, title: p.title, state: p.merged || p.merged_at ? 'merged' : p.state, draft: p.draft ?? (gitea ? /^(WIP|\[WIP\]|Draft):?/i.test(p.title) : undefined),
     head: p.head?.ref, base: p.base?.ref, url: p.html_url, user: p.user?.login, updated: p.updated_at });
+  const stack = (x: any): Stack => ({ number: x.number, url: x.url, open: !!x.open, base: x.base?.ref,
+    prs: (x.pull_requests ?? []).map((q: any) => ({ number: q.number, head: q.head?.ref, state: q.state, draft: q.draft, merged: !!q.merged_at })) });
+  // a 404 on /stacks: the feature is off for the repo (or the login can't see it)
+  const stackCall = async (method: string, path: string, body?: unknown) => {
+    try { return await api(method, path, body); } catch (e: any) {
+      if (e.status === 404) throw new Error('stacked PRs are not enabled for this repository (or this login cannot use them)');
+      throw e;
+    }
+  };
+  const stacks: Stacks = {
+    async list() {
+      const all: Stack[] = [];
+      for (let page = 1; page <= 5; page++) {
+        const batch: any[] = await stackCall('GET', `/stacks?per_page=100&page=${page}`);
+        all.push(...batch.map(stack));
+        if (batch.length < 100) break;
+      }
+      return all;
+    },
+    get: async (n) => stack(await stackCall('GET', `/stacks/${n}`)),
+    async forPr(n) { const [x] = await stackCall('GET', `/stacks?pull_request=${n}`); return x ? stack(x) : null; },
+    create: async (prs) => stack(await stackCall('POST', '/stacks', { pull_requests: prs })),
+    add: async (n, prs) => stack(await stackCall('POST', `/stacks/${n}/add`, { pull_requests: prs })),
+    async unstack(n) { const x = await stackCall('POST', `/stacks/${n}/unstack`); return x ? { dissolved: false, stack: stack(x) } : { dissolved: true }; },
+    async merge(n, a) {
+      let r: any;
+      try { r = await api('PUT', `/pulls/${n}/merge-async`, { merge_method: a.method, merge_action: a.action ?? 'default' }); } catch (e: any) {
+        if (e.status === 404) throw new Error('merging a stack is not available for this repository');
+        if (e.status === 409) throw new Error('a merge request already exists for this stack');
+        if (e.status === 400) throw new Error('the stack can no longer be merged as requested; read it again (stack) and retry');
+        throw e;
+      }
+      return mergeResult(r);
+    },
+    mergeStatus: async (n, uuid) => mergeResult(await api('GET', `/pulls/${n}/merge-async/${encodeURIComponent(uuid)}`)),
+  };
+  const mergeResult = (r: any): StackMerge => ({ status: r?.status, uuid: r?.details?.uuid, method: r?.details?.merge_method, action: r?.details?.merge_action, message: r?.details?.message, sha: r?.details?.sha });
   return {
+    ...(gitea ? {} : { stacks }),
     defaultBranch: async () => (await api('GET', '')).default_branch,
     async create(a) {
       try {

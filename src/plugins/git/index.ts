@@ -29,7 +29,7 @@ import { text } from '../../core/plugin-api.js';
 import type { McpApi } from '../mcp/index.js';
 import type { ToolRuleStore, LogEntry } from '../mcp/rules.js';
 import type { Proc, SshApi } from '../ssh/index.js';
-import { PROVIDERS, origin, provider, type ProviderName } from './providers.js';
+import { PROVIDERS, origin, provider, type Provider, type ProviderName, type Stack, type Stacks } from './providers.js';
 
 export interface HostCfg {
   name: string; native?: boolean; sshHost?: string; description?: string; reposDir: string; sshKey: string;
@@ -54,6 +54,11 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'comment', ro: false, description: 'Comment on a pull request (GitHub, Gitea: or an issue)' },
   { name: 'merge_pr', ro: false, description: 'Merge a pull request (merge, squash or rebase)' },
   { name: 'edit_pr', ro: false, description: 'Edit a pull request: title, body, base, close / reopen, draft, labels, assignees, reviewers' },
+  { name: 'stack', ro: true, description: 'List stacked PRs (GitHub), or read one stack: by number, or the one holding a PR' },
+  { name: 'stack_submit', ro: false, description: 'Open a chain of PRs, each based on the branch below it, and link them into a GitHub stack' },
+  { name: 'stack_link', ro: false, description: 'Create a GitHub stack from existing PRs, or add PRs to the top of one' },
+  { name: 'unstack', ro: false, description: 'Dissolve a GitHub stack (its PRs and branches stay)' },
+  { name: 'merge_stack', ro: false, description: 'Merge a stacked PR and every unmerged PR below it' },
   { name: 'review_pr', ro: false, description: 'Review a pull request: approve, request changes or comment' },
   { name: 'base_push', ro: false, description: 'submit_patch or git push straight to a base branch, without a PR' },
   { name: 'delete_branch', ro: false, description: 'Delete an agent branch on the remote (also merge_pr with delete_branch)' },
@@ -567,7 +572,29 @@ const plugin: MControlProgramPlugin = {
       return d ? [d] : [];
     };
     const prov = (r: Repo, call: ToolCallContext) => provider(r.h, r, call.signal, (script, input) => run(r.h, script, call.log, input));
-    const checkBase = (r: Repo, base?: string) => { if (base && r.baseBranches.length && !r.baseBranches.includes(base)) throw new Error(`base must be one of: ${r.baseBranches.join(', ')}`); };
+    /** A PR's target: one of the base branches, or an agent branch written out with its prefix (the layer below, to stack on). */
+    const resolveBase = (r: Repo, base?: string) => {
+      if (!base || !r.baseBranches.length || r.baseBranches.includes(base)) return base;
+      if (base.startsWith(r.branchPrefix)) return agentBranch(r, base);
+      throw new Error(`base must be one of: ${r.baseBranches.join(', ')}, or an agent branch (${r.branchPrefix}…) to stack on`);
+    };
+    const stacksOf = (p: Provider) => { if (!p.stacks) throw new Error('stacked PRs need a GitHub provider (github or gh)'); return p.stacks; };
+    /** Puts PRs `nums` (bottom to top) in one stack: creates it, or adds what's missing to the top of the one they are in. */
+    const linkStack = async (st: Stacks, nums: number[], stackNo?: number) => {
+      if (new Set(nums).size !== nums.length) throw new Error('a PR is listed twice');
+      const held = stackNo ? [await st.get(stackNo)] : (await Promise.all(nums.map((n) => st.forPr(n)))).filter((x): x is Stack => !!x);
+      const distinct = [...new Map(held.map((x) => [x.number, x])).values()];
+      if (distinct.length > 1) throw new Error(`these PRs are in different stacks (${distinct.map((x) => `#${x.number}`).join(', ')}): unstack one first`);
+      const cur = distinct[0];
+      if (!cur) {
+        if (nums.length < 2) return { stack: null, note: 'a stack needs at least two PRs' };
+        return { stack: await st.create(nums), created: true };
+      }
+      const have = new Set(cur.prs.map((x) => x.number));
+      const missing = nums.filter((n) => !have.has(n));
+      if (!missing.length) return { stack: cur, unchanged: true };
+      return { stack: await st.add(cur.number, missing), added: missing };
+    };
     const names = z.array(z.string()).optional();
     /** `b` if it is an agent branch (never a base branch, even with an empty prefix). */
     const deletable = async (r: Repo, b: string, log: ScopedLogger) => {
@@ -722,18 +749,18 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
         tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it unchanged. `labels`, `assignees` and `reviewers` are added to a PR this call opens (as edit_pr would).',
           {
             branch: z.string().describe('Agent branch (head)'),
-            base: z.string().optional().describe('Target branch; default: the first base branch, else the default branch'),
+            base: z.string().optional().describe('Target branch; default: the first base branch, else the default branch. To stack on another layer, that layer\'s agent branch with its prefix'),
             title: z.string(), body: z.string().optional(), draft: z.boolean().optional(),
             labels: names, assignees: names, reviewers: names,
           },
           async (r, a, call, gate) => {
             const head = agentBranch(r, a.branch);
-            checkBase(r, a.base);
+            const base = resolveBase(r, a.base);
             const p = prov(r, call);
             const extras = !!(a.labels?.length || a.assignees?.length || a.reviewers?.length);
-            await gate(['create_pr', ...(extras ? ['edit_pr'] : [])], `PR ${head} → ${a.base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}${extras ? ` (+ ${[a.labels?.length && 'labels', a.assignees?.length && 'assignees', a.reviewers?.length && 'reviewers'].filter(Boolean).join(', ')})` : ''}`,
-              { head, base: a.base, title: a.title, labels: a.labels, assignees: a.assignees, reviewers: a.reviewers });
-            const pr = await p.create({ head, base: a.base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
+            await gate(['create_pr', ...(extras ? ['edit_pr'] : [])], `PR ${head} → ${base ?? r.baseBranches[0] ?? 'default branch'}: ${a.title}${extras ? ` (+ ${[a.labels?.length && 'labels', a.assignees?.length && 'assignees', a.reviewers?.length && 'reviewers'].filter(Boolean).join(', ')})` : ''}`,
+              { head, base, title: a.title, labels: a.labels, assignees: a.assignees, reviewers: a.reviewers });
+            const pr = await p.create({ head, base: base ?? r.baseBranches[0] ?? await p.defaultBranch(), title: a.title, body: a.body ?? '', draft: !!a.draft });
             if (pr.existing || !extras) return pr;
             // the PR is open now: if the extras fail, say so rather than hide the PR
             try {
@@ -777,14 +804,14 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
           }),
         tool('edit_pr', 'Edit a pull request: title, body, base, close / reopen, draft / ready for review, and add or remove labels, assignees and requested reviewers (usernames). Returns the PR as `pr` does.',
           {
-            number: z.number().int(), title: z.string().optional(), body: z.string().optional(), base: z.string().optional().describe('New target branch'),
+            number: z.number().int(), title: z.string().optional(), body: z.string().optional(), base: z.string().optional().describe('New target branch (a base branch, or an agent branch with its prefix to stack on)'),
             state: z.enum(['open', 'closed']).optional(), draft: z.boolean().optional(),
             add_labels: names, remove_labels: names, add_assignees: names, remove_assignees: names, add_reviewers: names, remove_reviewers: names,
           },
           async (r, a, call, gate) => {
-            checkBase(r, a.base);
+            const base = resolveBase(r, a.base);
             const d = (add?: string[], remove?: string[]) => (add?.length || remove?.length ? { add, remove } : undefined);
-            const e = { title: a.title, body: a.body, base: a.base, state: a.state, draft: a.draft,
+            const e = { title: a.title, body: a.body, base, state: a.state, draft: a.draft,
               labels: d(a.add_labels, a.remove_labels), assignees: d(a.add_assignees, a.remove_assignees), reviewers: d(a.add_reviewers, a.remove_reviewers) };
             const changed = Object.entries(e).filter(([, v]) => v !== undefined).map(([k]) => k);
             if (!changed.length) throw new Error('nothing to change');
@@ -799,6 +826,81 @@ ${inspect('refs/remotes/origin/HEAD')}`, call.log));
             const p = prov(r, call);
             await gate(['review_pr'], `${a.event.replace('_', ' ')} #${a.number}`, { number: a.number, event: a.event, body: a.body });
             return p.review(a.number, a);
+          }),
+        tool('stack', 'GitHub stacked PRs. Without arguments: the repo\'s stacks. With `number`: that stack. With `pr`: the stack holding that PR (null when none). A stack lists its PRs from the bottom (merges first) to the top.',
+          { number: z.number().int().optional().describe('Stack number'), pr: z.number().int().optional().describe('PR number') },
+          async (r, a, call, gate) => {
+            const st = stacksOf(prov(r, call));
+            await gate(['stack'], a.number ? `read stack #${a.number}` : a.pr ? `find the stack of PR #${a.pr}` : 'list stacks', { number: a.number, pr: a.pr });
+            return a.number ? st.get(a.number) : a.pr ? st.forPr(a.pr) : st.list();
+          }),
+        tool('stack_submit', 'Open a chain of PRs from agent branches that are already pushed, and link them into a GitHub stack (like `gh stack submit`). `layers` go bottom to top: the first is based on `base` (default: the repo\'s base branch), each next one on the branch below it. A layer that already has an open PR is reused, and its base is corrected if it differs. New PRs are drafts unless `draft: false`. Safe to run again after a failure: it carries on from where it stopped.',
+          {
+            layers: z.array(z.object({ branch: z.string().describe('Agent branch (head)'), title: z.string(), body: z.string().optional() })).min(1).max(20),
+            base: z.string().optional().describe('Base of the bottom layer; default: the first base branch, else the default branch'),
+            draft: z.boolean().optional().describe('New PRs as drafts (default true)'),
+            stack: z.number().int().optional().describe('Add to this existing stack instead of finding it from the PRs'),
+          },
+          async (r, a, call, gate) => {
+            const p = prov(r, call), st = stacksOf(p);
+            const heads = a.layers.map((l: { branch: string }) => agentBranch(r, l.branch));
+            if (new Set(heads).size !== heads.length) throw new Error('a branch is listed twice');
+            const trunk = resolveBase(r, a.base);
+            const bottom = trunk ?? r.baseBranches[0] ?? await p.defaultBranch();
+            const open = await p.list('open');
+            const plan = heads.map((head: string, i: number) => {
+              const want = i === 0 ? bottom : heads[i - 1];
+              const have = open.find((x) => x.head === head);
+              return { head, want, have, action: !have ? 'create' : have.base !== want ? 'rebase' : 'reuse' };
+            });
+            await gate(['stack_submit', 'create_pr', ...(plan.some((x: { action: string }) => x.action === 'rebase') ? ['edit_pr'] : [])],
+              `stack of ${plan.length} PR(s) on ${bottom}: ${plan.map((x: { head: string; action: string }) => `${x.head} (${x.action})`).join(', ')}`, { layers: plan.map((x: { head: string; want: string; action: string }) => ({ head: x.head, base: x.want, action: x.action })) });
+            const done: { branch: string; number?: number; action: string }[] = [], nums: number[] = [];
+            try {
+              for (const [i, x] of plan.entries()) {
+                const l = a.layers[i];
+                let n = x.have?.number;
+                if (x.action === 'create') {
+                  const made = await p.create({ head: x.head, base: x.want, title: l.title, body: l.body ?? '', draft: a.draft !== false });
+                  n = made.number;
+                  // opened since the plan was made (or past the 50 PRs listed): moving it is an edit_pr
+                  if (made.existing && made.base !== x.want) { await gate(['edit_pr'], `move PR #${n} (${x.head}) onto ${x.want}`, { number: n, base: x.want }); await p.edit(n, { base: x.want }); }
+                } else if (x.action === 'rebase') await p.edit(n!, { base: x.want });
+                nums.push(n!); done.push({ branch: x.head, number: n, action: x.action });
+              }
+              const linked = await linkStack(st, nums, a.stack);
+              return { prs: done, ...linked };
+            } catch (e) {
+              throw new Error(`${(e as Error).message}${done.length ? `. Done so far: ${JSON.stringify(done)}` : ''}. Run stack_submit again to carry on: existing PRs are reused.`);
+            }
+          }),
+        tool('stack_link', 'Create a GitHub stack from existing PRs (at least two, bottom to top, each based on the branch of the one below), or with `stack` add PRs to its top (like `gh stack link`). PRs already in the stack are skipped. Never removes a PR from a stack.',
+          { prs: z.array(z.number().int()).min(1).describe('PR numbers, bottom to top'), stack: z.number().int().optional().describe('Add to this stack') },
+          async (r, a, call, gate) => {
+            const st = stacksOf(prov(r, call));
+            await gate(['stack_link'], `${a.stack ? `add to stack #${a.stack}` : 'create a stack from'} PRs ${a.prs.map((n: number) => `#${n}`).join(', ')}`, { prs: a.prs, stack: a.stack });
+            return linkStack(st, a.prs, a.stack);
+          }),
+        tool('unstack', 'Dissolve a GitHub stack. Only the grouping goes: the PRs and branches stay (a merged or queued PR stays in the stack, and the rest are returned).',
+          { number: z.number().int().describe('Stack number') },
+          async (r, a, call, gate) => {
+            const st = stacksOf(prov(r, call));
+            await gate(['unstack'], `unstack #${a.number}`, { number: a.number });
+            return st.unstack(a.number);
+          }),
+        tool('merge_stack', 'Merge PR `number` and every unmerged PR below it in its stack, all or nothing (like `gh stack merge`; `gh pr merge` cannot do this). GitHub runs it in the background: the answer is `merged`, `enqueued` (the base branch uses a merge queue, which picks the method and ignores `method`), `failed`, or `pending`. For `pending`, call again with the `uuid` to read the result. Only open, non-draft PRs can be merged.',
+          {
+            number: z.number().int().describe('PR to merge up to (it and everything below it)'),
+            method: z.enum(['merge', 'squash', 'rebase']).optional().describe('Default: the last method used'),
+            uuid: z.string().optional().describe('From an earlier pending answer: just read its result'),
+          },
+          async (r, a, call, gate) => {
+            const st = stacksOf(prov(r, call));
+            if (a.uuid) { await gate(['stack'], `read the stack merge of #${a.number}`, { number: a.number, uuid: a.uuid }); return st.mergeStatus(a.number, a.uuid); }
+            await gate(['merge_stack', 'merge_pr'], `merge #${a.number} and every unmerged PR below it${a.method ? ` (${a.method})` : ''}`, { number: a.number, method: a.method });
+            let m = await st.merge(a.number, { method: a.method });
+            for (let i = 0; i < 4 && m.status === 'pending' && m.uuid; i++) { await new Promise((ok) => setTimeout(ok, 1500)); m = await st.mergeStatus(a.number, m.uuid); }
+            return m;
           }),
       ] : []),
     ];
