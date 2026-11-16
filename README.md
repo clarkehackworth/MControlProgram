@@ -71,7 +71,8 @@ BrowserPaw has its own URL access rules (allow, ask or deny by default), pushed 
   `mcp` (proxy other MCP servers with per-tool allow/ask/deny), `browserpaw` (agent-driven
   Chromium profiles on SSH, native or manual hosts, with a managed URL policy and per-agent request
   log), `git` (agents push and submit patches from clones on a git host to any git server, and open
-  PRs on GitHub/GitLab/Gitea/Forgejo, with allow/ask/deny per repo and per tool) and `sandbox`
+  PRs on GitHub/GitLab/Gitea/Forgejo; they can also drive the host's clone: pull, switch, merge / rebase,
+  stash, resolve conflicts, commit and push; allow/ask/deny per repo and per tool) and `sandbox`
   (Docker Sandboxes via `sbx` over SSH or on this machine: create, exec, files,
   ports, network policy).
 - **Secrets encrypted at rest** (AES-256-GCM, key in `MCONTROLPROGRAM_MASTER_KEY` or `data/master.key`);

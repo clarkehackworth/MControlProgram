@@ -9,7 +9,7 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'mcontrolprogram-git-'));
 process.env.MCONTROLPROGRAM_DATA_DIR = path.join(tmp, 'data');
 process.env.HOME = tmp; // the native git host's ~ (repos dir, ssh key)
 await (await import('../src/core/plugin-loader.js')).loadPlugins(); // init: git gets mcp's rule store
-const { default: plugin, globMatch, isMbox, agentBranch, slug, qp } = await import('../src/plugins/git/index.js');
+const { default: plugin, globMatch, isMbox, agentBranch, slug, qp, workdirCheck } = await import('../src/plugins/git/index.js');
 const { ScopedLogger } = await import('../src/core/logger.js');
 const log = new ScopedLogger({ category: 'test' });
 
@@ -134,7 +134,7 @@ test('resolve, submit (mbox, then plain diff with force + sensitive path), one a
   const { rows } = await act('calls', { since: 0 });
   assert.ok(rows.some((r: any) => r.tool === 'submit_patch' && r.blocked === 'tool rule: deny'));
   const { tools } = await act('tool_rules', {});
-  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['clone_url', 'pr', 'resolve']);
+  assert.deepEqual(tools.filter((x: any) => x.upstream === 'demo' && x.read_only).map((x: any) => x.tool).sort(), ['clone_url', 'pr', 'resolve', 'workdir_read']);
 
   // PRs go to the API with the host's token; an existing PR for the branch is returned
   const real = globalThis.fetch; const seen: string[] = [];
@@ -322,6 +322,54 @@ esac
     assert.ok(lines.includes("api -X POST -H X-GitHub-Api-Version: 2022-11-28 repos/o/demo/pulls --input -"), lines.join('\n'));
     assert.ok(lines.some((l) => l.includes('"head":"agent/feat"')), 'body on stdin');
   } finally { process.env.PATH = oldPath; }
+});
+
+test('working in the host clone: pull with a conflict, resolve, commit, push; risky git refused', async () => {
+  for (const [c, args] of [['config', []], ['push', []], ['commit', ['-F', '/etc/passwd']], ['commit', ['-qF/x']], ['log', ['--out=x']], ['rebase', ['--exe=sh']], ['rebase', ['-ix', 'sh']], ['diff', ['--no-index', '/etc/passwd', 'x']], ['pull', ['/tmp/x']], ['fetch', ['https://evil/x']]] as [string, string[]][])
+    assert.throws(() => workdirCheck(c, args), undefined, `${c} ${args}`);
+  for (const [c, args] of [['pull', ['--rebase', 'origin', 'main']], ['commit', ['--message=Fix it']], ['log', ['--oneline', '-n', '3']], ['checkout', ['--', '-F']], ['stash', ['pop']]] as [string, string[]][])
+    workdirCheck(c, args);
+
+  const inst: any = await plugin.create({ instanceId: 'i4', instanceName: 'git', serverId: 's', config: { repos: ['demo'] }, pluginConfig: config, global: () => ({}) as any, log, dep: () => undefined } as any);
+  const asks: any[] = [];
+  const call = { principal: 'agent1', signal: new AbortController().signal, log, ask: async (a: any) => { asks.push(a); return 'approved by test'; } };
+  const run = async (n: string, a: any) => (await inst.tools.find((x: any) => x.name === n).handler(a, call)).content[0].text as string;
+  const git = (command: string, ...args: string[]) => run('git', { command, args });
+
+  assert.match(await git('status'), /exit 0$/);
+  assert.equal(asks.length, 0, 'read-only git runs under the read-only policy');
+  assert.match(await git('fetch'), /exit 0$/);
+  assert.match(await git('switch', '-c', 'work', 'origin/main'), /exit 0$/);
+  // origin moves on while the clone edits the same line
+  sh(clone, 'fetch', '-q', 'origin'); sh(clone, 'checkout', '-q', '-B', 'up', 'origin/main');
+  fs.writeFileSync(path.join(clone, 'README.md'), 'theirs\n'); sh(clone, 'commit', '-qam', 'theirs'); sh(clone, 'push', '-q', 'origin', 'HEAD:main');
+  await run('write_file', { path: 'README.md', content: 'ours\n' });
+  assert.match(await git('commit', '--message=ours'), /exit 0$/);
+  const pull = await git('pull', '--no-rebase', 'origin', 'main');
+  assert.match(pull, /CONFLICT[\s\S]*exit 1$/);
+  assert.match(await git('show', ':3:README.md'), /^theirs\n/);
+  await run('write_file', { path: 'README.md', content: 'merged\n' });
+  assert.match(await git('commit', '--no-edit'), /exit 0$/);
+  const p = JSON.parse(await run('push', { branch: 'work' }));
+  assert.equal(sh(origin, 'rev-parse', 'refs/heads/agent/work'), p.sha);
+  assert.equal(sh(origin, 'show', `${p.sha}:README.md`), 'merged');
+  assert.equal(sh(origin, 'log', '-1', '--format=%an', p.sha), 'MControlProgram');
+  assert.ok(asks.some((a) => a.subject.features.includes('push')) && asks.some((a) => a.subject.features.includes('workdir')));
+  assert.equal(JSON.parse(await run('push', { branch: 'work' })).unchanged, true);
+  // the merge builds on main: it fast-forwards main, with base_push
+  assert.equal(JSON.parse(await run('push', { branch: 'main' })).sha, sh(origin, 'rev-parse', 'main'));
+  assert.ok(asks.at(-1).subject.features.includes('base_push'));
+  assert.match(await git('reset', '--hard', 'HEAD~1'), /exit 0$/);
+  await assert.rejects(run('push', { branch: 'main' }), /never rewritten/);
+
+  // write_file stays inside the clone
+  const outside = path.join(tmp, 'outside'); fs.mkdirSync(outside);
+  const wt = config.repos[0].path;
+  fs.symlinkSync(outside, path.join(wt, 'lnk'));
+  await run('write_file', { path: 'lnk/f', content: 'x' });
+  assert.ok(!fs.existsSync(path.join(outside, 'f')) && fs.readFileSync(path.join(wt, 'lnk/f'), 'utf8') === 'x');
+  await assert.rejects(run('write_file', { path: '.git/config', content: 'x' }));
+  await assert.rejects(run('write_file', { path: '../x', content: 'x' }), /invalid path/);
 });
 
 test('a clone removed from the host drops out of the inventory', async () => {

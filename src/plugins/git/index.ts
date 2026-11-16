@@ -12,6 +12,9 @@
  * It serves a bare mirror next to the host clone holding only origin's branches and tags plus agent pushes, so
  * the host clone's own work never leaks.
  *
+ * Agents can also work in the host clone itself (`git`, `write_file`, `push` tools): pull, switch branches, merge / rebase,
+ * stash, resolve conflicts and commit there, with an allowlist of git subcommands and options, then push like submit_patch.
+ *
  * Every tool and git feature (force push, touching CI paths) is allow / ask / deny per repo, using mcp's rule store
  * (own `git_*` tables, same panel as the MCP pass-through). One call asks once, for everything it touches.
  */
@@ -54,6 +57,9 @@ export const FEATURES: { name: string; ro: boolean; description: string }[] = [
   { name: 'review_pr', ro: false, description: 'Review a pull request: approve, request changes or comment' },
   { name: 'base_push', ro: false, description: 'submit_patch or git push straight to a base branch, without a PR' },
   { name: 'delete_branch', ro: false, description: 'Delete an agent branch on the remote (also merge_pr with delete_branch)' },
+  { name: 'workdir_read', ro: true, description: "git status / log / diff / show … in MControlProgram's clone (the git tool's read-only commands)" },
+  { name: 'workdir', ro: false, description: "Change MControlProgram's clone: pull, switch branches, merge / rebase, stash, commit, resolve conflicts (git and write_file tools)" },
+  { name: 'push', ro: false, description: "Push a branch prepared in MControlProgram's clone to an agent branch (base_push, force_push, custom_identity and sensitive_paths apply too)" },
 ];
 const RO = Object.fromEntries(FEATURES.map((f) => [f.name, f.ro]));
 const featureList = FEATURES.map((f) => ({ name: f.name, description: f.description, annotations: { readOnlyHint: f.ro } }));
@@ -228,8 +234,49 @@ g diff --name-only -z "$base" "$sha"
   return { base: kv.base, sha: kv.sha, previous: kv.prev || undefined, force: kv.force === '1', commits: Number(kv.commits), files: files.split('\0').filter(Boolean) };
 }
 
+// ---- MControlProgram's clone, driven by agents (git / write_file / push tools) ------------------------------
+
+/** Subcommands agents may run in the host clone; the read ones fall under the read-only policy. No push (the push tool), config, remote, submodule, am. */
+export const WT_READ = ['status', 'log', 'diff', 'show', 'ls-files', 'rev-parse', 'merge-base', 'describe', 'shortlog'];
+export const WT_WRITE = ['pull', 'fetch', 'switch', 'checkout', 'restore', 'branch', 'stash', 'merge', 'rebase', 'cherry-pick', 'revert', 'reset', 'add', 'rm', 'mv', 'commit', 'clean'];
+/** Options that run commands, read or write files outside the repo, or reach other repos: long ones under any abbreviation git accepts. */
+const WT_LONG = ['--exec', '--upload-pack', '--receive-pack', '--output', '--no-index', '--pathspec-from-file', '--file', '--template', '--contents', '--recurse-submodules', '--ignore-revs-file', '--open-files-in-pager'];
+const WT_SHORT: Record<string, string> = { commit: 'Ft', merge: 'F', rebase: 'x' };
+/** Throws unless `git <cmd> <args>` is allowed in the host clone. Errs on the side of refusing (e.g. `-mFix` reads as -F: use --message=). */
+export function workdirCheck(cmd: string, args: string[]): void {
+  if (![...WT_READ, ...WT_WRITE].includes(cmd)) throw new Error(`git ${cmd} is not available here; allowed: ${[...WT_READ, ...WT_WRITE].join(', ')} (push with the push tool)`);
+  const pos: string[] = [];
+  let dd = false;
+  for (const a of args) {
+    if (dd || !a.startsWith('-') || a === '-') { pos.push(a); continue; }
+    if (a === '--') { dd = true; continue; }
+    const bad = a.startsWith('--') ? WT_LONG.some((o) => o.startsWith(a.split('=')[0])) : [...a.slice(1)].some((c) => (WT_SHORT[cmd] ?? '').includes(c));
+    if (bad) throw new Error(`option ${a} is not allowed here`);
+  }
+  if ((cmd === 'pull' || cmd === 'fetch') && pos.length && pos[0] !== 'origin') throw new Error(`${cmd} from origin only (give option values as --opt=value)`);
+}
+
+/**
+ * With $new (and $prev, the branch's current commit or empty) set: what pushing new over prev adds. Prints force,
+ * commit count, author / committer identities, then the files. `dflt` = where new work forks from when there is no prev.
+ */
+const inspect = (dflt: string) => `force=0; if [ -n "$prev" ] && ! g merge-base --is-ancestor "$prev" "$new"; then force=1; fi
+if [ -n "$prev" ] && [ $force = 0 ]; then base=$prev; else base=$(g merge-base "$new" ${dflt} 2>/dev/null || g hash-object -t tree /dev/null); fi
+ids=$( { g log --format='%an <%ae>%n%cn <%ce>' "$new" --not "$base" 2>/dev/null || g log --format='%an <%ae>%n%cn <%ce>' "$new"; } | sort -u | tr '\\n' '\\t')
+printf 'force=%s\\ncommits=%s\\nids=%s\\n--files--\\n' "$force" "$(g rev-list --count "$new" --not "$base" 2>/dev/null || g rev-list --count "$new")" "$ids"
+g diff --name-only -z "$base" "$new"
+`;
+/** `inspect`'s output (after any `k=v` lines before it), with the sensitive files and identities other than the host's. */
+function inspected(out: string, r: Repo) {
+  const [head, list = ''] = out.split('--files--\n');
+  const kv = Object.fromEntries(head.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+  const files = list.split('\0').filter(Boolean);
+  return { kv, force: kv.force === '1', commits: kv.commits, files, sensitive: files.filter((f) => r.askPaths.some((p) => globMatch(p, f))),
+    others: (kv.ids ?? '').split('\t').filter((x) => x && x !== `${r.h.committerName} <${r.h.committerEmail}>`) };
+}
+
 /** Push `sha` to `branch`; the lease fails the push if the branch moved since apply looked, instead of overwriting it. */
-const push = (run: Run, r: Repo, x: Applied, branch: string, log: ScopedLogger) => locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
+const push = (run: Run, r: Repo, x: Pick<Applied, 'sha' | 'previous'>, branch: string, log: ScopedLogger) => locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
 g push -q --no-verify ${q(`--force-with-lease=refs/heads/${branch}:${x.previous ?? ''}`)} origin ${q(`${x.sha}:refs/heads/${branch}`)}
 g update-ref ${q(`refs/remotes/origin/${branch}`)} ${q(x.sha)}
 sync
@@ -612,6 +659,65 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
           await deleteBranch(r, branch, call.log);
           return { deleted: branch };
         }),
+      tool('git', `Run git in MControlProgram's own clone of the repo (on the git host, shared by every agent on it): pull / fetch from origin, switch branches, merge, rebase, cherry-pick, stash, reset, add / rm, commit, and status / log / diff / show to look around. Returns git's output and exit code; a conflict exits non-zero and lists the files: read the sides with \`show :1:<path>\` (base) \`:2:\` (ours) \`:3:\` (theirs), write the result with write_file, then commit or \`rebase --continue\` (or \`merge --abort\`). Editors are off: give messages with --message=. Commits are by MControlProgram's git identity. Push the result with push. Allowed: ${[...WT_READ, ...WT_WRITE].join(', ')}.`,
+        { command: z.string().describe('git subcommand, e.g. "pull"'), args: z.array(z.string()).optional().describe('Its arguments, one per item, e.g. ["--rebase", "origin", "main"]') },
+        async (r, a, call, gate) => {
+          const args: string[] = a.args ?? [];
+          workdirCheck(a.command, args);
+          const write = WT_WRITE.includes(a.command);
+          await gate([write ? 'workdir' : 'workdir_read'], `git ${[a.command, ...args].join(' ')}`.slice(0, 300), { command: a.command, args });
+          const out = await locked(r, () => run(r.h, `${prelude(r.h)}cd ${qp(r.path)}
+export GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true GIT_MERGE_AUTOEDIT=no GIT_PAGER=cat PAGER=cat
+set +e
+g -c color.ui=never ${[a.command, ...args].map(q).join(' ')} 2>&1
+c=$?
+${write ? 'sync >/dev/null 2>&1' : ''}
+exit $c`, call.log));
+          const o = out.stdout + out.stderr;
+          // ponytail: 100 KB of output; page with log -n / diff -- <path> beyond that
+          return `${o.length > 100_000 ? `${o.slice(0, 100_000)}\n… (truncated)` : o}${o.endsWith('\n') || !o ? '' : '\n'}exit ${out.code}`;
+        }),
+      tool('write_file', "Write a file in MControlProgram's clone and stage it (git add): how you resolve a conflict from the git tool. Then commit, `rebase --continue`, `cherry-pick --continue`… with git.",
+        { path: z.string().describe('Path in the repo'), content: z.string().describe('The whole file') },
+        async (r, a, call, gate) => {
+          if (Buffer.byteLength(a.content) > r.maxPatchKB * 1024) throw new Error(`file is over ${r.maxPatchKB} KB`);
+          if (!a.path || a.path.startsWith('/') || a.path.split('/').some((c: string) => c === '..' || c === '')) throw new Error(`invalid path "${a.path}"`);
+          await gate(['workdir'], `write ${a.path} (${Buffer.byteLength(a.content)} bytes)`, { path: a.path, content: createHash('sha256').update(a.content).digest('hex').slice(0, 16) });
+          // through the index: git refuses paths in .git and replaces symlinks on the way, so nothing lands outside the clone
+          return locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
+p=${q(a.path)}; m=100644
+[ -f "$p" ] && [ ! -L "$p" ] && [ -x "$p" ] && m=100755
+b=$(g hash-object -w --stdin)
+g update-index --add --cacheinfo "$m,$b,$p"
+g checkout-index -f -- "$p"
+GIT_LITERAL_PATHSPECS=1 g status --short -- "$p"`, call.log, a.content));
+        }),
+      tool('push', "Push a branch prepared in MControlProgram's clone (with the git tool) to an agent branch on origin, or to a base branch by its exact name (see repos; needs approval, never rewritten). Commits are pushed as they are; authors or committers other than MControlProgram's git identity need approval. Rewriting a branch needs `force: true`.",
+        {
+          branch: z.string().describe('Agent branch to push to (the repo prefix is added if missing), or a base branch by its exact name'),
+          source: z.string().optional().describe('Local branch or commit in the clone; default HEAD'),
+          force: z.boolean().optional().describe('Allow rewriting the branch (not a fast-forward)'),
+        },
+        async (r, a, call, gate) => {
+          const toBase = (await baseOf(r, call.log)).includes(a.branch);
+          const branch = toBase ? a.branch : agentBranch(r, a.branch);
+          const out = await locked(r, () => sh(run, r.h, `${prelude(r.h)}cd ${qp(r.path)}
+fetch
+new=$(g rev-parse -q --verify ${q(`${ref(a.source ?? 'HEAD')}^{commit}`)}) || { echo ${q(`"${a.source ?? 'HEAD'}" is not a commit in the clone`)} >&2; exit 2; }
+prev=$(g rev-parse -q --verify ${q(`refs/remotes/origin/${branch}`)} || true)
+echo "sha=$new"; echo "prev=$prev"
+${inspect('refs/remotes/origin/HEAD')}`, call.log));
+          const { kv, force, files, sensitive, others } = inspected(out, r);
+          if (kv.sha === kv.prev) return { branch, sha: kv.sha, unchanged: true };
+          if (toBase && force) throw new Error(`${branch} is a base branch and is never rewritten: rebase onto origin/${branch} (git pull --rebase origin ${branch}) and push again.`);
+          if (force && !a.force) throw new Error(`${branch} is at ${kv.prev}, which ${a.source ?? 'HEAD'} doesn't build on. Rebase onto it, or pass force: true to replace it.`);
+          const features = ['push', ...(toBase ? ['base_push'] : []), ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
+          const what = `${force ? 'force-push' : 'push'} ${kv.commits} commit(s) from the clone to ${branch}: ${files.length} file(s)${others.length ? `, as ${others.slice(0, 3).join(', ')}` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
+          const by = await gate(features, what, { branch, sha: kv.sha, force });
+          await push(run, r, { sha: kv.sha, previous: kv.prev || undefined }, branch, call.log);
+          ctx.log.info(`${r.name}: ${what} (${kv.sha.slice(0, 12)}) for ${call.principal ?? 'agent'}, ${by}`);
+          return { branch, sha: kv.sha, commits: Number(kv.commits), files, forced: force };
+        }),
       ...(exposed.some((r) => r.h.provider !== 'none') ? [
         tool('create_pr', 'Open a pull request (GitLab: merge request) from an agent branch (push it first). If one is already open for the branch, returns it.',
           {
@@ -691,18 +797,9 @@ g for-each-ref --format='%(refname)%09%(objectname)%09%(*objectname)' refs/remot
       try {
         const out = await locked(r, () => sh(run, r.h, `${inServe(r)}cd "$S"
 new=${q(c.nu)}; prev=${q(prev)}
-force=0; if [ -n "$prev" ] && ! g merge-base --is-ancestor "$prev" "$new"; then force=1; fi
-if [ -n "$prev" ] && [ $force = 0 ]; then base=$prev; else base=$(g merge-base "$new" HEAD 2>/dev/null || g hash-object -t tree /dev/null); fi
-ids=$( { g log --format='%an <%ae>%n%cn <%ce>' "$new" --not "$base" 2>/dev/null || g log --format='%an <%ae>%n%cn <%ce>' "$new"; } | sort -u | tr '\\n' '\\t')
-printf 'force=%s\\ncommits=%s\\nids=%s\\n--files--\\n' "$force" "$(g rev-list --count "$new" --not "$base" 2>/dev/null || g rev-list --count "$new")" "$ids"
-g diff --name-only -z "$base" "$new"
-`, ctx.log));
-        const [head, list = ''] = out.split('--files--\n');
-        const kv = Object.fromEntries(head.trim().split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
-        const force = kv.force === '1', files = list.split('\0').filter(Boolean);
-        const sensitive = files.filter((f) => r.askPaths.some((p) => globMatch(p, f)));
+${inspect('HEAD')}`, ctx.log));
         // commits are expected under the host's identity (clone_url sets it up); anyone else is custom_identity
-        const others = (kv.ids ?? '').split('\t').filter((x) => x && x !== `${r.h.committerName} <${r.h.committerEmail}>`);
+        const { kv, force, files, sensitive, others } = inspected(out, r);
         if (base && force) throw new Error(`${branch} is a base branch and is never rewritten: fetch, rebase onto mcp/${branch} and push again`);
         const features = ['git_push', ...(base ? ['base_push'] : []), ...(force ? ['force_push'] : []), ...(others.length ? ['custom_identity'] : []), ...(sensitive.length ? ['sensitive_paths'] : [])];
         const what = `git push: ${force ? 'force-push' : 'push'} ${kv.commits} commit(s) to ${branch}: ${files.length} file(s)${others.length ? `, as ${others.slice(0, 3).join(', ')}` : ''}${sensitive.length ? `, sensitive: ${sensitive.slice(0, 5).join(', ')}${sensitive.length > 5 ? '…' : ''}` : ''}`;
@@ -815,7 +912,7 @@ g ${push ? RECEIVE : UPLOAD} ${svc.slice(4)} --stateless-rpc --advertise-refs .`
     return {
       tools,
       http,
-      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr; {prefix}_pr shows its checks and reviews, {prefix}_review_pr / {prefix}_edit_pr / {prefix}_merge_pr (with delete_branch) finish it, all through MControlProgram (merge with merge_pr rather than merging locally). Pushing straight to a base branch ({prefix}_repos lists them) works too, by its exact name (git push mcp HEAD:main, or submit_patch with branch "main"), but needs approval and must fast-forward; if a push or call says it awaits approval, repeat it later.',
+      instructions: 'Git via MControlProgram: {prefix}_clone_url gives you a git remote ("mcp") with what MControlProgram has: `git fetch mcp`, compare with `git log mcp/<base>..HEAD`, and `git push mcp HEAD:<branch prefix><name>` to have your commits pushed to GitHub. Without network access to it: {prefix}_resolve gives the sha to work on, and {prefix}_submit_patch takes `git format-patch --stdout <base>`. Then open a PR with {prefix}_create_pr; {prefix}_pr shows its checks and reviews, {prefix}_review_pr / {prefix}_edit_pr / {prefix}_merge_pr (with delete_branch) finish it, all through MControlProgram (merge with merge_pr rather than merging locally). Pushing straight to a base branch ({prefix}_repos lists them) works too, by its exact name (git push mcp HEAD:main, or submit_patch with branch "main"), but needs approval and must fast-forward; if a push or call says it awaits approval, repeat it later. You can also work in MControlProgram\'s own clone: {prefix}_git (pull, switch, merge / rebase, stash, commit, status / diff …), {prefix}_write_file to resolve conflicts, {prefix}_push to send the result to a branch.',
       status: () => ({ repos: exposed.map((r) => ({ name: r.name, host: r.host, origin: r.url })) }),
     };
   },
