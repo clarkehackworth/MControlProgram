@@ -91,3 +91,17 @@ test('blocks: normalize, match, enforce live (incl. redirects), and log every at
 
   inst.stop?.(); site.close();
 });
+
+test('credentials: a URL pattern must pin the host before its secret is sent', async () => {
+  const { credMatch } = await import('../src/plugins/web/index.js');
+  const m = (p: string, u: string) => credMatch(new RegExp(p, 'i'), new URL(u));
+  assert.equal(m('^https://api\\.github\\.com/', 'https://api.github.com/repos/x'), true);
+  assert.equal(m('^https://api\\.github\\.com/repos/', 'https://api.github.com/user'), false, 'path scoping still works');
+  assert.equal(m('^https://[^/]*\\.example\\.com/', 'https://a.example.com/x'), true, 'subdomain wildcard');
+  assert.equal(m('^http://192\\.168\\.3\\.87:8931/', 'http://192.168.3.87:8931/x'), true);
+  assert.equal(m('^https://api\\.github\\.com/', 'https://api.github.com@evil.com/x'), false, 'userinfo is not the host');
+  assert.equal(m('^https://api\\.github\\.com/', 'https://api.github.com.evil.com/x'), false);
+  assert.equal(m('^https://api\\.github\\.com', 'https://api.github.com/x'), 'unpinned', 'no / after the host: also fits api.github.com.evil.com');
+  assert.equal(m('api\\.github\\.com/', 'https://api.github.com/x'), 'unpinned', 'unanchored: also fits a path on any host');
+  assert.equal(m('^https://', 'https://api.github.com/x'), 'unpinned');
+});

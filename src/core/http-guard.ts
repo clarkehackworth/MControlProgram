@@ -6,13 +6,13 @@ const isLoopbackBind = (h: string) => LOOPBACK.test(h) || h === '::1';
 const hostname = (h: string) => h.replace(/:\d+$/, '');
 
 /**
- * Clickjacking headers always. If the app is bound to loopback, also refuse any Host header that isn't a loopback name
+ * Clickjacking headers and a no-inline-script policy always (the UI and plugin UI modules are same-origin files). If the app is bound to loopback, also refuse any Host header that isn't a loopback name
  * or the configured public URL's host: otherwise a DNS-rebinding page can reach the app as if same-origin.
  */
 export function guard(bindHost: string, publicUrl?: string | null) {
   let pub: string | undefined; try { pub = publicUrl ? new URL(publicUrl).hostname.toLowerCase() : undefined; } catch { /* ignore */ }
   return (req: Request, res: Response, next: NextFunction) => {
-    res.set({ 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'", 'X-Content-Type-Options': 'nosniff' });
+    res.set({ 'X-Frame-Options': 'DENY', 'Content-Security-Policy': "frame-ancestors 'none'; script-src 'self'; object-src 'none'; base-uri 'self'", 'X-Content-Type-Options': 'nosniff' });
     if (isLoopbackBind(bindHost)) {
       const h = hostname(String(req.headers.host ?? '')).toLowerCase();
       if (!LOOPBACK.test(h) && h !== pub) { res.status(403).type('text').send('forbidden host'); return; }

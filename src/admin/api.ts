@@ -129,7 +129,7 @@ export function adminApi() {
     try {
       await action.run(req.query as Record<string, any>, { config: pluginConfig.decrypted(pid), async setConfig(next) { pluginConfig.savePlain(pid, next); await manager.applyPlugin(pid); }, log: new ScopedLogger({ category: `plugin:${pid}` }), dep: depResolver(p!) });
       res.send('<p>Authorized. You can close this tab and return to MControlProgram.</p>');
-    } catch (e) { res.status(400).send(`<p>Authorization failed: ${String((e as Error).message ?? e)}</p>`); }
+    } catch (e) { res.status(400).type('text/plain').send(`Authorization failed: ${String((e as Error).message ?? e)}`); } // plain text: the message can carry query params verbatim
   });
   r.post('/plugins/reload', wrap(async () => {
     const out = await loadPlugins();

@@ -7,9 +7,26 @@ import type { MControlProgramPlugin, PluginContext, PluginHost, PluginInstance, 
 import { text, errorResult, ask, effective, safeRegex } from '../../core/plugin-api.js';
 import { ruleStore, ruleMatches, verdict, label, normalizeBlock, canonicalHost } from './url-policy.js';
 export { ruleMatches, verdict, normalizeBlock, type BlockKind, type RuleAction, type Policy } from './url-policy.js';
+import { createHash } from 'node:crypto';
 import { BlockList, isIP, type LookupFunction } from 'node:net';
 import { lookup as dnsLookup, type LookupAddress } from 'node:dns';
 import { Agent, fetch, Headers, type Response } from 'undici';
+
+/**
+ * Does a credential's URL pattern match this URL, and only because of its host? The URL's user:pass@ part is ignored
+ * (https://api.x.com@evil.com/ is evil.com), and a pattern that still matches with the host changed
+ * (unanchored, or `^https://api\.x\.com` without the closing /, which also fits api.x.com.evil.com) is 'unpinned':
+ * the secret is not sent.
+ */
+export function credMatch(pattern: RegExp, url: URL): boolean | 'unpinned' {
+  const u = new URL(url); u.username = ''; u.password = '';
+  if (!pattern.test(u.href)) return false;
+  const moved = (host: string) => { const p = new URL(u); p.hostname = host; return p.hostname !== u.hostname && pattern.test(p.href); };
+  const inPath = pattern.test(`${u.protocol}//host.invalid/${u.host}${u.pathname}${u.search}`); // unanchored: fits the host's name inside another site's path
+  return moved(`${u.hostname}.invalid`) || moved('host.invalid') || inPath ? 'unpinned' : true;
+}
+/** A request body is part of what a human approves: the same URL with another body is a new question. */
+const approvalBody = (body?: string) => (body ? { body: body.length > 500 ? `${body.slice(0, 500)}… (${body.length} chars)` : body, bodySha256: createHash('sha256').update(body).digest('hex') } : {});
 
 interface CredCfg { name: string; urlPattern: string; type: 'header' | 'basic' | 'bearer' | 'query'; headerName?: string; username?: string; secret: string }
 interface Cfg {
@@ -220,7 +237,7 @@ const plugin: MControlProgramPlugin = {
     const dispatcher = new Agent({ connect: { lookup: guardedLookup } });
 
     /** Policy checks; an ask verdict waits for a human (approvals). Returns who approved, if anyone did. */
-    async function checkUrl(raw: string, method: string, caller: Caller): Promise<{ u: URL; approvedBy?: string }> {
+    async function checkUrl(raw: string, method: string, caller: Caller, body?: string): Promise<{ u: URL; approvedBy?: string }> {
       const u = new URL(raw);
       if (!/^https?:$/.test(u.protocol)) throw new Blocked(`scheme: ${u.protocol}`, `only http/https allowed (got ${u.protocol})`); // logged like any block
       // Trailing dots name the same host ("evil.com." = evil.com, "localhost." = localhost); canonicalize so rules, prefixes and private checks all see one form.
@@ -233,13 +250,15 @@ const plugin: MControlProgramPlugin = {
       if (!v.ask) return { u };
       // ask last: never bother a human about a URL the instance would refuse anyway
       const shown = new URL(u); shown.search = ''; // query strings may carry tokens; the full URL is still the subject
-      try { return { u, approvedBy: await ask(caller, { feature: 'url', summary: `${method} ${shown.href}`, reason: v.ask, subject: { method, url: u.href, host: u.hostname } }) }; }
+      try { return { u, approvedBy: await ask(caller, { feature: 'url', summary: `${method} ${shown.href}`, reason: v.ask, subject: { method, url: u.href, host: u.hostname, ...approvalBody(body) } }) }; }
       catch (e) { throw new Blocked(`awaiting approval: ${v.ask}`, (e as Error).message); }
     }
 
     function applyCreds(u: URL, headers: Headers) {
       for (const c of creds) {
-        if (!c.urlPattern || !re(c.urlPattern).test(u.href)) continue;
+        const m = c.urlPattern ? credMatch(re(c.urlPattern), u) : false;
+        if (m === 'unpinned') ctx.log.warn(`credential "${c.name}" not sent to ${u.hostname}: its URL pattern would also match other hosts (anchor it and end the host with /, e.g. ^https://api\\.example\\.com/)`);
+        if (m !== true) continue;
         switch (c.type) {
           case 'bearer': headers.set('Authorization', `Bearer ${c.secret}`); break;
           case 'basic': headers.set('Authorization', 'Basic ' + Buffer.from(`${c.username ?? ''}:${c.secret}`).toString('base64')); break;
@@ -253,7 +272,7 @@ const plugin: MControlProgramPlugin = {
     async function doFetch(method: string, url: string, hdrs: Record<string, string> | undefined, body: string | undefined, caller: Caller) {
       if (!(cfg.allowMethods ?? []).includes(method)) throw new Error(`method ${method} not allowed`);
       let u: URL; let approvedBy: string | undefined;
-      try { ({ u, approvedBy } = await checkUrl(url, method, caller)); } catch (e) {
+      try { ({ u, approvedBy } = await checkUrl(url, method, caller, body)); } catch (e) {
         if (e instanceof Blocked) record(method, new URL(url), { blocked: e.rule }, caller);
         throw e;
       }
@@ -285,11 +304,11 @@ const plugin: MControlProgramPlugin = {
           await res.body?.cancel();
           const next = new URL(loc, u).href;
           // ponytail: an ask on a redirect hop that isn't decided in time makes the agent retry the whole call, re-sending the first request
-          try { ({ u, approvedBy } = await checkUrl(next, method, caller)); } catch (e) {
+          if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) { method = 'GET'; body = undefined; }
+          try { ({ u, approvedBy } = await checkUrl(next, method, caller, body)); } catch (e) {
             if (e instanceof Blocked) record(method, new URL(next), { blocked: e.rule }, caller);
             throw e;
           }
-          if (res.status === 303 || ((res.status === 301 || res.status === 302) && method === 'POST')) { method = 'GET'; body = undefined; }
         }
         const reader = res.body?.getReader();
         const chunks: Uint8Array[] = []; let size = 0; let truncated = false;

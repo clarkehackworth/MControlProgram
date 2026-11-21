@@ -53,6 +53,45 @@ test('ssh command rules: parse, decide, enforce live on a native host, and log',
   assert.equal(verdict('git status -s', 'prod', L, 'deny').blocked, 'default: deny', 'host-scoped rule');
   assert.equal(verdict('git statusx', 'dev', L, 'deny').blocked, 'default: deny', 'prefix matches whole words');
 
+  // wrapper flags that take a value must not hide the real program: long, abbreviated, clustered, glued, env -S
+  for (const line of ['timeout --signal KILL 5 rm x', 'timeout --sig=KILL 5 rm x', 'timeout --kill 1 5 rm x', 'nice --adjustment 5 rm x', 'xargs --arg-file /tmp/f rm', 'xargs --replace rm x',
+    'sudo -nu root rm x', 'sudo --user root -- rm x', 'env -S "rm x"', 'env -S"rm x"', 'env -iS "-u A rm" x', 'env --split-string="rm x"', 'env -a foo rm x', 'watch -d rm x', "watch -n1 'ls; rm x'", "flock /tmp/l -c 'rm x'"])
+    assert.equal(verdict(line, 'h', L, 'allow').blocked, 'program: rm', line);
+  assert.match(parse('timeout --made-up 5 rm x').unknown[0]!, /option is not recognised/, 'unlisted long flags fail closed');
+  assert.match(parse('env -S "$CMD"').unknown[0]!, /env -S command is computed/);
+  // interpreters run code the rules can't read: never allowed by a program rule alone
+  const P = [...L, ...['python3', 'perl', 'node', 'awk'].map((value) => ({ action: 'allow' as const, kind: 'program' as const, value, host: '' }))];
+  for (const line of [`python3 -c "import os; os.system('rm x')"`, 'python3 s.py', 'python3 <<EOF\nimport os\nEOF', '/usr/bin/python3.12 -m http.server', `perl -e 'unlink "x"'`, `node -e "1"`, `env python3 -c 1`, `bash -c "python3 -c 1"`, `awk 'BEGIN{system("rm x")}'`, `awk '{print > "/etc/x"}' f`, 'awk -f s.awk'])
+    assert.match(verdict(line, 'h', P, 'deny').blocked!, /^cannot check: /, line);
+  assert.match(verdict('python3 -c 1', 'h', P, 'ask').ask!, /cannot check/, 'a human decides');
+  assert.equal(verdict('python3 --version', 'h', P, 'deny').allowedBy, 'program: python3');
+  assert.equal(verdict(`awk -F: '{print $1}' f`, 'h', P, 'deny').allowedBy, 'program: awk');
+
+  // writes named by arguments and `..` in paths are seen by write rules
+  for (const line of ['cp x /etc/cron.d/evil', 'sudo cp -r a /etc/', 'cp -t /etc a b', 'cp --target=/etc a', 'mv a /etc/b', 'install -m 644 x /etc/passwd', 'install -d /etc/a /tmp/b', 'ln -sf /tmp/a /etc/b', 'echo x | tee -a /etc/hosts',
+    'dd if=/dev/zero of=/etc/x', 'scp f box:/etc/passwd', 'rsync -a /tmp/x /etc/ --exclude y', 'echo hi > /tmp/../../etc/passwd', 'cp x /tmp/a/../../etc/y', "sed -i 's/a/b/' /etc/hosts", "sed -ni.bak -e p /etc/hosts"])
+    assert.equal(verdict(line, 'h', L, 'allow').blocked, 'write: /etc', line);
+  const C = [...L, ...['cp', 'sed', 'tee'].map((value) => ({ action: 'allow' as const, kind: 'program' as const, value, host: '' }))];
+  assert.equal(verdict('cp /etc/hosts /tmp/h', 'h', C, 'deny').allowedBy, 'program: cp, write: /tmp');
+  assert.equal(verdict('cp a /home/x', 'h', C, 'deny').blocked, 'default: deny', 'an allowed program still needs an allowed destination');
+  assert.match(verdict('cp a "$D"', 'h', C, 'deny').blocked!, /cannot check: output file is computed/);
+  // remaining wrapper forms
+  for (const line of ['ssh box -- rm x', 'ssh -- box rm x', 'ssh box -o A=b -p 22 rm x', 'ssh -vp 22 box rm x', 'command rm -v x', 'command -p rm x', 'true \\\\\nrm x'])
+    assert.equal(verdict(line, 'h', L, 'allow').blocked, 'program: rm', line);
+  assert.deepEqual(programs('command -v rm'), ['command'], 'lookup only');
+  assert.deepEqual(programs('true \\\nrm x'), ['true'], 'a continued line is one command, as in bash');
+  assert.deepEqual(programs(`echo 'a\; rm x' "b\; rm y"`), ['echo'], '\; inside quotes is text');
+  // sed: e runs a command, w writes a file; ordinary scripts stay checkable
+  const { sedRuns } = await import('../src/plugins/ssh/shell-parse.js');
+  for (const sc of ['e rm x', '1e rm x', '/a/e', 's/a/b/e', 's/a/b/gw /etc/x', 'w /etc/x', '$!{W f\n}', 's/[/]/X/;e rm', 's|a|b|;1,3{/x/I e\n}', 's/a/b'])
+    assert.equal(sedRuns(sc), true, sc);
+  for (const sc of ['s/error/warn/g', 's/e/w/;s|we|ew|2', '/^e/d;$!N;y/ew/we/', '1,/end/{p;d}', '/a/!{s/[e/w]*//I;p}', ':a;N;$!ba;s/\\n/ /g', '2q', 'a hello we', 's/a\\/e/w/'])
+    assert.equal(sedRuns(sc), false, sc);
+  assert.equal(verdict("sed -n 's/error/warn/p' f", 'h', C, 'deny').allowedBy, 'program: sed');
+  for (const line of ["sed '1e rm x' f", "sed -e p -e 'w /tmp/x' f", 'sed -f s.sed f', "sed -n --expr='e id'", 'sed "$S" f'])
+    assert.match(verdict(line, 'h', C, 'deny').blocked!, /^cannot check: sed /, line);
+  assert.equal(verdict("sed --sandbox 's/a/b/w x' f", 'h', C, 'deny').allowedBy, 'program: sed', 'sed itself refuses e/w under --sandbox');
+
   const act = (k: string, p: any = {}) => (ssh.globalActions as any)[k].run(p, {} as any);
   // new installs default to ask; these tests exercise behaviour, not the default
   await act('set_policy', { policy: 'allow' });
